@@ -26,8 +26,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument(
         "--lang",
         choices=["ja", "en"],
-        default=None,
-        help="言語 (未指定なら自動判定)",
+        default="ja",
+        help="言語 (既定: ja)",
     )
     p_tr.add_argument(
         "--model", default=DEFAULT_MODEL, help=f"mlx-whisperモデル (既定: {DEFAULT_MODEL})"

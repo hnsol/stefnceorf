@@ -90,7 +90,7 @@ def build_segment_line(seg_id: str, words: list[dict], fillers: set[str],
 
 def transcribe(
     input_wav: str,
-    lang: str | None = None,
+    lang: str | None = "ja",
     model: str = DEFAULT_MODEL,
     filler_suggest: bool = True,
 ) -> dict:

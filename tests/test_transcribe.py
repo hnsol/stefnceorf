@@ -208,6 +208,13 @@ def fake_whisper_en(monkeypatch):
     return fake_result
 
 
+def test_transcribe_default_lang_is_ja(tmp_path, fake_whisper):
+    """lang未指定時の既定は 'ja' であり、Whisperに language='ja' が渡される。"""
+    wav = _make_input(tmp_path)
+    transcribe.transcribe(str(wav))
+    assert fake_whisper["kwargs"]["language"] == "ja"
+
+
 def test_transcribe_auto_lang_uses_detected_dict(tmp_path, fake_whisper_en):
     """--lang未指定でも result['language']=='en' なら en辞書で 'um' を検出する。"""
     wav = _make_input(tmp_path)

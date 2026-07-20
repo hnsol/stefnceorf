@@ -40,7 +40,7 @@ stefnceorf transcribe input.wav [--lang ja|en] [--model MODEL] [--no-filler-sugg
 ```
 
 - `input.sc.txt`（人間が編集するテキスト）と `input.sc.json`（単語→時刻・信頼度の対応表、触らない）を生成する
-- `--lang` 省略時は自動判定
+- `--lang` 既定 `ja`。英語は `--lang en` で明示指定。自動判定は `--lang` なし呼び出し (`lang=None`) で可能
 - `--model` 既定 `mlx-community/whisper-large-v3-turbo`
 - フィラー候補数を表示。`--no-filler-suggest` で提案を無効化
 
