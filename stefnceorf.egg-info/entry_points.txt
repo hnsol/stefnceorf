@@ -1,3 +1,0 @@
-[console_scripts]
-sc = stefnceorf.cli:main
-stefnceorf = stefnceorf.cli:main
