@@ -23,3 +23,8 @@ packages = ["stefnceorf"]
 
 [tool.setuptools.package-data]
 stefnceorf = ["fillers_ja.txt", "fillers_en.txt"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: 実モデル/say を使うローカル確認用の重いテスト (`-m slow` で実行)",
+]
