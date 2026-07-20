@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+stefnceorf/__init__.py
+stefnceorf/cli.py
+stefnceorf/fillers.py
+stefnceorf/fillers_en.txt
+stefnceorf/fillers_ja.txt
+stefnceorf/render.py
+stefnceorf/transcribe.py
+stefnceorf.egg-info/PKG-INFO
+stefnceorf.egg-info/SOURCES.txt
+stefnceorf.egg-info/dependency_links.txt
+stefnceorf.egg-info/entry_points.txt
+stefnceorf.egg-info/requires.txt
+stefnceorf.egg-info/top_level.txt
+tests/test_fillers.py
+tests/test_transcribe.py

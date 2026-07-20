@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stefnceorf"
+version = "0.1.0"
+description = "テキスト編集で音声を編集するCLIツール (Descript風・日本語対応・ローカル・無料)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mlx-whisper",
+    "numpy",
+    "soundfile",
+]
+
+[project.scripts]
+stefnceorf = "stefnceorf.cli:main"
+sc = "stefnceorf.cli:main"
+
+[tool.setuptools]
+packages = ["stefnceorf"]
+
+[tool.setuptools.package-data]
+stefnceorf = ["fillers_ja.txt", "fillers_en.txt"]
