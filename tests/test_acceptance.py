@@ -27,7 +27,7 @@ WORD_DUR = 1.0  # 1単語=1秒
 # ---- 合成プロジェクト生成 -------------------------------------------------
 
 def _build_project(tmp_path, segments, sr=SR, subtype="PCM_16", blocks=None,
-                   silences=None):
+                   silences=None, zero_ranges=None):
     """合成 wav + .sc.json を生成し、(wav パス, 無編集の txt 本文) を返す。
 
     segments: [[(word_str, freq_hz), ...], ...]  各内側リストが1セグメント。
@@ -36,6 +36,8 @@ def _build_project(tmp_path, segments, sr=SR, subtype="PCM_16", blocks=None,
     "block" を付与する（ポーズ区切り＝ブロック単位削除の検証用）。
     silences: [[s, e], ...]。指定時は json に "silences" を付与する（フィラー
     精密カットの音響安全判定用）。
+    zero_ranges: [[s, e], ...]。指定時は波形の該当秒区間を無音化する（json に
+    silences を書かない旧形式で、境界 RMS を実際に下げて音響安全判定を通す用）。
     """
     inst_freq_parts: list[np.ndarray] = []
     json_segs: list[dict] = []
@@ -67,6 +69,13 @@ def _build_project(tmp_path, segments, sr=SR, subtype="PCM_16", blocks=None,
     # 位相連続合成: 瞬時周波数を積分して位相にする
     phase = 2.0 * np.pi * np.cumsum(inst_freq) / sr
     audio = 0.3 * np.sin(phase)
+
+    if zero_ranges is not None:
+        for zs, ze in zero_ranges:
+            a = max(0, int(round(zs * sr)))
+            b = min(len(audio), int(round(ze * sr)))
+            if b > a:
+                audio[a:b] = 0.0
 
     wav = tmp_path / "input.wav"
     sf.write(str(wav), audio, sr, subtype=subtype)
@@ -247,6 +256,86 @@ def test_filler_bracket_removed_is_kept(tmp_path):
     out = render.render(str(txt))
     audio, sr = sf.read(out)
     assert _freq_sequence(audio, sr, freqs) == [200, 400, 600]
+
+
+# --------------------------------------------------------------------------
+# 複数フィラーの一括削除: 1行に〔〕2つ残す → 両方消え他の語は全部残る
+# --------------------------------------------------------------------------
+
+def test_multiple_fillers_deleted_in_one_line(tmp_path):
+    freqs = [200, 400, 600, 800, 1000]
+    # か・まあ(filler)・き・えっと(filler)・く。まあ[1,2] えっと[3,4] の各境界に
+    # 無音を用意し音響安全判定を通す。
+    _build_project(
+        tmp_path,
+        [[("か", 200), ("まあ", 400), ("き", 600), ("えっと", 800), ("く", 1000)]],
+        silences=[[0.98, 1.02], [1.98, 2.02], [2.98, 3.02], [3.98, 4.02]],
+    )
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] か〔まあ〕き〔えっと〕く\n", encoding="utf-8")
+
+    out = render.render(str(txt))
+    audio, sr = sf.read(out)
+    present = _present_freqs(audio, sr, freqs)
+    assert 400 not in present  # まあ 削除
+    assert 800 not in present  # えっと 削除
+    assert present == {200, 600, 1000}  # 他の語は全部残る
+    assert _freq_sequence(audio, sr, freqs) == [200, 600, 1000]
+
+
+# --------------------------------------------------------------------------
+# 複合編集: フィラー削除 + 行削除 + 行入れ替え が共存できる
+# --------------------------------------------------------------------------
+
+def test_filler_delete_with_line_delete_and_reorder(tmp_path):
+    freqs = [200, 400, 600, 800, 1000]
+    # seg1: あ / seg2: か・まあ(filler)・き / seg3: さ
+    _build_project(
+        tmp_path,
+        [
+            [("あ", 200)],
+            [("か", 400), ("まあ", 600), ("き", 800)],
+            [("さ", 1000)],
+        ],
+        silences=[[1.98, 2.02], [2.98, 3.02]],  # まあ[2,3] の両境界
+    )
+    txt = tmp_path / "input.sc.txt"
+    # 0001(あ) を行削除、0003 を 0002 より前へ入れ替え、0002 内のフィラー削除
+    txt.write_text("[0003] さ\n[0002] か〔まあ〕き\n", encoding="utf-8")
+
+    out = render.render(str(txt))
+    audio, sr = sf.read(out)
+    present = _present_freqs(audio, sr, freqs)
+    assert 200 not in present  # 行削除
+    assert 600 not in present  # フィラー削除
+    assert present == {400, 800, 1000}
+    # さ → か → き の順（入れ替え反映、フィラー抜け）
+    assert _freq_sequence(audio, sr, freqs) == [1000, 400, 800]
+
+
+# --------------------------------------------------------------------------
+# 旧形式 json（silences / suggest / block 無し）でも〔〕フィラー削除が
+# 致命的失敗せず動く（音響安全判定は RMS のみへ劣化）
+# --------------------------------------------------------------------------
+
+def test_legacy_json_filler_delete_degrades_gracefully(tmp_path):
+    freqs = [200, 400, 600]
+    # silences/block/suggest を一切書かない旧形式。波形側にだけ無音を作り、
+    # RMS のみの安全判定（silences=None）で精密カットが成立することを確認。
+    _build_project(
+        tmp_path,
+        [[("か", 200), ("まあ", 400), ("き", 600)]],
+        zero_ranges=[[0.9, 1.1], [1.9, 2.1]],  # まあ[1,2] の両境界を実際に無音化
+    )
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] か〔まあ〕き\n", encoding="utf-8")
+
+    out = render.render(str(txt))  # 例外なく完走すること
+    audio, sr = sf.read(out)
+    assert len(audio) > 0
+    present = _present_freqs(audio, sr, freqs)
+    assert present == {200, 600}  # 隣接語は残り、フィラーだけ消える
+    assert _freq_sequence(audio, sr, freqs) == [200, 600]
 
 
 # ==========================================================================
