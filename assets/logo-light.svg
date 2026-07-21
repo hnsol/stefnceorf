@@ -1,0 +1,35 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <filter id="shadow">
+      <feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#100F0F" flood-opacity="0.08"/>
+    </filter>
+    <radialGradient id="bg" cx="50%" cy="50%" r="60%">
+      <stop offset="0%" stop-color="#FFFCF0"/>
+      <stop offset="100%" stop-color="#F2F0E5"/>
+    </radialGradient>
+  </defs>
+  <rect width="256" height="256" rx="48" fill="#F2F0E5"/>
+  <rect width="256" height="256" rx="48" fill="url(#bg)" opacity="0.7"/>
+  <rect width="256" height="256" rx="48" fill="none" stroke="#CECDC3" stroke-width="1"/>
+  <g filter="url(#shadow)">
+    <rect x="32" y="98" width="10" height="60" rx="5" fill="#BC5215"/>
+    <rect x="48" y="78" width="10" height="100" rx="5" fill="#BC5215"/>
+    <rect x="64" y="58" width="10" height="140" rx="5" fill="#BC5215"/>
+    <rect x="80" y="42" width="10" height="172" rx="5" fill="#BC5215"/>
+    <rect x="96" y="68" width="10" height="120" rx="5" fill="#BC5215"/>
+  </g>
+  <rect x="120" y="24" width="3" height="208" rx="1.5" fill="#100F0F" opacity="0.85"/>
+  <rect x="118" y="24" width="7" height="208" rx="3.5" fill="#100F0F" opacity="0.08"/>
+  <g filter="url(#shadow)">
+    <rect x="136" y="52" width="10" height="152" rx="5" fill="#BC5215"/>
+    <rect x="152" y="38" width="10" height="180" rx="5" fill="#BC5215"/>
+    <rect x="168" y="62" width="10" height="132" rx="5" fill="#BC5215"/>
+    <rect x="184" y="82" width="10" height="92" rx="5" fill="#BC5215"/>
+    <rect x="200" y="100" width="10" height="56" rx="5" fill="#BC5215"/>
+  </g>
+  <g opacity="0.2">
+    <rect x="110" y="45" width="4" height="14" rx="2" fill="#BC5215" transform="rotate(-15 112 52)"/>
+    <rect x="130" y="185" width="4" height="10" rx="2" fill="#BC5215" transform="rotate(20 132 190)"/>
+    <rect x="108" y="160" width="3" height="8" rx="1.5" fill="#BC5215" transform="rotate(-8 110 164)"/>
+  </g>
+</svg>
