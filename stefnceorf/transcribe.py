@@ -195,6 +195,11 @@ def assign_blocks(
 
     `start`/`end` が None の対は境界にしない（安全側）。空リストは `[]`。
     `threshold == 0` は全単語を独立ブロックにする（＝全境界＝旧挙動）。
+
+    無音区間 [s, e] が単一単語の [w.start, w.end] に完全包含される場合
+    （`w.start <= s and e <= w.end`、≤判定）はブロック境界候補にしない。
+    伸ばし音の途中の息継ぎ等、単語内無音で偽の境界（／）が立つのを防ぐ。
+    start/end が None の単語は包含判定に使わない。
     """
     n = len(words)
     if n == 0:
@@ -218,8 +223,22 @@ def assign_blocks(
             boundary[i] = True
 
     # 各無音期間の中点を最寄りの接合点にマップして境界化
+    # 無音が単一単語の [start, end] に完全包含される場合は境界候補にしない。
+    # 伸ばし音の途中の息継ぎ等、単語内部に収まる無音で偽のブロック境界（／）が
+    # 立つのを防ぐため。start/end が None の単語は包含判定に使わない。
     for s, e in silences:
         if (e - s) < threshold:
+            continue
+        contained = False
+        for w in words:
+            ws = w.get("start")
+            we = w.get("end")
+            if ws is None or we is None:
+                continue
+            if float(ws) <= s and e <= float(we):
+                contained = True
+                break
+        if contained:
             continue
         m = (s + e) / 2.0
         best_i: int | None = None

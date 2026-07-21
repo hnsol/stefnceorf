@@ -153,6 +153,28 @@ def test_assign_blocks_none_times_not_boundary():
     assert transcribe.assign_blocks(words, [(0.5, 1.5)], 0.15) == [0, 0]
 
 
+def test_assign_blocks_silence_contained_in_word_no_boundary():
+    """無音が1単語の span 内部に完全に収まる → 境界は立たない。"""
+    # 単語 w0=[0.0,2.0], w1=[2.0,3.0]。無音[0.3,0.8] は w0 に完全包含 → 無視
+    words = [_bw(0.0, 2.0), _bw(2.0, 3.0)]
+    assert transcribe.assign_blocks(words, [(0.3, 0.8)], 0.15) == [0, 0]
+
+
+def test_assign_blocks_silence_spanning_words_is_boundary():
+    """無音がどの単語にも完全包含されない → 従来どおり境界が立つ。"""
+    # w0=[0.0,1.0], w1=[1.0,3.0]。無音[0.8,1.5] は w0 にも w1 にも完全包含されない
+    words = [_bw(0.0, 1.0), _bw(1.0, 3.0)]
+    blocks = transcribe.assign_blocks(words, [(0.8, 1.5)], 0.15)
+    assert blocks == [0, 1]
+
+
+def test_assign_blocks_silence_start_equals_word_start_is_contained():
+    """端一致（s == w.start かつ e < w.end）は包含扱い → 境界なし。"""
+    # w0=[0.0,2.0], w1=[2.0,3.0]。無音[0.0,0.5] は s==w0.start かつ e<w0.end
+    words = [_bw(0.0, 2.0), _bw(2.0, 3.0)]
+    assert transcribe.assign_blocks(words, [(0.0, 0.5)], 0.15) == [0, 0]
+
+
 # ---- build_segment_line + blocks（／挿入） ----
 
 def test_line_block_separator_inserted():
