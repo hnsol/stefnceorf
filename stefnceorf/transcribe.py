@@ -26,6 +26,9 @@ SILENCE_KEEP_S = 0.7
 # この秒数以上の無音を「カット可能なポーズ区切り」としてブロック境界にする
 PAUSE_THRESHOLD_S = 0.15
 
+# 無音クランプ後の単語長がこれ未満になる補正は棄却する（秒）
+CLAMP_MIN_WORD_S = 0.05
+
 # 繰り返し幻覚セグメントの後処理除去（--verbatim の condition_on_previous_text=True
 # で長尺の静音区間から発生する繰り返し幻覚への対策。入力側では完全に防げない）
 HALLUC_MIN_WORDS = 5     # セグメント内反復判定の最小語数
@@ -175,6 +178,102 @@ def remap_words(
             last = e
         elif s is not None:
             last = s
+    return out
+
+
+def clamp_words_to_silences(
+    words: list[dict],
+    silences: list[tuple[float, float]],
+    min_word_s: float = CLAMP_MIN_WORD_S,
+) -> list[dict]:
+    """単語の start/end を無音区間の境界へ縮めて補正した新リストを返す（純関数）。
+
+    remap_words と同様に非破壊で、dict をコピーした新リストを返す。
+
+    背景: Whisper の単語時刻はフィラー等で実発話区間より大きくズレることが
+    ある（実測: 「あの」end=2.30s だが実際は 1.20s から無音）。silencedetect
+    済みの無音区間で単語境界を内側へ補正する（stable-ts の adjust_by_silence
+    相当の自前実装）。
+
+    補正規則（各単語 w について、silences の全区間を評価する。昇順前提でなくてよい）:
+    - start が無音 [s, e] の内部（s < start < e、開区間）にあれば new_start = e
+    - end が無音 [s, e] の内部（s < end < e）にあれば new_end = s
+    - いずれも単語を内側へ縮める方向のみ（拡大はしない）
+
+    ガード:
+    - 単語全体が同一無音区間の内部（start も end も同じ無音内）→ 無補正
+      （無音誤検出の疑い）
+    - 両側補正の結果 new_end - new_start < min_word_s → 補正量（|new−元|）が
+      小さい側のみ適用を試し、それでも < min_word_s なら無補正
+    - 片側のみの補正でも new_end - new_start < min_word_s になるなら無補正
+    - start / end が None → その単語は無補正
+
+    区間は内側に縮むだけなので、remap_words が保証した単調性（前 end ≤ 次 start）
+    は崩れない。
+    """
+    out: list[dict] = []
+    for w in words:
+        nw = dict(w)
+        start = w.get("start")
+        end = w.get("end")
+        if start is None or end is None:
+            out.append(nw)
+            continue
+        start = float(start)
+        end = float(end)
+
+        # 単語全体が同一無音区間の内部 → 無音誤検出の疑いで無補正
+        if any(s < start < e and s < end < e for s, e in silences):
+            out.append(nw)
+            continue
+
+        # start が無音内部なら new_start = その無音の e（最も縮む e を採用）
+        new_start = start
+        for s, e in silences:
+            if s < start < e and e > new_start:
+                new_start = e
+        # end が無音内部なら new_end = その無音の s（最も縮む s を採用）
+        new_end = end
+        for s, e in silences:
+            if s < end < e and s < new_end:
+                new_end = s
+
+        start_changed = new_start != start
+        end_changed = new_end != end
+
+        if start_changed and end_changed:
+            if new_end - new_start >= min_word_s:
+                a_start, a_end = new_start, new_end
+            else:
+                # 補正量の小さい側のみ適用を試す
+                start_corr = new_start - start
+                end_corr = end - new_end
+                if start_corr <= end_corr:
+                    if end - new_start >= min_word_s:
+                        a_start, a_end = new_start, end
+                    else:
+                        a_start, a_end = start, end
+                else:
+                    if new_end - start >= min_word_s:
+                        a_start, a_end = start, new_end
+                    else:
+                        a_start, a_end = start, end
+        elif start_changed:
+            if end - new_start >= min_word_s:
+                a_start, a_end = new_start, end
+            else:
+                a_start, a_end = start, end
+        elif end_changed:
+            if new_end - start >= min_word_s:
+                a_start, a_end = start, new_end
+            else:
+                a_start, a_end = start, end
+        else:
+            a_start, a_end = start, end
+
+        nw["start"] = a_start
+        nw["end"] = a_end
+        out.append(nw)
     return out
 
 
@@ -743,6 +842,8 @@ def transcribe(
             )
         # 認識用wavの時刻を元音源の時刻へ逆写像（cuts が空なら恒等）
         words = remap_words(words, cuts)
+        # 単語境界を無音区間へ縮めて補正（フィラー等の時刻ズレ対策）
+        words = clamp_words_to_silences(words, periods)
         # ポーズベースのブロック割当（各 word に "block" を付与）
         blocks = assign_blocks(words, block_silences, pause_threshold)
         for wi, w in enumerate(words):
@@ -770,6 +871,7 @@ def transcribe(
             "count": len(cuts),
             "removed_s": round(removed_s, 3),
         },
+        "silences": [[round(s, 3), round(e, 3)] for s, e in block_silences],
         "segments": segments_out,
     }
     if dropped_count:

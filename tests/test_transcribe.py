@@ -320,6 +320,90 @@ def test_remap_words_applies_and_monotonic():
     assert out[0]["end"] <= out[1]["start"]
 
 
+# ---- clamp_words_to_silences（純関数） ----
+
+def _cw(start, end):
+    return {"word": "x", "start": start, "end": end, "probability": 0.9}
+
+
+def test_clamp_end_only_shrinks_to_silence_start():
+    # 実測再現: end=2.30 が無音[1.20, 2.35] の内部 → new_end = 1.20
+    words = [_cw(1.0, 2.30)]
+    out = transcribe.clamp_words_to_silences(words, [(1.20, 2.35)])
+    assert out[0]["start"] == pytest.approx(1.0)
+    assert out[0]["end"] == pytest.approx(1.20)
+
+
+def test_clamp_start_only_shrinks_to_silence_end():
+    # start=1.5 が無音[1.20, 2.0] の内部 → new_start = 2.0（無音末尾へ）
+    words = [_cw(1.5, 3.0)]
+    out = transcribe.clamp_words_to_silences(words, [(1.20, 2.0)])
+    assert out[0]["start"] == pytest.approx(2.0)
+    assert out[0]["end"] == pytest.approx(3.0)
+
+
+def test_clamp_boundary_exact_no_correction():
+    # start==s, end==e は開区間の外 → 補正しない
+    words = [_cw(1.0, 2.0)]
+    out = transcribe.clamp_words_to_silences(words, [(1.0, 2.0)])
+    assert out[0]["start"] == pytest.approx(1.0)
+    assert out[0]["end"] == pytest.approx(2.0)
+
+
+def test_clamp_whole_word_in_one_silence_no_correction():
+    # 単語全体が1無音内（無音誤検出の疑い）→ 無補正
+    words = [_cw(1.3, 1.8)]
+    out = transcribe.clamp_words_to_silences(words, [(1.0, 2.0)])
+    assert out[0]["start"] == pytest.approx(1.3)
+    assert out[0]["end"] == pytest.approx(1.8)
+
+
+def test_clamp_both_sides_shrink_below_min_smaller_side_applied():
+    # start=1.05（無音[1.0,1.1]内, 補正量0.05）, end=1.12（無音[1.11,1.2]内, 補正量0.01）
+    # 両側補正すると new=[1.1, 1.11] 長さ0.01 < 0.05 → 補正量の小さい end 側のみ試す。
+    # end 側のみ [1.05, 1.11] 長さ0.06 >= 0.05 → end のみ適用
+    words = [_cw(1.05, 1.12)]
+    out = transcribe.clamp_words_to_silences(words, [(1.0, 1.1), (1.11, 1.2)])
+    assert out[0]["start"] == pytest.approx(1.05)
+    assert out[0]["end"] == pytest.approx(1.11)
+
+
+def test_clamp_both_sides_all_below_min_no_correction():
+    # 両側補正・片側補正いずれも min 未満 → 完全無補正
+    # start=1.09（無音[1.0,1.1]内）, end=1.111（無音[1.11,1.2]内）
+    # both: [1.1,1.11]=0.01<0.05。end のみ:[1.09,1.11]=0.02<0.05。
+    # start のみ:[1.1,1.111]=0.011<0.05 → 全滅 → 無補正
+    words = [_cw(1.09, 1.111)]
+    out = transcribe.clamp_words_to_silences(words, [(1.0, 1.1), (1.11, 1.2)])
+    assert out[0]["start"] == pytest.approx(1.09)
+    assert out[0]["end"] == pytest.approx(1.111)
+
+
+def test_clamp_none_times_no_correction():
+    words = [
+        {"word": "a", "start": None, "end": 2.0, "probability": 0.9},
+        {"word": "b", "start": 1.0, "end": None, "probability": 0.9},
+    ]
+    out = transcribe.clamp_words_to_silences(words, [(0.5, 1.5)])
+    assert out[0]["start"] is None and out[0]["end"] == pytest.approx(2.0)
+    assert out[1]["start"] == pytest.approx(1.0) and out[1]["end"] is None
+
+
+def test_clamp_empty_words_and_empty_silences_identity():
+    assert transcribe.clamp_words_to_silences([], [(1.0, 2.0)]) == []
+    words = [_cw(1.0, 2.0)]
+    out = transcribe.clamp_words_to_silences(words, [])
+    assert out[0]["start"] == pytest.approx(1.0)
+    assert out[0]["end"] == pytest.approx(2.0)
+
+
+def test_clamp_non_destructive():
+    words = [_cw(1.0, 2.30)]
+    original = dict(words[0])
+    transcribe.clamp_words_to_silences(words, [(1.20, 2.35)])
+    assert words[0] == original
+
+
 # ---- drop_hallucinations（純関数） ----
 
 def _seg(text, words):
@@ -672,6 +756,70 @@ def test_transcribe_silence_trim_remaps_and_meta(tmp_path, monkeypatch):
     assert data["silence_trim"]["count"] == 1
     assert data["silence_trim"]["removed_s"] == pytest.approx(2.3, abs=0.01)
     assert res["silence_cut_count"] == 1
+
+
+def test_transcribe_clamps_word_times_and_saves_silences(tmp_path, monkeypatch):
+    """単語 end が無音内部 → json でクランプ済み。silences フィールドに block 無音のみ。"""
+    fake_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "あの",
+                "words": [
+                    # end=1.5 が無音[1.20,1.80] の内部 → クランプで end=1.20
+                    {"word": "あの", "start": 1.0, "end": 1.5, "probability": 0.9},
+                ],
+            },
+        ],
+    }
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda path, **kwargs: fake_result
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    # 無音[1.20,1.80]=0.6s（block・clamp対象。1.5s未満なので切り詰めなし）と
+    # [3.0,3.05]=0.05s（pause_threshold 未満で block から除外）
+    stderr = (
+        "silence_start: 1.20\n"
+        "silence_end: 1.80 | silence_duration: 0.60\n"
+        "silence_start: 3.0\n"
+        "silence_end: 3.05 | silence_duration: 0.05\n"
+    )
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: stderr)
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja", pause_threshold=0.15)
+    data = res["data"]
+
+    w = data["segments"][0]["words"][0]
+    assert w["start"] == pytest.approx(1.0)
+    assert w["end"] == pytest.approx(1.20)  # 無音境界へクランプ
+
+    # silences には pause_threshold(0.15) 以上の無音のみ
+    assert data["silences"] == [[1.2, 1.8]]
+
+
+def test_transcribe_silences_empty_when_pause_threshold_zero(tmp_path, monkeypatch):
+    """pause_threshold<=0 では block_silences が空 → silences も空リスト。"""
+    fake_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "あの",
+                "words": [
+                    {"word": "あの", "start": 1.0, "end": 1.5, "probability": 0.9},
+                ],
+            },
+        ],
+    }
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda path, **kwargs: fake_result
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja", pause_threshold=0)
+    assert res["data"]["silences"] == []
 
 
 def test_transcribe_blocks_and_pause_threshold(tmp_path, monkeypatch):
