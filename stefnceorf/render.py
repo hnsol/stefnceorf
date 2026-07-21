@@ -15,6 +15,8 @@ import sys
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from . import fillers as fillers_mod
+
 # transcribe 側と同じマーカー定義
 LOW_CONF_MARK = "◆"
 FILLER_OPEN = "〔"
@@ -42,27 +44,38 @@ _LINE_RE = re.compile(r"^\[([^\]\s]+)(?:\s+[^\]]*)?\]\s?(.*)$")
 _FILLER_RE = re.compile(re.escape(FILLER_OPEN) + r"[^" + re.escape(FILLER_CLOSE) + r"]*" + re.escape(FILLER_CLOSE))
 
 
-def _clean_edited_text(text: str) -> str:
+def _clean_edited_text(text: str) -> tuple[str, list[str]]:
     """編集後テキストから ◆・／ を除去し、〔...〕 を中身ごと削除する。
+
+    戻り値は (クリーン済みテキスト, 残されていた〔〕中身リスト)。〔〕は削除対象
+    フィラーの提案なので、テキストに残された〔中身〕は「削除する」意思表示として
+    出現順に収集する。中身からは ◆ と ／ を除いた内容を採る（transcribe が付与した
+    マーカーを剥がして word 文字列と突き合わせられるようにするため）。
 
     括弧が外されている（〔〕が無い）箇所は通常の文字として残る。
     ／（ブロック区切り）は残しても消しても差分に影響しないよう除去する。
     """
+    contents: list[str] = []
+    for m in _FILLER_RE.finditer(text):
+        inner = m.group(0)[len(FILLER_OPEN): -len(FILLER_CLOSE)]
+        inner = inner.replace(LOW_CONF_MARK, "").replace(BLOCK_SEP, "")
+        contents.append(inner)
     text = _FILLER_RE.sub("", text)
     text = text.replace(BLOCK_SEP, "")
     text = text.replace(LOW_CONF_MARK, "")
-    return text
+    return text, contents
 
 
-def parse_edited_txt(text: str) -> list[tuple[str, str]]:
-    """編集後 txt をパースして (ID, クリーン済みテキスト) の列を返す。
+def parse_edited_txt(text: str) -> list[tuple[str, str, list[str]]]:
+    """編集後 txt をパースして (ID, クリーン済みテキスト, 〔〕中身リスト) の列を返す。
 
     - 空行（空白のみ含む）は無視する
     - `[ID] text` 形式でない非空行は ValueError
     - ◆ は除去、〔...〕 は削除扱いへ変換する
+    - 〔〕の中身は出現順にリストで返す（フィラー削除の構造マッチング用）
     - ID の重複は ValueError
     """
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, list[str]]] = []
     seen: set[str] = set()
     for lineno, raw in enumerate(text.splitlines(), start=1):
         if raw.strip() == "":
@@ -76,8 +89,74 @@ def parse_edited_txt(text: str) -> list[tuple[str, str]]:
         if seg_id in seen:
             raise ValueError(f"{lineno}行目: ID が重複しています: [{seg_id}]")
         seen.add(seg_id)
-        out.append((seg_id, _clean_edited_text(m.group(2))))
+        cleaned, brackets = _clean_edited_text(m.group(2))
+        out.append((seg_id, cleaned, brackets))
     return out
+
+
+def match_filler_deletions(
+    words: list[dict],
+    bracket_contents: list[str],
+    fillers: set[str],
+) -> tuple[set[int], list[str]]:
+    """編集後テキストに残された〔中身〕列を提案単語へ順序マッチし、
+    (フィラー削除確定 word index 集合, 警告列) を返す（純関数）。
+
+    〔〕はフィラー削除の提案マーカー。編集後テキストに〔中身〕が残っている＝
+    ユーザーがその提案を受け入れ「削除する」意思表示である。中身を提案単語
+    （transcribe が付与した "suggest": True）へ出現順に構造マッチし、対応する
+    word index を削除確定として返す。これにより頻出フィラーで文字diffの整列が
+    曖昧になっても、削除対象の単語を一意に特定できる。
+
+    候補 index 列は words のうち w.get("suggest") が真のもの（昇順）。1つも無い
+    （suggest を持たない旧 json）場合は fillers_mod.is_filler が真のものへ
+    フォールバックする。
+
+    マッチは2ポインタの順序マッチ。各 bracket 内容（先頭から）について、未消費の
+    候補のうち w["word"].lstrip() == bracket内容 と完全一致する最初のものへ
+    マッチして消費する。完全一致が無ければ fillers_mod.normalize_token 同士の
+    比較で緩和一致を試す。マッチしなかった bracket は警告を返し、削除自体は
+    _clean_edited_text で既に除去済みのため従来の文字diffに委ねる。
+    """
+    warnings: list[str] = []
+    if not bracket_contents:
+        return set(), warnings
+
+    candidates = [i for i, w in enumerate(words) if w.get("suggest")]
+    if not candidates:
+        candidates = [
+            i for i, w in enumerate(words)
+            if fillers_mod.is_filler(w.get("word", ""), fillers)
+        ]
+
+    consumed: set[int] = set()
+    filler_del: set[int] = set()
+    for content in bracket_contents:
+        matched: int | None = None
+        # まず完全一致（lstrip 後の word 文字列と bracket 内容）
+        for i in candidates:
+            if i in consumed:
+                continue
+            if words[i].get("word", "").lstrip() == content:
+                matched = i
+                break
+        # 次に normalize_token 同士の緩和一致
+        if matched is None:
+            norm_content = fillers_mod.normalize_token(content)
+            for i in candidates:
+                if i in consumed:
+                    continue
+                if fillers_mod.normalize_token(words[i].get("word", "")) == norm_content:
+                    matched = i
+                    break
+        if matched is None:
+            warnings.append(
+                f"〔{content}〕に対応する提案単語が見つかりません（テキストdiffで処理します）"
+            )
+            continue
+        consumed.add(matched)
+        filler_del.add(matched)
+    return filler_del, warnings
 
 
 def surviving_words(
@@ -362,6 +441,9 @@ def render(
 
     parsed = parse_edited_txt(txt.read_text(encoding="utf-8"))
 
+    # フィラー〔〕削除の構造マッチング用に辞書を1回ロードする。
+    fillers_set = fillers_mod.load_fillers(data.get("language"))
+
     # 音声読み込み（元フォーマット維持のため subtype を保持）
     audio, samplerate = sf.read(source_wav, dtype="float64", always_2d=False)
     info = sf.info(source_wav)
@@ -392,14 +474,26 @@ def render(
 
     plan_intervals: list[tuple[float, float]] = []
     all_warnings: list[str] = []
-    for seg_id, edited in parsed:
+    for seg_id, edited, brackets in parsed:
         seg = seg_map.get(seg_id)
         if seg is None:
             raise ValueError(f"json に存在しない ID です: [{seg_id}]")
         words = seg.get("words", []) or []
         word_strs = [w.get("word", "").replace(BLOCK_SEP, "") for w in words]
 
-        keep, warns = surviving_words(word_strs, edited)
+        # 〔〕削除の構造マッチ: 提案単語へ順序対応させて削除確定 index を得る。
+        # これらは diff の両辺から除外し、曖昧な文字整列に依存せず確実に削除する。
+        filler_del, fwarns = match_filler_deletions(words, brackets, fillers_set)
+        for w in fwarns:
+            all_warnings.append(f"[{seg_id}] {w}")
+
+        # フィラー削除確定分を除いた縮約列で文字diffを行い、残す単語を求める。
+        idx_map = [i for i in range(len(word_strs)) if i not in filler_del]
+        keep_reduced, warns = surviving_words(
+            [word_strs[i] for i in idx_map], edited
+        )
+        # 縮約 index を元 index へ逆写像（フィラー削除分は keep に入らない）
+        keep = {idx_map[k] for k in keep_reduced}
         for w in warns:
             all_warnings.append(f"[{seg_id}] {w}")
 

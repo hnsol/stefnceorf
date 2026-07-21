@@ -10,47 +10,73 @@ from stefnceorf import render
 
 def test_parse_plain():
     txt = "[0001] 結局面倒\n[0002] 作業\n"
-    assert render.parse_edited_txt(txt) == [("0001", "結局面倒"), ("0002", "作業")]
+    assert render.parse_edited_txt(txt) == [
+        ("0001", "結局面倒", []), ("0002", "作業", [])
+    ]
 
 
 def test_parse_with_timestamp():
     """新形式 [ID 時刻] はIDのみ抽出し、テキストは正常にパースされる。"""
     txt = "[0001 0:12] 結局面倒\n[0002 12:34] 作業\n"
-    assert render.parse_edited_txt(txt) == [("0001", "結局面倒"), ("0002", "作業")]
+    assert render.parse_edited_txt(txt) == [
+        ("0001", "結局面倒", []), ("0002", "作業", [])
+    ]
 
 
 def test_parse_timestamp_hhmmss():
     """H:MM:SS 形式の時刻付き行もIDのみ抽出できる。"""
     txt = "[0001 1:02:03] テスト\n"
-    assert render.parse_edited_txt(txt) == [("0001", "テスト")]
+    assert render.parse_edited_txt(txt) == [("0001", "テスト", [])]
 
 
 def test_parse_legacy_and_new_mixed():
     """旧形式と新形式が混在してもそれぞれ正しくパースされる。"""
     txt = "[0001] 旧形式\n[0002 0:05] 新形式\n"
-    assert render.parse_edited_txt(txt) == [("0001", "旧形式"), ("0002", "新形式")]
+    assert render.parse_edited_txt(txt) == [
+        ("0001", "旧形式", []), ("0002", "新形式", [])
+    ]
 
 
 def test_parse_ignores_blank_lines():
     txt = "[0001] あ\n\n   \n[0002] い\n"
-    assert render.parse_edited_txt(txt) == [("0001", "あ"), ("0002", "い")]
+    assert render.parse_edited_txt(txt) == [("0001", "あ", []), ("0002", "い", [])]
 
 
 def test_parse_strips_low_conf_mark():
     txt = "[0001] 結局◆面倒\n"
-    assert render.parse_edited_txt(txt) == [("0001", "結局面倒")]
+    assert render.parse_edited_txt(txt) == [("0001", "結局面倒", [])]
 
 
 def test_parse_filler_bracket_deleted():
-    # 〔...〕 は中身ごと削除
+    # 〔...〕 は中身ごと削除。中身は出現順にリストで返る
     txt = "[0001] 結局〔まあ〕面倒\n"
-    assert render.parse_edited_txt(txt) == [("0001", "結局面倒")]
+    assert render.parse_edited_txt(txt) == [("0001", "結局面倒", ["まあ"])]
 
 
 def test_parse_filler_bracket_removed_keeps_text():
     # 括弧を外した箇所は通常文字として残る
     txt = "[0001] 結局まあ面倒\n"
-    assert render.parse_edited_txt(txt) == [("0001", "結局まあ面倒")]
+    assert render.parse_edited_txt(txt) == [("0001", "結局まあ面倒", [])]
+
+
+def test_parse_multiple_brackets_in_order():
+    # 複数の〔〕は出現順に中身が集まる
+    txt = "[0001] 〔あの、〕結局〔まあ〕面倒\n"
+    assert render.parse_edited_txt(txt) == [
+        ("0001", "結局面倒", ["あの、", "まあ"])
+    ]
+
+
+def test_parse_bracket_content_strips_markers():
+    # 〔〕中身に混在した ◆・／ は中身から除去される
+    txt = "[0001] 結局〔◆まあ〕面倒\n"
+    assert render.parse_edited_txt(txt) == [("0001", "結局面倒", ["まあ"])]
+
+
+def test_clean_edited_text_returns_contents():
+    cleaned, brackets = render._clean_edited_text("結局〔まあ〕面倒")
+    assert cleaned == "結局面倒"
+    assert brackets == ["まあ"]
 
 
 def test_parse_broken_id_line_raises():
@@ -66,7 +92,67 @@ def test_parse_duplicate_id_raises():
 def test_parse_strips_block_separator():
     # ／（ブロック区切り）は除去される
     txt = "[0001] 結局／面倒\n"
-    assert render.parse_edited_txt(txt) == [("0001", "結局面倒")]
+    assert render.parse_edited_txt(txt) == [("0001", "結局面倒", [])]
+
+
+# ---- match_filler_deletions ----
+
+from stefnceorf import fillers as fillers_mod
+
+_JA = fillers_mod.load_fillers("ja")
+
+
+def _sw(word, suggest=False):
+    d = {"word": word, "start": 0.0, "end": 1.0, "probability": 0.9}
+    if suggest:
+        d["suggest"] = True
+    return d
+
+
+def test_match_filler_ordered():
+    # 提案単語2つ、〔〕2つが順序どおりマッチ
+    words = [_sw("結局"), _sw("まあ", True), _sw("面倒"), _sw("えー", True)]
+    filler_del, warns = render.match_filler_deletions(words, ["まあ", "えー"], _JA)
+    assert filler_del == {1, 3}
+    assert warns == []
+
+
+def test_match_filler_same_content_partial_kept():
+    # 同一内容〔あの、〕が2つ提案されるが片方だけ残された → 順序どおり先頭にマッチ
+    words = [_sw("あの、", True), _sw("結局"), _sw("あの、", True), _sw("面倒")]
+    filler_del, warns = render.match_filler_deletions(words, ["あの、"], _JA)
+    assert filler_del == {0}
+    assert warns == []
+
+
+def test_match_filler_unmatched_warns():
+    # 対応する提案単語が無い → 警告し diff 委譲（削除確定には含めない）
+    words = [_sw("結局"), _sw("まあ", True)]
+    filler_del, warns = render.match_filler_deletions(words, ["えー"], _JA)
+    assert filler_del == set()
+    assert len(warns) == 1
+    assert "えー" in warns[0]
+
+
+def test_match_filler_legacy_json_fallback():
+    # suggest キーが1つも無い旧 json → is_filler フォールバックでマッチ
+    words = [_sw("結局"), _sw("まあ"), _sw("面倒")]
+    filler_del, warns = render.match_filler_deletions(words, ["まあ"], _JA)
+    assert filler_del == {1}
+    assert warns == []
+
+
+def test_match_filler_empty_brackets():
+    words = [_sw("結局"), _sw("まあ", True)]
+    assert render.match_filler_deletions(words, [], _JA) == (set(), [])
+
+
+def test_match_filler_relaxed_normalize():
+    # 完全一致しないが normalize_token 同士は一致（読点差）
+    words = [_sw("まあ、", True)]
+    filler_del, warns = render.match_filler_deletions(words, ["まあ"], _JA)
+    assert filler_del == {0}
+    assert warns == []
 
 
 # ---- snap_to_blocks ----
@@ -536,6 +622,82 @@ def test_render_block_separator_kept_equals_no_edit(tmp_path):
     out2 = render.render(str(txt), output=str(tmp_path / "plain.wav"))
     b, _ = sf.read(out2)
     assert len(a) == len(b)
+
+
+def _make_ambiguous_filler_project(tmp_path, sr=16000):
+    """フィラー「まあ」の文字列が隣接語「まあね」の一部にも含まれる構成。
+
+    w0=結局[0,1](220Hz), w1=まあ[1,2](440Hz, suggest, 単独ブロック),
+    w2=まあね[2,2.5](660Hz)。従来の文字diffだと「まあ」削除が w1 と w2 の
+    どちらの「まあ」に整列するか曖昧になる。w1/w2 の長さを変え（1.0s/0.5s）、
+    削除された語を出力尺で判別できるようにする。
+    """
+    import soundfile as sf
+
+    specs = [(0.0, 1.0, 220.0), (1.0, 2.0, 440.0), (2.0, 2.5, 660.0)]
+    audio = np.zeros(int(2.5 * sr))
+    for s, e, fr in specs:
+        t = np.arange(int((e - s) * sr)) / sr
+        audio[int(s * sr): int(s * sr) + len(t)] = 0.3 * np.sin(2 * np.pi * fr * t)
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), audio, sr, subtype="PCM_16")
+
+    data = {
+        "source_wav": str(wav.resolve()),
+        "language": "ja",
+        "model": "test",
+        "pause_threshold": 0.15,
+        "segments": [
+            {
+                "id": "0001",
+                "text": "結局まあまあね",
+                "words": [
+                    {"word": "結局", "start": 0.0, "end": 1.0,
+                     "probability": 0.9, "block": 0},
+                    {"word": "まあ", "start": 1.0, "end": 2.0,
+                     "probability": 0.9, "block": 1, "suggest": True},
+                    {"word": "まあね", "start": 2.0, "end": 2.5,
+                     "probability": 0.9, "block": 2},
+                ],
+            }
+        ],
+    }
+    (tmp_path / "input.sc.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+    return wav
+
+
+def test_render_filler_bracket_deletes_exact_word(tmp_path):
+    """〔まあ〕削除が、文字列が重なる隣接語「まあね」を巻き込まず w1 だけ消す。"""
+    import soundfile as sf
+
+    _make_ambiguous_filler_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    # 〔まあ〕を残す＝提案受け入れ（w1 を削除）。w2「まあね」は残す。
+    txt.write_text("[0001] 結局〔まあ〕まあね\n", encoding="utf-8")
+
+    out = render.render(str(txt))
+    o_audio, sr = sf.read(out)
+    # w1(1.0s) 削除 → 結局(1.0s)+まあね(0.5s) = 1.5s。
+    # 誤って w2(0.5s) を消すと 2.0s になるため 1.5s 近傍で判別できる。
+    dur = len(o_audio) / sr
+    assert dur == pytest.approx(1.5, abs=0.1)
+
+
+def test_render_filler_bracket_unmatched_falls_back(tmp_path, capsys):
+    """提案単語に無い〔〕内容は警告し、削除自体は diff に委ねられる。"""
+    import soundfile as sf
+
+    _make_ambiguous_filler_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    # 〔えー〕は提案単語に無い → 警告。テキスト本体は結局まあまあね（無削除相当）
+    txt.write_text("[0001] 結局まあまあね〔えー〕\n", encoding="utf-8")
+
+    render.render(str(txt))
+    err = capsys.readouterr().err
+    assert "えー" in err
+    assert "見つかりません" in err
 
 
 def test_render_warns_on_insertion(tmp_path, capsys):

@@ -611,9 +611,38 @@ def _seg_id(index: int) -> str:
     return f"{index + 1:04d}"
 
 
+def suggest_filler_indices(
+    words: list[dict], blocks: list[int] | None, fillers: set[str]
+) -> set[int]:
+    """〔〕提案対象（単独ブロックのフィラー）の word index 集合を返す（純関数）。
+
+    フィラー（fillers_mod.is_filler が真）のうち、単独ブロック（同ブロックに
+    他語がない）のものだけを提案対象とする。他語と同ブロックのフィラーは消すと
+    巻き込みが起きるため提案しない。
+
+    blocks が None のときは「単独ブロック」条件を常に真とみなす（build_segment_line
+    の is_solo=True フォールバックと同じ挙動）。
+    """
+    out: set[int] = set()
+    for idx, w in enumerate(words):
+        raw = w.get("word", "")
+        if not fillers_mod.is_filler(raw, fillers):
+            continue
+        is_solo = True
+        if blocks is not None:
+            b = blocks[idx]
+            is_solo = not any(
+                blocks[j] == b for j in range(len(blocks)) if j != idx
+            )
+        if is_solo:
+            out.add(idx)
+    return out
+
+
 def build_segment_line(seg_id: str, words: list[dict], fillers: set[str],
                        filler_suggest: bool,
-                       blocks: list[int] | None = None) -> tuple[str, int]:
+                       blocks: list[int] | None = None,
+                       suggest_indices: set[int] | None = None) -> tuple[str, int]:
     """1セグメントの .sc.txt 行文字列とフィラー候補数を組み立てる。
 
     表示テキストは json の words から再構成する。◆・〔〕・／ を取り除くと
@@ -621,7 +650,13 @@ def build_segment_line(seg_id: str, words: list[dict], fillers: set[str],
 
     blocks が渡された場合、ブロック境界（blocks[i] != blocks[i-1]）の直前に
     区切り記号 ／ を挿入する（lead 空白・〔〕の外側、◆の前）。
+
+    suggest_indices が None のときは suggest_filler_indices を内部で計算する。
+    渡された場合はその index 集合を〔〕提案対象として用いる（txt の〔〕と json の
+    "suggest" を構成的に一致させるため）。filler_suggest=False のときは提案しない。
     """
+    if filler_suggest and suggest_indices is None:
+        suggest_indices = suggest_filler_indices(words, blocks, fillers)
     parts: list[str] = []
     filler_count = 0
     for idx, w in enumerate(words):
@@ -631,18 +666,9 @@ def build_segment_line(seg_id: str, words: list[dict], fillers: set[str],
         prob = w.get("probability")
 
         piece = core
-        if filler_suggest and fillers_mod.is_filler(raw, fillers):
-            # 単独ブロック（前後にポーズ）のフィラーだけ〔〕提案する。
-            # 他の語と同ブロックのフィラーは消すと巻き込みが起きるため提案しない。
-            is_solo = True
-            if blocks is not None:
-                b = blocks[idx]
-                is_solo = not any(
-                    blocks[j] == b for j in range(len(blocks)) if j != idx
-                )
-            if is_solo:
-                piece = f"{FILLER_OPEN}{piece}{FILLER_CLOSE}"
-                filler_count += 1
+        if filler_suggest and suggest_indices is not None and idx in suggest_indices:
+            piece = f"{FILLER_OPEN}{piece}{FILLER_CLOSE}"
+            filler_count += 1
         if prob is not None and prob < LOW_CONF_THRESHOLD:
             piece = f"{LOW_CONF_MARK}{piece}"
         segment = lead + piece
@@ -848,6 +874,13 @@ def transcribe(
         blocks = assign_blocks(words, block_silences, pause_threshold)
         for wi, w in enumerate(words):
             w["block"] = blocks[wi]
+        # フィラー〔〕提案対象を計算し、該当 word に "suggest": True を付与する。
+        # txt の〔〕と json の "suggest" を同じ集合から構成し一致を保証する。
+        sug: set[int] = set()
+        if filler_suggest:
+            sug = suggest_filler_indices(words, blocks, fillers)
+            for wi in sug:
+                words[wi]["suggest"] = True
         segments_out.append(
             {
                 "id": seg_id,
@@ -856,7 +889,8 @@ def transcribe(
             }
         )
         line, fcount = build_segment_line(
-            seg_id, words, fillers, filler_suggest, blocks=blocks
+            seg_id, words, fillers, filler_suggest, blocks=blocks,
+            suggest_indices=sug,
         )
         lines.append(line)
         total_fillers += fcount

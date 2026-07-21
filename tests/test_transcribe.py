@@ -237,6 +237,97 @@ def test_line_filler_suggested_when_solo_block():
     assert fc == 1
 
 
+# ---- suggest_filler_indices（純関数） ----
+
+def test_suggest_solo_block_filler_included():
+    ja = fillers_mod.load_fillers("ja")
+    words = _words(("まあ", 0.9), ("どれぐらい", 0.9))
+    assert transcribe.suggest_filler_indices(words, [0, 1], ja) == {0}
+
+
+def test_suggest_shared_block_filler_excluded():
+    ja = fillers_mod.load_fillers("ja")
+    words = _words(("まあ", 0.9), ("どれぐらい", 0.9))
+    assert transcribe.suggest_filler_indices(words, [0, 0], ja) == set()
+
+
+def test_suggest_blocks_none_all_fillers():
+    ja = fillers_mod.load_fillers("ja")
+    words = _words(("まあ", 0.9), ("えー", 0.9), ("結局", 0.9))
+    assert transcribe.suggest_filler_indices(words, None, ja) == {0, 1}
+
+
+def test_suggest_non_filler_excluded():
+    ja = fillers_mod.load_fillers("ja")
+    words = _words(("結局", 0.9), ("面倒", 0.9))
+    assert transcribe.suggest_filler_indices(words, [0, 1], ja) == set()
+
+
+# ---- transcribe: json の suggest キーと txt の〔〕一致 ----
+
+def test_transcribe_json_suggest_matches_txt(tmp_path, monkeypatch):
+    """filler_suggest=True で単独ブロックのフィラー word に suggest=True が付き、
+    txt の〔〕位置と一致する。非対象には suggest キーが無い。"""
+    fake_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "結局まあ面倒",
+                "words": [
+                    {"word": "結局", "start": 0.0, "end": 0.5, "probability": 0.9},
+                    # 0.5→0.8 のギャップ 0.3 ≥ 0.15 → 単独ブロック（前後にポーズ）
+                    {"word": "まあ", "start": 0.8, "end": 1.0, "probability": 0.9},
+                    {"word": "面倒", "start": 1.3, "end": 1.8, "probability": 0.9},
+                ],
+            },
+        ],
+    }
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda path, **kwargs: fake_result
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja", filler_suggest=True,
+                                pause_threshold=0.15)
+    data = res["data"]
+    ws = data["segments"][0]["words"]
+    assert "suggest" not in ws[0]  # 結局
+    assert ws[1].get("suggest") is True  # まあ（単独ブロック）
+    assert "suggest" not in ws[2]  # 面倒
+
+    txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
+    assert "〔まあ〕" in txt
+    assert res["filler_count"] == 1
+
+
+def test_transcribe_no_suggest_key_when_disabled(tmp_path, monkeypatch):
+    """filler_suggest=False では suggest キーが付かない。"""
+    fake_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "まあ",
+                "words": [
+                    {"word": "まあ", "start": 0.8, "end": 1.0, "probability": 0.9},
+                ],
+            },
+        ],
+    }
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda path, **kwargs: fake_result
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja", filler_suggest=False,
+                                pause_threshold=0.15)
+    ws = res["data"]["segments"][0]["words"]
+    assert "suggest" not in ws[0]
+
+
 # ---- 無音切り詰め: silencedetect パース / cuts / 逆写像（純関数） ----
 
 def test_parse_silence_periods():
