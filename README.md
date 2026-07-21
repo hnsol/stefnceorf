@@ -30,6 +30,18 @@ python -m venv .venv
 
 依存: mlx-whisper, numpy, soundfile（mlx-whisper は Apple Silicon 前提）
 
+### どこからでも使えるようにする（任意）
+
+editable インストール後、`.venv/bin/` にある実行ファイルへシンボリックリンクを張ると、`.venv/bin/` を毎回指定したり `activate` したりせずに、どのディレクトリからでも `stefnceorf` / `sc` を実行できる。
+
+```sh
+cd /path/to/stefnceorf  # このプロジェクトのルート
+ln -s "$(pwd)/.venv/bin/stefnceorf" /opt/homebrew/bin/stefnceorf
+ln -s "$(pwd)/.venv/bin/sc" /opt/homebrew/bin/sc
+```
+
+（`/opt/homebrew/bin` は Apple Silicon の Homebrew の既定 PATH。別の PATH の通ったディレクトリでもよい。リンク先はプロジェクトの `.venv` を指すので、`.venv` を削除・再作成する場合は張り直しが必要）
+
 ## 使い方
 
 ### 1. 文字起こし
