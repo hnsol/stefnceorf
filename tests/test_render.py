@@ -63,6 +63,40 @@ def test_parse_duplicate_id_raises():
         render.parse_edited_txt("[0001] あ\n[0001] い\n")
 
 
+def test_parse_strips_block_separator():
+    # ／（ブロック区切り）は除去される
+    txt = "[0001] 結局／面倒\n"
+    assert render.parse_edited_txt(txt) == [("0001", "結局面倒")]
+
+
+# ---- snap_to_blocks ----
+
+def test_snap_partial_delete_removes_block():
+    # block0={0,1}, block1={2}。word1 削除 → block0 全削除、extra に word0
+    keep, extra = render.snap_to_blocks({0, 2}, [0, 0, 1])
+    assert keep == {2}
+    assert extra == {0}
+
+
+def test_snap_all_survive_unchanged():
+    keep, extra = render.snap_to_blocks({0, 1, 2}, [0, 0, 1])
+    assert keep == {0, 1, 2}
+    assert extra == set()
+
+
+def test_snap_identity_blocks_passthrough():
+    # 各単語が独立ブロック → 入力そのまま
+    keep, extra = render.snap_to_blocks({0, 2}, [0, 1, 2])
+    assert keep == {0, 2}
+    assert extra == set()
+
+
+def test_snap_empty_keep():
+    keep, extra = render.snap_to_blocks(set(), [0, 0, 1])
+    assert keep == set()
+    assert extra == set()
+
+
 # ---- surviving_words ----
 
 def test_survive_no_edit():
@@ -383,6 +417,97 @@ def test_render_missing_source_wav_raises(tmp_path):
     txt.write_text("[0001] あ\n", encoding="utf-8")
     with pytest.raises(FileNotFoundError):
         render.render(str(txt))
+
+
+def _make_block_project(tmp_path, sr=16000):
+    """3語 x 1秒。blocks=[0,0,1]（「あ」「い」が同ブロック、「う」が別ブロック）。"""
+    import soundfile as sf
+
+    seg = []
+    freqs = [220.0, 440.0, 660.0]
+    for fr in freqs:
+        t = np.arange(sr) / sr
+        seg.append(0.3 * np.sin(2 * np.pi * fr * t))
+    audio = np.concatenate(seg)
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), audio, sr, subtype="PCM_16")
+
+    data = {
+        "source_wav": str(wav.resolve()),
+        "language": "ja",
+        "model": "test",
+        "pause_threshold": 0.15,
+        "segments": [
+            {
+                "id": "0001",
+                "text": "あいう",
+                "words": [
+                    {"word": "あ", "start": 0.0, "end": 1.0, "probability": 0.9, "block": 0},
+                    {"word": "い", "start": 1.0, "end": 2.0, "probability": 0.9, "block": 0},
+                    {"word": "う", "start": 2.0, "end": 3.0, "probability": 0.9, "block": 1},
+                ],
+            }
+        ],
+    }
+    (tmp_path / "input.sc.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+    return wav
+
+
+def test_render_block_snap_removes_whole_block(tmp_path):
+    """ブロック内1語削除 → 同ブロックの2語とも音声から消える（尺で検証）。"""
+    import soundfile as sf
+
+    _make_block_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    # block0=「あい」の「い」を削除 → block0 全体（あい=2秒）が消え「う」1秒のみ残る
+    txt.write_text("[0001] あ／う\n", encoding="utf-8")
+
+    out = render.render(str(txt))
+    o_audio, sr = sf.read(out)
+    assert abs(len(o_audio) - 16000) < 3000
+
+
+def test_render_block_snap_warns(tmp_path, capsys):
+    """スナップで巻き込まれた語が警告に列挙される。"""
+    _make_block_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あ／う\n", encoding="utf-8")
+    render.render(str(txt))
+    err = capsys.readouterr().err
+    assert "ポーズ区切りに合わせて追加削除" in err
+    assert "あ" in err
+
+
+def test_render_block_other_block_kept(tmp_path):
+    """別ブロックは残る（block1「う」を消しても block0「あい」は残る）。"""
+    import soundfile as sf
+
+    _make_block_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あい\n", encoding="utf-8")  # 「う」削除
+
+    out = render.render(str(txt))
+    o_audio, sr = sf.read(out)
+    # block0（あい=2秒）残存
+    assert abs(len(o_audio) - 32000) < 3000
+
+
+def test_render_block_separator_kept_equals_no_edit(tmp_path):
+    """／を残したまま render は無編集と同一結果になる。"""
+    import soundfile as sf
+
+    _make_block_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あい／う\n", encoding="utf-8")
+    out = render.render(str(txt), output=str(tmp_path / "kept.wav"))
+    a, _ = sf.read(out)
+
+    txt.write_text("[0001] あいう\n", encoding="utf-8")
+    out2 = render.render(str(txt), output=str(tmp_path / "plain.wav"))
+    b, _ = sf.read(out2)
+    assert len(a) == len(b)
 
 
 def test_render_warns_on_insertion(tmp_path, capsys):

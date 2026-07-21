@@ -19,6 +19,8 @@ from pathlib import Path
 LOW_CONF_MARK = "◆"
 FILLER_OPEN = "〔"
 FILLER_CLOSE = "〕"
+# ブロック（カット可能単位）境界の区切り記号（transcribe と同一）
+BLOCK_SEP = "／"
 
 # 区間前後に付与するマージン（秒）と結合クロスフェード長（秒）
 MARGIN_S = 0.02
@@ -37,11 +39,13 @@ _FILLER_RE = re.compile(re.escape(FILLER_OPEN) + r"[^" + re.escape(FILLER_CLOSE)
 
 
 def _clean_edited_text(text: str) -> str:
-    """編集後テキストから ◆ を除去し、〔...〕 を中身ごと削除する。
+    """編集後テキストから ◆・／ を除去し、〔...〕 を中身ごと削除する。
 
     括弧が外されている（〔〕が無い）箇所は通常の文字として残る。
+    ／（ブロック区切り）は残しても消しても差分に影響しないよう除去する。
     """
     text = _FILLER_RE.sub("", text)
+    text = text.replace(BLOCK_SEP, "")
     text = text.replace(LOW_CONF_MARK, "")
     return text
 
@@ -117,6 +121,26 @@ def surviving_words(
             keep.add(wi)
         pos += length
     return keep, warnings
+
+
+def snap_to_blocks(
+    keep: set[int], blocks: list[int]
+) -> tuple[set[int], set[int]]:
+    """残す単語集合をブロック単位にスナップする（純関数）。
+
+    ブロック内に1単語でも削除（keep に無い）があれば、そのブロック全体を削除
+    する。戻り値: (スナップ後の keep, スナップで追加削除された index 集合)。
+    """
+    members: dict[int, list[int]] = {}
+    for i, b in enumerate(blocks):
+        members.setdefault(b, []).append(i)
+
+    new_keep: set[int] = set()
+    for b, idxs in members.items():
+        if all(i in keep for i in idxs):
+            new_keep.update(idxs)
+    extra = set(keep) - new_keep
+    return new_keep, extra
 
 
 def words_to_intervals(
@@ -363,11 +387,24 @@ def render(
         if seg is None:
             raise ValueError(f"json に存在しない ID です: [{seg_id}]")
         words = seg.get("words", []) or []
-        word_strs = [w.get("word", "") for w in words]
+        word_strs = [w.get("word", "").replace(BLOCK_SEP, "") for w in words]
 
         keep, warns = surviving_words(word_strs, edited)
         for w in warns:
             all_warnings.append(f"[{seg_id}] {w}")
+
+        # ポーズ区切り（ブロック）単位にスナップ。block を持たない旧 json は
+        # 各単語を独立ブロック扱い（＝従来の単語スナップ）にフォールバック。
+        if words and all("block" in w for w in words):
+            blocks = [w["block"] for w in words]
+        else:
+            blocks = list(range(len(words)))
+        keep, extra = snap_to_blocks(keep, blocks)
+        if extra:
+            removed = "".join(word_strs[i] for i in sorted(extra))
+            all_warnings.append(
+                f"[{seg_id}] ポーズ区切りに合わせて追加削除: {removed!r}"
+            )
 
         lo_b, hi_b = seg_bounds.get(seg_id, (0.0, file_length_s))
         intervals = words_to_intervals(

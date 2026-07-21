@@ -7,7 +7,7 @@ import sys
 
 from . import __version__
 from .render import GAP_MAX_S, GAP_THRESHOLD_S
-from .transcribe import DEFAULT_MODEL
+from .transcribe import DEFAULT_MODEL, PAUSE_THRESHOLD_S
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -37,6 +37,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--filler-suggest",
         action="store_true",
         help="フィラー候補の 〔〕 提案を有効化（既定: 無効）",
+    )
+    p_tr.add_argument(
+        "--pause-threshold",
+        type=float,
+        default=PAUSE_THRESHOLD_S,
+        help=(
+            f"この秒数以上の無音をカット可能なポーズ区切り（／）とする"
+            f"（既定: {PAUSE_THRESHOLD_S}）。0で全単語境界（旧挙動）"
+        ),
     )
 
     p_rn = sub.add_parser("render", help="編集後テキストから音声を再構成")
@@ -71,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
                 lang=args.lang,
                 model=args.model,
                 filler_suggest=args.filler_suggest,
+                pause_threshold=args.pause_threshold,
             )
         except (RuntimeError, FileNotFoundError) as exc:
             print(f"エラー: {exc}", file=sys.stderr)

@@ -26,11 +26,13 @@ WORD_DUR = 1.0  # 1単語=1秒
 
 # ---- 合成プロジェクト生成 -------------------------------------------------
 
-def _build_project(tmp_path, segments, sr=SR, subtype="PCM_16"):
+def _build_project(tmp_path, segments, sr=SR, subtype="PCM_16", blocks=None):
     """合成 wav + .sc.json を生成し、(wav パス, 無編集の txt 本文) を返す。
 
     segments: [[(word_str, freq_hz), ...], ...]  各内側リストが1セグメント。
     単語は 1秒ずつ、ソース時間軸で連続配置する。波形は位相連続。
+    blocks: segments と同形の [[block_idx, ...], ...]。指定時は各 word の json に
+    "block" を付与する（ポーズ区切り＝ブロック単位削除の検証用）。
     """
     inst_freq_parts: list[np.ndarray] = []
     json_segs: list[dict] = []
@@ -42,16 +44,17 @@ def _build_project(tmp_path, segments, sr=SR, subtype="PCM_16"):
         seg_id = f"{si + 1:04d}"
         words = []
         text = ""
-        for word, freq in seg:
+        for wi, (word, freq) in enumerate(seg):
             inst_freq_parts.append(np.full(n_per_word, float(freq)))
-            words.append(
-                {
-                    "word": word,
-                    "start": t_cursor,
-                    "end": t_cursor + WORD_DUR,
-                    "probability": 0.9,
-                }
-            )
+            wd = {
+                "word": word,
+                "start": t_cursor,
+                "end": t_cursor + WORD_DUR,
+                "probability": 0.9,
+            }
+            if blocks is not None:
+                wd["block"] = blocks[si][wi]
+            words.append(wd)
             text += word
             t_cursor += WORD_DUR
         json_segs.append({"id": seg_id, "text": text, "words": words})
@@ -166,6 +169,31 @@ def test_intra_line_delete(tmp_path):
     assert _freq_sequence(audio, sr, freqs) == [200, 600]
     # 「い」(1秒)が消え約2秒に短縮、前後が繋がる
     assert abs(len(audio) - 2 * SR) < SR // 4
+
+
+# ==========================================================================
+# §11.5 ポーズ区切り: ブロック内1語削除 → 同ブロック全語が出力から消える
+# ==========================================================================
+
+def test_block_snap_removes_whole_block(tmp_path):
+    freqs = [200, 400, 600]
+    # 1セグメント3語。blocks=[0,0,1]（あ・い が同ブロック、う が別ブロック）
+    _build_project(
+        tmp_path,
+        [[("あ", 200), ("い", 400), ("う", 600)]],
+        blocks=[[0, 0, 1]],
+    )
+    txt = tmp_path / "input.sc.txt"
+    # block0 の「い」だけ削除 → block0（あ・い）全体が消え「う」のみ残る
+    txt.write_text("[0001] あ／う\n", encoding="utf-8")
+
+    out = render.render(str(txt))
+    audio, sr = sf.read(out)
+    present = _present_freqs(audio, sr, freqs)
+    assert 200 not in present  # 巻き込み削除
+    assert 400 not in present  # 直接削除
+    assert present == {600}
+    assert _freq_sequence(audio, sr, freqs) == [600]
 
 
 # ==========================================================================

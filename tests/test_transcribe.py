@@ -104,6 +104,96 @@ def test_line_english_preserves_spaces():
     assert fc == 1
 
 
+# ---- assign_blocks（純関数） ----
+
+def _bw(start, end):
+    return {"word": "x", "start": start, "end": end, "probability": 0.9}
+
+
+def test_assign_blocks_empty():
+    assert transcribe.assign_blocks([], [], 0.15) == []
+
+
+def test_assign_blocks_threshold_zero_all_boundaries():
+    words = [_bw(0.0, 1.0), _bw(1.0, 2.0), _bw(2.0, 3.0)]
+    assert transcribe.assign_blocks(words, [], 0) == [0, 1, 2]
+
+
+def test_assign_blocks_no_silence_contiguous_single_block():
+    # ギャップ0・無音なし → 全て同一ブロック
+    words = [_bw(0.0, 1.0), _bw(1.0, 2.0), _bw(2.0, 3.0)]
+    assert transcribe.assign_blocks(words, [], 0.15) == [0, 0, 0]
+
+
+def test_assign_blocks_word_gap_is_boundary():
+    # word1→word2 のギャップ 0.3 ≥ 0.15 → 境界
+    words = [_bw(0.0, 1.0), _bw(1.3, 2.0), _bw(2.0, 3.0)]
+    assert transcribe.assign_blocks(words, [], 0.15) == [0, 1, 1]
+
+
+def test_assign_blocks_silence_maps_to_nearest_joint():
+    # 3語連続。無音 [0.95,1.2]（中点1.075）は接合点1.0に最も近い → word1 が境界
+    words = [_bw(0.0, 1.0), _bw(1.0, 2.0), _bw(2.0, 3.0)]
+    blocks = transcribe.assign_blocks(words, [(0.95, 1.2)], 0.15)
+    assert blocks == [0, 1, 1]
+
+
+def test_assign_blocks_silence_outside_segment_skipped():
+    # 無音中点 10.0 はどの単語対の [prev.start, cur.end] にも入らない → 無視
+    words = [_bw(0.0, 1.0), _bw(1.0, 2.0)]
+    assert transcribe.assign_blocks(words, [(9.9, 10.1)], 0.15) == [0, 0]
+
+
+def test_assign_blocks_none_times_not_boundary():
+    # start/end が None の対はギャップ・無音いずれでも境界にしない
+    words = [
+        {"word": "a", "start": 0.0, "end": None, "probability": 0.9},
+        {"word": "b", "start": None, "end": 2.0, "probability": 0.9},
+    ]
+    assert transcribe.assign_blocks(words, [(0.5, 1.5)], 0.15) == [0, 0]
+
+
+# ---- build_segment_line + blocks（／挿入） ----
+
+def test_line_block_separator_inserted():
+    ja = fillers_mod.load_fillers("ja")
+    words = _words(("結局", 0.9), ("面倒", 0.9))
+    line, _ = transcribe.build_segment_line("0001", words, ja, True, blocks=[0, 1])
+    assert line == "[0001 0:00] 結局／面倒"
+
+
+def test_line_block_separator_none_unchanged():
+    ja = fillers_mod.load_fillers("ja")
+    words = _words(("結局", 0.9), ("面倒", 0.9))
+    line, _ = transcribe.build_segment_line("0001", words, ja, True, blocks=None)
+    assert line == "[0001 0:00] 結局面倒"
+
+
+def test_line_block_separator_english_lead_space():
+    en = fillers_mod.load_fillers("en")
+    words = _words((" hello", 0.9), (" world", 0.9))
+    line, _ = transcribe.build_segment_line("0001", words, en, False, blocks=[0, 1])
+    body = line.split("] ", 1)[1]
+    # ／ は lead 空白の外側（前）に入る
+    assert body == " hello／ world"
+
+
+def test_line_block_separator_outside_brackets_and_before_mark():
+    # ／ は 〔〕の外側・◆の前。◆〔〕／ 除去で word 連結に一致（不変条件）
+    ja = fillers_mod.load_fillers("ja")
+    words = _words(("まあ", 0.9), ("動画", 0.3))  # まあ=filler, 動画=low conf
+    line, _ = transcribe.build_segment_line("0001", words, ja, True, blocks=[0, 1])
+    body = line.split("] ", 1)[1]
+    assert body == "〔まあ〕／◆動画"
+    cleaned = (
+        body.replace(transcribe.LOW_CONF_MARK, "")
+        .replace(transcribe.FILLER_OPEN, "")
+        .replace(transcribe.FILLER_CLOSE, "")
+        .replace(transcribe.BLOCK_SEP, "")
+    )
+    assert cleaned == "".join(w["word"] for w in words)
+
+
 # ---- 無音切り詰め: silencedetect パース / cuts / 逆写像（純関数） ----
 
 def test_parse_silence_periods():
@@ -222,7 +312,7 @@ def fake_whisper(monkeypatch):
     monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
     # ffmpeg変換・無音検出は行わない（無音なし＝逆写像は恒等）
     monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
-    monkeypatch.setattr(transcribe, "_detect_silence", lambda p: "")
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
     return captured
 
 
@@ -250,7 +340,10 @@ def test_transcribe_generates_files(tmp_path, fake_whisper):
         "start": 0.0,
         "end": 0.5,
         "probability": 0.95,
+        "block": 0,
     }
+    # トップレベルに pause_threshold メタが入る
+    assert "pause_threshold" in data
 
 
 def test_transcribe_txt_markers(tmp_path, fake_whisper):
@@ -316,7 +409,7 @@ def fake_whisper_en(monkeypatch):
     fake_mod.transcribe = fake_transcribe
     monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
     monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
-    monkeypatch.setattr(transcribe, "_detect_silence", lambda p: "")
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
     return fake_result
 
 
@@ -355,7 +448,7 @@ def test_transcribe_silence_trim_remaps_and_meta(tmp_path, monkeypatch):
     monkeypatch.setattr(
         transcribe,
         "_detect_silence",
-        lambda p: "silence_start: 2.0\nsilence_end: 5.0 | silence_duration: 3.0\n",
+        lambda p, **k: "silence_start: 2.0\nsilence_end: 5.0 | silence_duration: 3.0\n",
     )
 
     res = transcribe.transcribe(str(wav), lang="ja")
@@ -370,6 +463,67 @@ def test_transcribe_silence_trim_remaps_and_meta(tmp_path, monkeypatch):
     assert data["silence_trim"]["count"] == 1
     assert data["silence_trim"]["removed_s"] == pytest.approx(2.3, abs=0.01)
     assert res["silence_cut_count"] == 1
+
+
+def test_transcribe_blocks_and_pause_threshold(tmp_path, monkeypatch):
+    """ブロック割当: 単語ギャップ≥閾値で json に block・txt に ／ が入る。"""
+    fake_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "結局面倒",
+                "words": [
+                    {"word": "結局", "start": 0.0, "end": 0.5, "probability": 0.9},
+                    # 0.5→0.8 のギャップ 0.3 ≥ 0.15 → ブロック境界
+                    {"word": "面倒", "start": 0.8, "end": 1.2, "probability": 0.9},
+                ],
+            },
+        ],
+    }
+
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda path, **kwargs: fake_result
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja", pause_threshold=0.15)
+    data = res["data"]
+    assert data["pause_threshold"] == 0.15
+    ws = data["segments"][0]["words"]
+    assert ws[0]["block"] == 0
+    assert ws[1]["block"] == 1
+    txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
+    assert txt.splitlines()[0] == "[0001 0:00] 結局／面倒"
+
+
+def test_transcribe_pause_threshold_zero_no_separator_dense(tmp_path, monkeypatch):
+    """pause_threshold=0 は全単語境界（各単語独立ブロック・／は全境界に入る）。"""
+    fake_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "結局面倒",
+                "words": [
+                    {"word": "結局", "start": 0.0, "end": 0.5, "probability": 0.9},
+                    {"word": "面倒", "start": 0.5, "end": 1.0, "probability": 0.9},
+                ],
+            },
+        ],
+    }
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda path, **kwargs: fake_result
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja", pause_threshold=0)
+    ws = res["data"]["segments"][0]["words"]
+    assert [w["block"] for w in ws] == [0, 1]
+    txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
+    assert txt.splitlines()[0] == "[0001 0:00] 結局／面倒"
 
 
 def test_transcribe_default_lang_is_ja(tmp_path, fake_whisper):

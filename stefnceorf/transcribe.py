@@ -21,12 +21,18 @@ SILENCE_DB = -50  # 発話レベルが低い音源で静かな発話を無音と
 SILENCE_MIN_S = 1.5
 SILENCE_KEEP_S = 0.7
 
+# ポーズベース区切り（ブロック単位削除）設定
+# この秒数以上の無音を「カット可能なポーズ区切り」としてブロック境界にする
+PAUSE_THRESHOLD_S = 0.15
+
 _SILENCE_RE = re.compile(r"silence_(start|end):\s*(-?\d+(?:\.\d+)?)")
 
 # 表示用マーカー（render 側で除去する前提）
 LOW_CONF_MARK = "◆"
 FILLER_OPEN = "〔"
 FILLER_CLOSE = "〕"
+# ブロック（カット可能単位）境界を示す区切り記号（全角スラッシュ、render 側で除去）
+BLOCK_SEP = "／"
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 
@@ -153,14 +159,90 @@ def remap_words(
     return out
 
 
-def _detect_silence(wav_path: str) -> str:
-    """ffmpeg silencedetect を実行し stderr を返す。失敗時は空文字列。"""
+def assign_blocks(
+    words: list[dict],
+    silences: list[tuple[float, float]],
+    threshold: float,
+) -> list[int]:
+    """単語列にセグメント内ブロックindex（0始まり）を割り当てて返す（純関数）。
+
+    ブロック＝カット可能な単位。以下のいずれかで単語 i とその前の単語の間を
+    ブロック境界とする:
+    - `duration >= threshold` の無音期間の中点 m が、その単語対の接合時刻
+      `(prev.end + cur.start)/2` に最も近く、かつ m が `[prev.start, cur.end]`
+      に収まる（他セグメントの無音を巻き込まないガード）
+    - 単語ギャップ `cur.start - prev.end >= threshold`（無音切り詰め箇所は
+      remap でギャップが拡大し自然に境界になる）
+
+    `start`/`end` が None の対は境界にしない（安全側）。空リストは `[]`。
+    `threshold == 0` は全単語を独立ブロックにする（＝全境界＝旧挙動）。
+    """
+    n = len(words)
+    if n == 0:
+        return []
+    if threshold <= 0:
+        return list(range(n))
+
+    boundary = [False] * n
+
+    # 各接合点（i-1, i の間）の接合時刻。None 時刻対は None。
+    joints: list[float | None] = [None]  # index 0 はダミー
+    for i in range(1, n):
+        pe = words[i - 1].get("end")
+        cs = words[i].get("start")
+        if pe is None or cs is None:
+            joints.append(None)
+            continue
+        joints.append((float(pe) + float(cs)) / 2.0)
+        # 単語ギャップ境界
+        if float(cs) - float(pe) >= threshold:
+            boundary[i] = True
+
+    # 各無音期間の中点を最寄りの接合点にマップして境界化
+    for s, e in silences:
+        if (e - s) < threshold:
+            continue
+        m = (s + e) / 2.0
+        best_i: int | None = None
+        best_dist: float | None = None
+        for i in range(1, n):
+            j = joints[i]
+            if j is None:
+                continue
+            ps = words[i - 1].get("start")
+            ce = words[i].get("end")
+            if ps is None or ce is None:
+                continue
+            if not (float(ps) <= m <= float(ce)):
+                continue
+            dist = abs(j - m)
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_i = i
+        if best_i is not None:
+            boundary[best_i] = True
+
+    blocks = [0] * n
+    b = 0
+    for i in range(1, n):
+        if boundary[i]:
+            b += 1
+        blocks[i] = b
+    return blocks
+
+
+def _detect_silence(wav_path: str, d: float = SILENCE_MIN_S) -> str:
+    """ffmpeg silencedetect を実行し stderr を返す。失敗時は空文字列。
+
+    d は最小無音長（秒）。ポーズ区切り検出時は短い d で1回だけ実行し、
+    結果を用途別（切り詰め用・ブロック境界用）にフィルタして使う。
+    """
     cmd = [
         "ffmpeg",
         "-i",
         wav_path,
         "-af",
-        f"silencedetect=noise={SILENCE_DB}dB:d={SILENCE_MIN_S}",
+        f"silencedetect=noise={SILENCE_DB}dB:d={d}",
         "-f",
         "null",
         "-",
@@ -224,15 +306,19 @@ def _seg_id(index: int) -> str:
 
 
 def build_segment_line(seg_id: str, words: list[dict], fillers: set[str],
-                       filler_suggest: bool) -> tuple[str, int]:
+                       filler_suggest: bool,
+                       blocks: list[int] | None = None) -> tuple[str, int]:
     """1セグメントの .sc.txt 行文字列とフィラー候補数を組み立てる。
 
-    表示テキストは json の words から再構成する。◆ と 〔〕 を取り除くと
+    表示テキストは json の words から再構成する。◆・〔〕・／ を取り除くと
     words の word 文字列の連結に一致する（render の文字diff→単語逆引き用）。
+
+    blocks が渡された場合、ブロック境界（blocks[i] != blocks[i-1]）の直前に
+    区切り記号 ／ を挿入する（lead 空白・〔〕の外側、◆の前）。
     """
     parts: list[str] = []
     filler_count = 0
-    for w in words:
+    for idx, w in enumerate(words):
         raw = w.get("word", "")
         core = raw.lstrip()
         lead = raw[: len(raw) - len(core)]
@@ -244,7 +330,10 @@ def build_segment_line(seg_id: str, words: list[dict], fillers: set[str],
             filler_count += 1
         if prob is not None and prob < LOW_CONF_THRESHOLD:
             piece = f"{LOW_CONF_MARK}{piece}"
-        parts.append(lead + piece)
+        segment = lead + piece
+        if blocks is not None and idx > 0 and blocks[idx] != blocks[idx - 1]:
+            segment = BLOCK_SEP + segment
+        parts.append(segment)
 
     text = "".join(parts)
     if words:
@@ -259,6 +348,7 @@ def transcribe(
     lang: str | None = "ja",
     model: str = DEFAULT_MODEL,
     filler_suggest: bool = False,
+    pause_threshold: float = PAUSE_THRESHOLD_S,
 ) -> dict:
     """入力wavを文字起こしし、.sc.json / .sc.txt を生成する。
 
@@ -271,8 +361,22 @@ def transcribe(
         raise FileNotFoundError(f"入力ファイルが見つかりません: {input_wav}")
 
     tmp_wav = _convert_to_16k_mono(str(input_path))
-    # 認識用wavのみ長い無音を切り詰める（元wavは不変）。単語時刻は後段で元時刻へ逆写像。
-    cuts = build_cuts(parse_silence_periods(_detect_silence(tmp_wav)))
+    # silencedetect を1回だけ実行し、用途別にフィルタする（元wavは不変）。
+    # pause_threshold>0 のときはブロック境界検出用に短い d で検出する。
+    if pause_threshold and pause_threshold > 0:
+        det_d = min(pause_threshold, SILENCE_MIN_S)
+    else:
+        det_d = SILENCE_MIN_S
+    periods = parse_silence_periods(_detect_silence(tmp_wav, d=det_d))
+    # 認識用wav切り詰め用: SILENCE_MIN_S 以上の長い無音のみ
+    cut_periods = [p for p in periods if (p[1] - p[0]) >= SILENCE_MIN_S]
+    # ブロック境界用: pause_threshold 以上の全無音
+    if pause_threshold and pause_threshold > 0:
+        block_silences = [p for p in periods if (p[1] - p[0]) >= pause_threshold]
+    else:
+        block_silences = []
+    # 認識用wavのみ長い無音を切り詰める。単語時刻は後段で元時刻へ逆写像。
+    cuts = build_cuts(cut_periods)
     trimmed_wav, removed_s = _write_trimmed_wav(tmp_wav, cuts)
     recog_wav = trimmed_wav
     try:
@@ -314,6 +418,10 @@ def transcribe(
             )
         # 認識用wavの時刻を元音源の時刻へ逆写像（cuts が空なら恒等）
         words = remap_words(words, cuts)
+        # ポーズベースのブロック割当（各 word に "block" を付与）
+        blocks = assign_blocks(words, block_silences, pause_threshold)
+        for wi, w in enumerate(words):
+            w["block"] = blocks[wi]
         segments_out.append(
             {
                 "id": seg_id,
@@ -321,7 +429,9 @@ def transcribe(
                 "words": words,
             }
         )
-        line, fcount = build_segment_line(seg_id, words, fillers, filler_suggest)
+        line, fcount = build_segment_line(
+            seg_id, words, fillers, filler_suggest, blocks=blocks
+        )
         lines.append(line)
         total_fillers += fcount
 
@@ -329,6 +439,7 @@ def transcribe(
         "source_wav": str(input_path.resolve()),
         "language": result.get("language", lang),
         "model": model,
+        "pause_threshold": pause_threshold,
         "silence_trim": {
             "count": len(cuts),
             "removed_s": round(removed_s, 3),
