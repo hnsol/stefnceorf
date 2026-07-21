@@ -157,9 +157,18 @@ def test_intervals_merges_consecutive():
 
 def test_intervals_margin_applied():
     words = [_w(1.0, 2.0)]
-    # 前後に十分な余地（lo=0, hi=10）→ フルにマージンが乗る
-    ivs = render.words_to_intervals(words, {0}, margin=0.02, lo=0.0, hi=10.0)
+    # 前後に十分な余地（lo=0, hi=10）→ start は margin、end は tail_margin まで拡張
+    ivs = render.words_to_intervals(words, {0}, margin=0.02, tail_margin=0.02,
+                                     lo=0.0, hi=10.0)
     assert ivs == [(pytest.approx(0.98), pytest.approx(2.02))]
+
+
+def test_intervals_tail_margin_extends_end():
+    words = [_w(1.0, 2.0)]
+    # tail_margin=0.2 で後方に余地あり → end は 2.0+0.2=2.2 まで拡張
+    ivs = render.words_to_intervals(words, {0}, margin=0.02, tail_margin=0.2,
+                                     lo=0.0, hi=10.0)
+    assert ivs == [(pytest.approx(0.98), pytest.approx(2.2))]
 
 
 def test_intervals_no_intrusion_into_deleted_neighbors():
@@ -630,10 +639,10 @@ def test_render_gap_trim_and_keep(tmp_path):
 
     out = render.render(str(txt))
     o_audio, sr = sf.read(out)
-    # 期待: seg1(≈1.04) + トリム無音(≈0.7) + seg2〜seg3を短ポーズ込みで連続(≈2.87)
-    # ≈ 4.24s。単純に単語だけ残す旧動作(≈3.08s)より長く、全保持(6.5s)より短い。
+    # 期待: seg1(≈1.22) + トリム無音(≈0.7) + seg2〜seg3を短ポーズ込みで連続(≈2.87)
+    # ≈ 4.42s。tail_margin=0.2 で後方マージンが拡張されている。
     dur = len(o_audio) / sr
-    assert dur == pytest.approx(4.24, abs=0.15)
+    assert dur == pytest.approx(4.42, abs=0.15)
 
 
 def test_render_gap_threshold_keeps_all(tmp_path):

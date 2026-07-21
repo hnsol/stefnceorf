@@ -24,6 +24,7 @@ BLOCK_SEP = "／"
 
 # 区間前後に付与するマージン（秒）と結合クロスフェード長（秒）
 MARGIN_S = 0.02
+TAIL_MARGIN_S = 0.2
 FADE_S = 0.008
 
 # ギャップ（無音ポーズ）保持・切り詰めのしきい値と上限（秒）
@@ -147,13 +148,14 @@ def words_to_intervals(
     words: list[dict],
     keep_indices: set[int],
     margin: float = MARGIN_S,
+    tail_margin: float = TAIL_MARGIN_S,
     lo: float = 0.0,
     hi: float | None = None,
 ) -> list[tuple[float, float]]:
     """残す単語の連続区間をマージし、マージン付与＋クランプした時間区間を返す。
 
     - 連続する残す単語（index が隣接）を1区間にまとめる
-    - 各区間の前後に margin を付与
+    - 各区間の前後に margin を付与（後方は tail_margin まで拡張可能）
     - ただし前後の（削除された）隣接単語の境界、および [lo, hi] に食い込まない
       範囲でクランプする（削除区間・隣接カットに食い込まない）
     """
@@ -182,10 +184,10 @@ def words_to_intervals(
         if j + 1 < n:
             next_bound = float(words[j + 1]["start"])
         else:
-            next_bound = hi if hi is not None else (raw_end + margin)
+            next_bound = hi if hi is not None else (raw_end + tail_margin)
 
         start = max(raw_start - margin, prev_bound, lo)
-        end = raw_end + margin
+        end = raw_end + min(tail_margin, max(margin, next_bound - raw_end))
         end = min(end, next_bound)
         if hi is not None:
             end = min(end, hi)
