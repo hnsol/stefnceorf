@@ -120,6 +120,25 @@ def test_survive_partial_char_delete_removes_word():
     assert keep == {0, 2}
 
 
+def test_survive_punct_diff_ambiguity_no_dragging():
+    """読点付きトークンの diff 曖昧性で隣の単語を巻き込まない（回帰テスト）。
+
+    「…を、」＋「あの、」から「あの、」を削除すると、difflib は削除を
+    「、あの」に整列することがある。句読点は生存判定から除外するため
+    「生成AIを、」は巻き込まれない。
+    """
+    words = ["生成AIが", "生成AIを、", "あの、", "最先端の"]
+    keep, warns = render.surviving_words(words, "生成AIが生成AIを、最先端の")
+    assert keep == {0, 1, 3}
+
+
+def test_survive_punct_only_word_always_kept():
+    # 句読点のみの単語は判定対象文字がなく常に生存扱い（空白のみと同様）
+    words = ["結局", "、", "面倒"]
+    keep, _ = render.surviving_words(words, "結局、面倒")
+    assert keep == {0, 1, 2}
+
+
 def test_survive_insertion_warns_and_keeps():
     words = ["結局", "面倒"]
     keep, warns = render.surviving_words(words, "結局X面倒")

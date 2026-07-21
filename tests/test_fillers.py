@@ -3,10 +3,11 @@ from stefnceorf import fillers
 
 def test_load_ja_defaults():
     ja = fillers.load_fillers("ja")
-    for w in ["あのー", "そのー", "えー", "え", "えっと", "まあ", "うーん"]:
+    for w in ["あのー", "そのー", "えー", "えっと", "まあ", "うーん"]:
         assert w in ja
-    # 間投詞でない語は辞書から除外されている
-    for w in ["あの", "その", "なんか", "こう"]:
+    # 「え」は返事・相槌と紛らわしいため辞書から除外
+    # 間投詞でない語も辞書から除外されている
+    for w in ["え", "あの", "その", "なんか", "こう"]:
         assert w not in ja
 
 

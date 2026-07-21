@@ -22,6 +22,9 @@ FILLER_CLOSE = "〕"
 # ブロック（カット可能単位）境界の区切り記号（transcribe と同一）
 BLOCK_SEP = "／"
 
+# 単語の生存判定で無視する句読点・記号（diff の曖昧性対策。fillers._STRIP_PUNCT と同系）
+_JOIN_PUNCT = "、。，．！？!?…・,."
+
 # 区間前後に付与するマージン（秒）と結合クロスフェード長（秒）
 MARGIN_S = 0.02
 TAIL_MARGIN_S = 0.2
@@ -113,10 +116,15 @@ def surviving_words(
     pos = 0
     for wi, w in enumerate(original_words):
         length = len(w)
-        # 単語先頭・末尾の空白（英語トークンの整形上の区切り）は diff の
-        # 曖昧性で削除側に寄りやすいため、生存判定は非空白文字のみで行う。
+        # 単語先頭・末尾の空白（英語トークンの整形上の区切り）と句読点・記号
+        # （verbatim転写の「を、」「あの、」等）は diff の曖昧性で削除側に
+        # 寄りやすいため、生存判定は本体文字のみで行う。
+        # 例: 「…を、」＋「あの、」→「…を、」の編集で、削除が「あの、」でなく
+        # 「、あの」に整列しても「を、」の単語を巻き込まない。
         core_positions = [
-            pos + k for k, ch in enumerate(w) if not ch.isspace()
+            pos + k
+            for k, ch in enumerate(w)
+            if not ch.isspace() and ch not in _JOIN_PUNCT
         ]
         if not core_positions or all(survived[p] for p in core_positions):
             keep.add(wi)

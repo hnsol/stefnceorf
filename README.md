@@ -121,7 +121,7 @@ stefnceorf render input.sc.txt [-o output.wav] [--gap-threshold 1.5] [--gap-max 
 
 フィラー候補は辞書との**完全一致**で `〔〕` に包まれる（部分一致はしない）。辞書はパッケージ同梱の以下のファイル（1行1語）で編集できる。
 
-- 日本語: `stefnceorf/fillers_ja.txt`（既定: あのー, そのー, えー, え, えっと, えと, まあ, まー, うーん）
+- 日本語: `stefnceorf/fillers_ja.txt`（既定: あのー, そのー, えー, えっと, えと, まあ, まー, うーん）
 - 英語: `stefnceorf/fillers_en.txt`（既定: um, uh, uhm, er, ah）
 
 既定辞書は間投詞（言い淀み・つなぎ語）のみを収録している。あくまで提案であり、括弧を外せば却下できる。フィラー提案は既定で無効のため、使用時は `--filler-suggest` を指定する。
