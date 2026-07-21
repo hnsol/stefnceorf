@@ -34,9 +34,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--model", default=DEFAULT_MODEL, help=f"mlx-whisperモデル (既定: {DEFAULT_MODEL})"
     )
     p_tr.add_argument(
-        "--no-filler-suggest",
+        "--filler-suggest",
         action="store_true",
-        help="フィラー候補の 〔〕 提案を無効化",
+        help="フィラー候補の 〔〕 提案を有効化（既定: 無効）",
     )
 
     p_rn = sub.add_parser("render", help="編集後テキストから音声を再構成")
@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.input,
                 lang=args.lang,
                 model=args.model,
-                filler_suggest=not args.no_filler_suggest,
+                filler_suggest=args.filler_suggest,
             )
         except (RuntimeError, FileNotFoundError) as exc:
             print(f"エラー: {exc}", file=sys.stderr)
@@ -82,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"無音切り詰め: {res['silence_cut_count']}箇所 "
                 f"-{res['silence_removed_s']:.1f}秒"
             )
-        if not args.no_filler_suggest:
+        if args.filler_suggest:
             print(f"フィラー候補: {res['filler_count']}箇所")
         return 0
 

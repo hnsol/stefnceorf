@@ -45,7 +45,7 @@ input.edited.wav
 ## 4. CLI仕様
 
 ```
-stefnceorf transcribe input.wav [--lang ja|en] [--model MODEL] [--no-filler-suggest]
+stefnceorf transcribe input.wav [--lang ja|en] [--model MODEL] [--filler-suggest]
   → input.sc.txt / input.sc.json を生成
   --model 既定: mlx-community/whisper-large-v3-turbo（導入済み）
 
@@ -83,7 +83,7 @@ stefnceorf render input.sc.txt [-o output.wav]
 - 既定辞書（en）：um, uh, uhm, er, ah
 - 辞書は設定ファイル（例：`fillers_ja.txt`、1行1語）で編集可能
 - **あくまで提案**。指示語の「その」「あの」（例：そのウェブサイト）と間投詞は音声認識結果だけでは区別できないため、誤検出は起こる。だからこそ自動確定ではなく `〔〕` 提案とし、ユーザーが括弧を外して却下できる設計にする
-- transcribe時に検出数を表示（例：`フィラー候補: 37箇所`）。`--no-filler-suggest` で無効化
+- transcribe時に検出数を表示（例：`フィラー候補: 37箇所`）。フィラー提案は既定で無効。`--filler-suggest` で有効化（既定は無効）
 
 ## 7. 技術選定
 
@@ -130,6 +130,7 @@ v1（faster-whisper＋WhisperX 2段構成）からの変更理由：導入済み
 - **無音切り詰めをスコープに追加**（§2の「沈黙除去はやらない」を変更）：前処理はノイズ除去のみでよい。transcribeは認識用一時wavの無音（1.5s超）を0.7sに切り詰めてWhisper幻覚を抑止し、単語時刻を元音源へ逆写像。renderは残存区間間の無音ギャップを保持しつつ1.5s超を0.7sに切り詰め（`--gap-threshold` / `--gap-max`）
 - **.sc.txt 行頭に開始時刻を併記**：`[0001 12:34] テキスト`（renderは時刻を無視、旧形式互換）
 - **フィラー既定辞書（ja）を間投詞のみに縮小**：指示語系（あの・その・なんか・こう）を除外し誤検出を削減
+- **フィラー提案を既定無効に変更**：日本語ではWhisperがフィラーを吸収するため検出率が低い。`--filler-suggest` で有効化（既定は無効）
 
 ## 12. 受け入れテスト
 

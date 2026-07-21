@@ -6,3 +6,4 @@ __pycache__/
 *.wav
 *.sc.txt
 *.sc.json
+.DS_Store

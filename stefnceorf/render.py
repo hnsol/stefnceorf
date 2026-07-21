@@ -189,7 +189,7 @@ def plan_output_intervals(
     word_spans: list[tuple[float, float]],
     gap_threshold: float = GAP_THRESHOLD_S,
     gap_max: float = GAP_MAX_S,
-) -> list[tuple[float, float]]:
+) -> tuple[list[tuple[float, float]], list[bool]]:
     """出力順のソース区間列から、ギャップ保持/切り詰めを適用した出力区間列を返す。
 
     隣接する区間 (prev, cur) の境界について、ソース時間軸上のギャップ
@@ -200,14 +200,16 @@ def plan_output_intervals(
     - 純粋な無音ギャップ かつ g ≤ gap_threshold: ギャップ音声を保持
       （＝1つの連続区間としてマージ。クロスフェードは入らない）
     - 純粋な無音ギャップ かつ g > gap_threshold: gap_max に切り詰め
-      （前側 gap_max/2 ＋ 後側 gap_max/2 を残し中間をカット、境界はクロスフェード）
+      （前側 gap_max/2 ＋ 後側 gap_max/2 を残し中間をカット、単純結合）
 
-    戻り値は crossfade_concat へ渡す前提の区間列（連続する区間はクロスフェード結合される）。
+    戻り値: (区間列, クロスフェードフラグ列)。フラグ列の長さは len(区間列)-1。
+    True=クロスフェード結合、False=単純結合（ギャップ切り詰め境界）。
     """
     if not intervals:
-        return []
+        return [], []
 
     out: list[tuple[float, float]] = []
+    cf_flags: list[bool] = []
     pending = [intervals[0][0], intervals[0][1]]
     half = gap_max / 2.0
     for k in range(1, len(intervals)):
@@ -218,18 +220,18 @@ def plan_output_intervals(
         eligible = g >= 0 and not _word_in_gap(word_spans, pe, ns)
         if eligible:
             if g <= gap_threshold or g <= gap_max:
-                # 保持: ギャップ音声を含めて連続区間にマージ
                 pending[1] = cur[1]
             else:
-                # 切り詰め: 前側 half を残して確定、後側 half から次区間を開始
                 pending[1] = pe + half
                 out.append((pending[0], pending[1]))
+                cf_flags.append(False)
                 pending = [ns - half, cur[1]]
         else:
             out.append((pending[0], pending[1]))
+            cf_flags.append(True)
             pending = [cur[0], cur[1]]
     out.append((pending[0], pending[1]))
-    return out
+    return out, cf_flags
 
 
 def _apply_weights(block, weights):
@@ -239,23 +241,36 @@ def _apply_weights(block, weights):
     return block * weights
 
 
-def crossfade_concat(chunks: list, fade_samples: int):
-    """音声チャンク列を等パワークロスフェードで結合する。
+def crossfade_concat(
+    chunks: list, fade_samples: int, crossfade_flags: list[bool] | None = None
+):
+    """音声チャンク列を結合する。
 
-    境界で前チャンクの末尾と次チャンクの先頭を重ね、
-    sin/cos の等パワー窓（二乗和=1）でクリックノイズを防ぐ。
+    crossfade_flags が None または True の境界では等パワークロスフェード
+    （sin/cos 窓でクリックノイズ防止）、False の境界では単純結合。
     """
     import numpy as np
 
-    valid = [c for c in chunks if len(c) > 0]
+    valid = []
+    valid_cf: list[bool] = []
+    for i, c in enumerate(chunks):
+        if len(c) > 0:
+            if valid and crossfade_flags is not None:
+                valid_cf.append(crossfade_flags[i - 1] if i - 1 < len(crossfade_flags) else True)
+            valid.append(c)
+
     if not valid:
-        # 空。呼び出し側で作った配列の形状（mono/2ch）に合わせられないため
-        # 空の1次元配列を返す。
         return np.zeros(0, dtype=np.float64)
 
+    use_flags = valid_cf if crossfade_flags is not None else None
+
     out = valid[0].astype(np.float64)
-    for nxt in valid[1:]:
+    for idx, nxt in enumerate(valid[1:]):
         nxt = nxt.astype(np.float64)
+        do_cf = use_flags[idx] if use_flags and idx < len(use_flags) else True
+        if not do_cf:
+            out = np.concatenate([out, nxt], axis=0)
+            continue
         f = min(fade_samples, len(out), len(nxt))
         if f <= 0:
             out = np.concatenate([out, nxt], axis=0)
@@ -360,19 +375,26 @@ def render(
         )
         plan_intervals.extend(intervals)
 
-    out_intervals = plan_output_intervals(
+    out_intervals, cf_flags = plan_output_intervals(
         plan_intervals, word_spans, gap_threshold=gap_threshold, gap_max=gap_max
     )
 
     chunks = []
-    for start, end in out_intervals:
+    kept_indices = []
+    for i, (start, end) in enumerate(out_intervals):
         s0 = max(0, int(round(start * samplerate)))
         s1 = min(total_samples, int(round(end * samplerate)))
         if s1 > s0:
             chunks.append(audio[s0:s1])
+            kept_indices.append(i)
+
+    valid_flags = []
+    for j in range(1, len(kept_indices)):
+        idx = kept_indices[j] - 1
+        valid_flags.append(cf_flags[idx] if idx < len(cf_flags) else True)
 
     fade_samples = int(round(FADE_S * samplerate))
-    result = crossfade_concat(chunks, fade_samples)
+    result = crossfade_concat(chunks, fade_samples, valid_flags if valid_flags else None)
 
     # 出力形状を元音声のチャンネル構成へ合わせる
     if len(result) == 0 and audio.ndim == 2:

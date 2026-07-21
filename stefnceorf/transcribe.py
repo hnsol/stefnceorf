@@ -258,7 +258,7 @@ def transcribe(
     input_wav: str,
     lang: str | None = "ja",
     model: str = DEFAULT_MODEL,
-    filler_suggest: bool = True,
+    filler_suggest: bool = False,
 ) -> dict:
     """入力wavを文字起こしし、.sc.json / .sc.txt を生成する。
 

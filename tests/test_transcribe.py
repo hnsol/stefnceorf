@@ -255,7 +255,7 @@ def test_transcribe_generates_files(tmp_path, fake_whisper):
 
 def test_transcribe_txt_markers(tmp_path, fake_whisper):
     wav = _make_input(tmp_path)
-    res = transcribe.transcribe(str(wav), lang="ja")
+    res = transcribe.transcribe(str(wav), lang="ja", filler_suggest=True)
     txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
     lines = txt.splitlines()
     # seg1: 最初の単語 start=0.0 → 0:00、〔まあ〕 と 面倒(prob0.3)の◆
@@ -382,7 +382,7 @@ def test_transcribe_default_lang_is_ja(tmp_path, fake_whisper):
 def test_transcribe_auto_lang_uses_detected_dict(tmp_path, fake_whisper_en):
     """--lang未指定でも result['language']=='en' なら en辞書で 'um' を検出する。"""
     wav = _make_input(tmp_path)
-    res = transcribe.transcribe(str(wav), lang=None)
+    res = transcribe.transcribe(str(wav), lang=None, filler_suggest=True)
     txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
     lines = txt.splitlines()
     assert lines[0] == "[0001 0:00]  so 〔um〕 yeah"

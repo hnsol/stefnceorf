@@ -6,6 +6,24 @@
 
 正式コマンドは `stefnceorf`、2文字エイリアス `sc`（同一動作）。
 
+## 特徴
+
+- 全処理ローカル完結・無料（mlx-whisperによるApple Silicon GPU文字起こし）
+- 単語単位のタイムスタンプ・信頼度スコア付き文字起こし
+- フィラー語（言い淀み）の自動検出・削除提案（辞書ベース、誤検出は却下可能）
+- 低信頼箇所の自動マーキングで聞き直し箇所を絞り込み
+- 長い無音の自動切り詰め（Whisperの幻覚対策＋出力の間延び防止）
+- テキスト削除・並べ替えを非破壊で音声へ反映（何度でも再実行可能）
+- カット境界は等パワークロスフェードでクリックノイズを防止
+
+## クイックスタート
+
+```sh
+sc transcribe input.wav          # input.sc.txt / input.sc.json を生成
+$EDITOR input.sc.txt             # テキストを編集（削除・並べ替え）
+sc render input.sc.txt           # input.edited.wav を生成
+```
+
 ## 前提
 
 - Apple Silicon Mac / Python 3.11+
@@ -47,14 +65,14 @@ ln -s "$(pwd)/.venv/bin/sc" /opt/homebrew/bin/sc
 ### 1. 文字起こし
 
 ```sh
-stefnceorf transcribe input.wav [--lang ja|en] [--model MODEL] [--no-filler-suggest]
+stefnceorf transcribe input.wav [--lang ja|en] [--model MODEL] [--filler-suggest]
 # sc transcribe input.wav でも同じ
 ```
 
 - `input.sc.txt`（人間が編集するテキスト）と `input.sc.json`（単語→時刻・信頼度の対応表、触らない）を生成する
 - `--lang` 既定 `ja`。英語は `--lang en` で明示指定。自動判定は `--lang` なし呼び出し (`lang=None`) で可能
 - `--model` 既定 `mlx-community/whisper-large-v3-turbo`
-- フィラー候補数を表示。`--no-filler-suggest` で提案を無効化
+- フィラー提案は既定で無効。`--filler-suggest` で有効化（有効時は候補数を表示）
 - 認識用の一時 wav に限り長い無音（1.5秒以上）を 0.7秒へ切り詰めて Whisper の幻覚を抑える。単語時刻は元音源の時刻へ逆写像するため出力音声には影響しない（元 wav は不変）。切り詰めがあれば箇所数と短縮秒数を表示する
 
 ### 2. 編集して音声へ反映
@@ -68,8 +86,9 @@ stefnceorf render input.sc.txt [-o output.wav] [--gap-threshold 1.5] [--gap-max 
 
 - 編集後 txt と同じ場所の `input.sc.json` を突き合わせ、残す単語の時間区間を算出し、**元の input.wav**（`.sc.json` の `source_wav`）から切り出して再構成する
 - `-o` 省略時の出力は `input.edited.wav`
-- 出力は元 wav と同一のサンプルレート・ビット深度。カット境界は等パワークロスフェードでクリックノイズを防ぐ
-- セグメント間の無音ポーズは保持される。`--gap-threshold`（既定 1.5秒）以下のポーズはそのまま残し、超える長い無音は `--gap-max`（既定 0.7秒）に切り詰める（間が詰まりすぎるのを防ぐ）
+- 出力は元 wav と同一のサンプルレート・ビット深度
+- 単語削除・行並べ替えで生じる接合部は等パワークロスフェードでクリックノイズを防ぐ
+- セグメント間の無音ポーズは保持される。`--gap-threshold`（既定 1.5秒）以下のポーズはそのまま残し、超える長い無音は `--gap-max`（既定 0.7秒）に切り詰める（間が詰まりすぎるのを防ぐ）。この切り詰め境界は無音同士の結合のため単純結合とし、クロスフェードは行わない（発話音声を混ぜないため）
 - 非破壊。何度でも再実行できる
 
 ## 編集ルール（input.sc.txt）
@@ -96,7 +115,7 @@ stefnceorf render input.sc.txt [-o output.wav] [--gap-threshold 1.5] [--gap-max 
 - 日本語: `stefnceorf/fillers_ja.txt`（既定: あのー, そのー, えー, え, えっと, えと, まあ, まー, うーん）
 - 英語: `stefnceorf/fillers_en.txt`（既定: um, uh, uhm, er, ah）
 
-既定辞書は間投詞（言い淀み・つなぎ語）のみを収録している。あくまで提案であり、括弧を外せば却下できる。`--no-filler-suggest` で提案自体を無効化できる。
+既定辞書は間投詞（言い淀み・つなぎ語）のみを収録している。あくまで提案であり、括弧を外せば却下できる。フィラー提案は既定で無効のため、使用時は `--filler-suggest` を指定する。
 
 ## 制約と注意
 
@@ -105,3 +124,15 @@ stefnceorf render input.sc.txt [-o output.wav] [--gap-threshold 1.5] [--gap-max 
 - フィラー誤検出はレビューで却下する運用
 - turbo モデルが気になる場合は `--model mlx-community/whisper-large-v3-mlx` に切り替え可能
 - 対象は音声のみ。動画・テロップ出力、加筆・言い換え、ノイズ除去は対象外（ノイズ除去は Audacity 等で済ませておく。無音の切り詰めは sc が対応）
+
+## 開発・テスト
+
+```sh
+.venv/bin/python -m pytest -q
+```
+
+- 実モデル（mlx-whisper）や `say` コマンドを使う重いテストは `slow` マーカーが付き既定でスキップされる。実行する場合は `.venv/bin/python -m pytest -m slow`
+
+## ライセンス
+
+[MIT License](LICENSE)

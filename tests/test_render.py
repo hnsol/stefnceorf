@@ -151,55 +151,81 @@ def test_intervals_empty_when_none_kept():
 # ---- plan_output_intervals（ギャップ保持/切り詰め 純関数） ----
 
 def test_plan_single_interval_unchanged():
-    assert render.plan_output_intervals([(0.0, 1.0)], []) == [(0.0, 1.0)]
+    out, flags = render.plan_output_intervals([(0.0, 1.0)], [])
+    assert out == [(0.0, 1.0)]
+    assert flags == []
 
 
 def test_plan_short_gap_kept_merges():
     # ギャップ 0.5s（<1.5）で純無音 → 連続区間にマージ
     ivs = [(0.0, 1.0), (1.5, 2.5)]
-    out = render.plan_output_intervals(ivs, [], gap_threshold=1.5, gap_max=0.7)
+    out, flags = render.plan_output_intervals(ivs, [], gap_threshold=1.5, gap_max=0.7)
     assert out == [(0.0, 2.5)]
+    assert flags == []
 
 
 def test_plan_contiguous_merges():
     # g==0（隙間なし）でも純無音扱い → 連続マージ
     ivs = [(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)]
-    out = render.plan_output_intervals(ivs, [], gap_threshold=1.5, gap_max=0.7)
+    out, flags = render.plan_output_intervals(ivs, [], gap_threshold=1.5, gap_max=0.7)
     assert out == [(0.0, 3.0)]
+    assert flags == []
 
 
 def test_plan_long_gap_trimmed():
-    # ギャップ 3.0s（>1.5）で純無音 → 0.7s に切り詰め（前0.35+後0.35）
+    # ギャップ 3.0s（>1.5）で純無音 → 0.7s に切り詰め、単純結合
     ivs = [(0.0, 1.0), (4.0, 5.0)]
-    out = render.plan_output_intervals(ivs, [], gap_threshold=1.5, gap_max=0.7)
+    out, flags = render.plan_output_intervals(ivs, [], gap_threshold=1.5, gap_max=0.7)
     assert out == [
         (0.0, pytest.approx(1.35)),
         (pytest.approx(3.65), 5.0),
     ]
+    assert flags == [False]
 
 
 def test_plan_deleted_word_in_gap_not_merged():
-    # ギャップ [1.0,4.0] に削除単語 [1.5,3.5] が挟まる → 従来動作（別区間）
+    # ギャップ [1.0,4.0] に削除単語 [1.5,3.5] が挟まる → クロスフェード結合
     ivs = [(0.0, 1.0), (4.0, 5.0)]
-    out = render.plan_output_intervals(
+    out, flags = render.plan_output_intervals(
         ivs, [(1.5, 3.5)], gap_threshold=1.5, gap_max=0.7
     )
     assert out == [(0.0, 1.0), (4.0, 5.0)]
+    assert flags == [True]
 
 
 def test_plan_reverse_join_not_merged():
-    # 並べ替えでソース逆行（g<0）→ 従来動作（別区間）
+    # 並べ替えでソース逆行（g<0）→ クロスフェード結合
     ivs = [(4.0, 5.0), (0.0, 1.0)]
-    out = render.plan_output_intervals(ivs, [], gap_threshold=1.5, gap_max=0.7)
+    out, flags = render.plan_output_intervals(ivs, [], gap_threshold=1.5, gap_max=0.7)
     assert out == [(4.0, 5.0), (0.0, 1.0)]
+    assert flags == [True]
 
 
 def test_plan_kept_neighbor_words_do_not_block_merge():
     # 隣接単語自身（区間端の外側）は間の単語とみなされない → マージされる
     ivs = [(0.0, 1.0), (1.5, 2.5)]
-    spans = [(0.0, 0.98), (1.52, 2.5)]  # 区間端のマージン外に単語end/start
-    out = render.plan_output_intervals(ivs, spans, gap_threshold=1.5, gap_max=0.7)
+    spans = [(0.0, 0.98), (1.52, 2.5)]
+    out, flags = render.plan_output_intervals(ivs, spans, gap_threshold=1.5, gap_max=0.7)
     assert out == [(0.0, 2.5)]
+    assert flags == []
+
+
+def test_crossfade_concat_no_crossfade_flag():
+    """crossfade_flags=False の境界では単純結合（長さ減少なし）"""
+    a = np.ones(100)
+    b = np.ones(100)
+    out = render.crossfade_concat([a, b], fade_samples=10, crossfade_flags=[False])
+    assert len(out) == 200
+
+
+def test_crossfade_concat_mixed_flags():
+    """境界ごとにクロスフェード/単純結合を切り替え"""
+    a = np.ones(100)
+    b = np.ones(100)
+    c = np.ones(100)
+    out = render.crossfade_concat([a, b, c], fade_samples=10, crossfade_flags=[True, False])
+    # a-b: crossfade (190), b-c: simple concat (+100)
+    assert len(out) == 290
 
 
 # ---- crossfade_concat ----
