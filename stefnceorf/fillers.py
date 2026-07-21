@@ -12,6 +12,16 @@ _DICT_FILES = {
 # 言語未指定・未知言語のときの既定辞書
 _DEFAULT_LANG = "ja"
 
+# 読点付き（verbatim転写）でのみフィラー扱いする指示語系（日本語）。
+# 「あの本」等の指示語誤検出を避けるため、末尾が読点/句点のときだけ一致とする。
+SOFT_FILLERS_JA = {"あの", "その", "なんか", "こう"}
+
+# normalize_token で前後から除去する句読点・記号（長音「ー」は残す）
+_STRIP_PUNCT = "、。，．！？!?…・,."
+
+# SOFT_FILLERS 一致の条件となる読点/句点（この文字で終わるときのみ）
+_PAUSE_CHARS = "、。，．,."
+
 
 def load_fillers(lang: str | None) -> set[str]:
     """指定言語のフィラー辞書を集合として返す。
@@ -34,11 +44,30 @@ def load_fillers(lang: str | None) -> set[str]:
 def normalize_token(word: str) -> str:
     """Whisperのwordトークンを比較用に正規化する。
 
-    Whisperのwordは先頭にスペースが付くことがあるため前後空白を除去する。
+    Whisperのwordは先頭にスペースが付くことがあるため前後空白を除去し、
+    さらに前後の句読点・記号（、。，．！？!?…・,.）を除去する。
+    verbatim転写では「まあ、」のように読点付きで出るため辞書完全一致を
+    可能にする。長音「ー」は「あのー」等の一部なので除去しない。
     """
-    return word.strip()
+    return word.strip().strip(_STRIP_PUNCT)
+
+
+def _ends_with_pause(word: str) -> bool:
+    """元トークン（正規化前）が読点/句点で終わるか。前後空白は無視する。"""
+    s = word.strip()
+    return bool(s) and s[-1] in _PAUSE_CHARS
 
 
 def is_filler(word: str, fillers: set[str]) -> bool:
-    """単語トークンが辞書と完全一致すればTrue（部分一致はしない）。"""
-    return normalize_token(word) in fillers
+    """単語トークンがフィラーならTrue（部分一致はしない）。
+
+    - 辞書との完全一致（normalize 後）: True
+    - SOFT_FILLERS_JA（指示語系）: 元トークンが読点/句点で終わる場合のみ True
+      （verbatim転写の「あの、」を拾いつつ「あの本」等の誤検出を避ける）
+    """
+    norm = normalize_token(word)
+    if norm in fillers:
+        return True
+    if norm in SOFT_FILLERS_JA and _ends_with_pause(word):
+        return True
+    return False

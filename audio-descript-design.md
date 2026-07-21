@@ -138,6 +138,12 @@ v1（faster-whisper＋WhisperX 2段構成）からの変更理由：導入済み
   - render：純関数 `snap_to_blocks` で「ブロック内に1語でも削除があればブロック全体を削除」。`surviving_words`（文字→単語）はそのまま、後段に単語→ブロックの第2スナップを追加。巻き込み削除は警告で列挙。`_clean_edited_text` が diff 前に `／` を除去するため、`／` を残す/消すは等価
   - 後方互換：`block` を持たない word があるセグメントは `blocks=[0,1,2,...]`（各単語独立＝従来の単語スナップ）にフォールバック。旧 .sc.json/.sc.txt は無修正で動く
   - 逃げ道：`--pause-threshold 0` で全単語境界＝旧挙動（単語単位削除）
+- **verbatim モード（フィラーも転写）を追加**（2026-07-22、ユーザー承認済み）：
+  - 課題：既定設定（large-v3-turbo, `condition_on_previous_text=False`, プロンプトなし）では Whisper がフィラーを吸収し転写されない。フィラー削除ワークフローの前段としてフィラーを転写させたい
+  - 実験結果：`mlx-community/whisper-large-v3-mlx` ＋ initial_prompt（フィラー例文）＋ `condition_on_previous_text=True` でフィラー（「まあ、」「あの、」「えっと」等、読点付きトークン）が転写されることを確認。turbo+condF はフィラー吸収、turbo+condT は繰り返し幻覚が出るため NG、large+prompt+condT では幻覚なし
+  - 方式：`transcribe(..., verbatim=False)` を追加。`--verbatim` 指定時、`--model` 未指定なら `VERBATIM_MODEL`（large-v3-mlx）に差し替え（明示モデルは尊重するため `model` を sentinel `None` 方式に変更）、`initial_prompt`（日本語 `FILLER_PROMPT` / 英語 `FILLER_PROMPT_EN`）と `condition_on_previous_text=True` を渡す。非 verbatim 時は現行どおりプロンプトなし・False。幻覚対策の既存パラメータ（temperature=0, compression_ratio_threshold=2.0, no_speech_threshold=0.8）は不変。json トップに `"verbatim"` を記録
+  - フィラー辞書：verbatim 転写は読点付き（「まあ、」）で出るため、`normalize_token` を前後の句読点・記号除去に拡張（長音「ー」は残す）。指示語系（あの・その・なんか・こう）は `SOFT_FILLERS_JA` として、元トークンが読点/句点で終わる場合のみフィラー扱い（「あの、」は拾い「あの本」は誤検出しない）
+  - `--filler-suggest` の自動有効化はしない（独立のまま。併用を README で推奨）
 
 ## 12. 受け入れテスト
 

@@ -31,12 +31,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="言語 (既定: ja)",
     )
     p_tr.add_argument(
-        "--model", default=DEFAULT_MODEL, help=f"mlx-whisperモデル (既定: {DEFAULT_MODEL})"
+        "--model",
+        default=None,
+        help=f"mlx-whisperモデル (既定: {DEFAULT_MODEL}、--verbatim時は自動で verbatim用モデル)",
     )
     p_tr.add_argument(
         "--filler-suggest",
         action="store_true",
         help="フィラー候補の 〔〕 提案を有効化（既定: 無効）",
+    )
+    p_tr.add_argument(
+        "--verbatim",
+        action="store_true",
+        help=(
+            "フィラーや言い淀みも転写する（モデルは whisper-large-v3-mlx、"
+            "処理は約2倍遅い。--filler-suggest 併用推奨）"
+        ),
     )
     p_tr.add_argument(
         "--pause-threshold",
@@ -81,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
                 model=args.model,
                 filler_suggest=args.filler_suggest,
                 pause_threshold=args.pause_threshold,
+                verbatim=args.verbatim,
             )
         except (RuntimeError, FileNotFoundError) as exc:
             print(f"エラー: {exc}", file=sys.stderr)
@@ -94,6 +105,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.filler_suggest:
             print(f"フィラー候補: {res['filler_count']}箇所")
+            if res["filler_count"] == 0 and not args.verbatim:
+                print(
+                    "ヒント: --verbatim を併用するとフィラーが転写されやすくなります",
+                    file=sys.stderr,
+                )
         return 0
 
     if args.command == "render":

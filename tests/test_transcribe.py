@@ -194,6 +194,27 @@ def test_line_block_separator_outside_brackets_and_before_mark():
     assert cleaned == "".join(w["word"] for w in words)
 
 
+def test_line_filler_not_suggested_when_shared_block():
+    """同ブロック内のフィラーは巻き込み削除になるため〔〕を付けない。"""
+    ja = fillers_mod.load_fillers("ja")
+    words = _words(("まあ", 0.9), ("どれぐらい", 0.9))
+    line, fc = transcribe.build_segment_line("0001", words, ja, True, blocks=[0, 0])
+    body = line.split("] ", 1)[1]
+    assert "〔" not in body
+    assert body == "まあどれぐらい"
+    assert fc == 0
+
+
+def test_line_filler_suggested_when_solo_block():
+    """単独ブロックのフィラーは安全に消せるため〔〕を付ける。"""
+    ja = fillers_mod.load_fillers("ja")
+    words = _words(("まあ", 0.9), ("どれぐらい", 0.9))
+    line, fc = transcribe.build_segment_line("0001", words, ja, True, blocks=[0, 1])
+    body = line.split("] ", 1)[1]
+    assert body == "〔まあ〕／どれぐらい"
+    assert fc == 1
+
+
 # ---- 無音切り詰め: silencedetect パース / cuts / 逆写像（純関数） ----
 
 def test_parse_silence_periods():
@@ -351,11 +372,11 @@ def test_transcribe_txt_markers(tmp_path, fake_whisper):
     res = transcribe.transcribe(str(wav), lang="ja", filler_suggest=True)
     txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
     lines = txt.splitlines()
-    # seg1: 最初の単語 start=0.0 → 0:00、〔まあ〕 と 面倒(prob0.3)の◆
-    assert lines[0] == "[0001 0:00] 結局〔まあ〕◆面倒"
+    # seg1: 全語が同ブロック（ギャップなし）→ まあ は単独ブロックでないため〔〕なし
+    assert lines[0] == "[0001 0:00] 結局まあ◆面倒"
     # seg2: 最初の単語 start=1.2 → floor=1秒 → 0:01
     assert lines[1] == "[0002 0:01] 作業"
-    assert res["filler_count"] == 1
+    assert res["filler_count"] == 0
 
 
 def test_transcribe_no_filler_suggest(tmp_path, fake_whisper):
@@ -378,6 +399,47 @@ def test_transcribe_passes_whisper_kwargs(tmp_path, fake_whisper):
     assert kw["condition_on_previous_text"] is False
     assert kw["no_speech_threshold"] == 0.8
     assert kw["compression_ratio_threshold"] == 2.0
+
+
+# ---- verbatim モード ----
+
+def test_transcribe_non_verbatim_defaults(tmp_path, fake_whisper):
+    """非verbatim: 既定モデル・プロンプトなし・condT False・json verbatim False。"""
+    wav = _make_input(tmp_path)
+    transcribe.transcribe(str(wav), lang="ja")
+    kw = fake_whisper["kwargs"]
+    assert kw["path_or_hf_repo"] == transcribe.DEFAULT_MODEL
+    assert kw["condition_on_previous_text"] is False
+    assert "initial_prompt" not in kw
+    data = json.loads((tmp_path / "input.sc.json").read_text(encoding="utf-8"))
+    assert data["verbatim"] is False
+
+
+def test_transcribe_verbatim_uses_verbatim_model_and_prompt(tmp_path, fake_whisper):
+    """verbatim: model未指定→VERBATIM_MODEL・FILLER_PROMPT・condT True・json verbatim True。"""
+    wav = _make_input(tmp_path)
+    transcribe.transcribe(str(wav), lang="ja", verbatim=True)
+    kw = fake_whisper["kwargs"]
+    assert kw["path_or_hf_repo"] == transcribe.VERBATIM_MODEL
+    assert kw["initial_prompt"] == transcribe.FILLER_PROMPT
+    assert kw["condition_on_previous_text"] is True
+    data = json.loads((tmp_path / "input.sc.json").read_text(encoding="utf-8"))
+    assert data["verbatim"] is True
+    assert data["model"] == transcribe.VERBATIM_MODEL
+
+
+def test_transcribe_verbatim_respects_explicit_model(tmp_path, fake_whisper):
+    """verbatimでも明示モデルは尊重する。"""
+    wav = _make_input(tmp_path)
+    transcribe.transcribe(str(wav), lang="ja", model="custom-model", verbatim=True)
+    assert fake_whisper["kwargs"]["path_or_hf_repo"] == "custom-model"
+
+
+def test_transcribe_verbatim_en_prompt(tmp_path, fake_whisper):
+    """lang=en の verbatim では英語プロンプトに切り替わる。"""
+    wav = _make_input(tmp_path)
+    transcribe.transcribe(str(wav), lang="en", verbatim=True)
+    assert fake_whisper["kwargs"]["initial_prompt"] == transcribe.FILLER_PROMPT_EN
 
 
 def test_transcribe_missing_input(tmp_path, fake_whisper):
@@ -539,5 +601,6 @@ def test_transcribe_auto_lang_uses_detected_dict(tmp_path, fake_whisper_en):
     res = transcribe.transcribe(str(wav), lang=None, filler_suggest=True)
     txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
     lines = txt.splitlines()
-    assert lines[0] == "[0001 0:00]  so 〔um〕 yeah"
-    assert res["filler_count"] == 1
+    # 全語が同ブロック（ギャップなし）→ um は単独ブロックでないため〔〕なし
+    assert lines[0] == "[0001 0:00]  so um yeah"
+    assert res["filler_count"] == 0

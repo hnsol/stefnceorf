@@ -36,6 +36,14 @@ BLOCK_SEP = "／"
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 
+# verbatim（フィラーも転写）モード用モデル。turbo はフィラーを吸収し、
+# turbo+condT は繰り返し幻覚が出るため、large+prompt+condT を用いる。
+VERBATIM_MODEL = "mlx-community/whisper-large-v3-mlx"
+
+# verbatim時に渡す initial_prompt（フィラー例文。読点付きトークンを誘導する）
+FILLER_PROMPT = "えーっと、あのー、そのー、まあ、うーん、なんか、えー、あー。"
+FILLER_PROMPT_EN = "Um, uh, er, ah, you know, like."
+
 
 def _convert_to_16k_mono(input_wav: str) -> str:
     """ffmpeg で入力wavを16kHz mono一時wavに変換し、一時ファイルのパスを返す。"""
@@ -326,8 +334,17 @@ def build_segment_line(seg_id: str, words: list[dict], fillers: set[str],
 
         piece = core
         if filler_suggest and fillers_mod.is_filler(raw, fillers):
-            piece = f"{FILLER_OPEN}{piece}{FILLER_CLOSE}"
-            filler_count += 1
+            # 単独ブロック（前後にポーズ）のフィラーだけ〔〕提案する。
+            # 他の語と同ブロックのフィラーは消すと巻き込みが起きるため提案しない。
+            is_solo = True
+            if blocks is not None:
+                b = blocks[idx]
+                is_solo = not any(
+                    blocks[j] == b for j in range(len(blocks)) if j != idx
+                )
+            if is_solo:
+                piece = f"{FILLER_OPEN}{piece}{FILLER_CLOSE}"
+                filler_count += 1
         if prob is not None and prob < LOW_CONF_THRESHOLD:
             piece = f"{LOW_CONF_MARK}{piece}"
         segment = lead + piece
@@ -346,15 +363,26 @@ def build_segment_line(seg_id: str, words: list[dict], fillers: set[str],
 def transcribe(
     input_wav: str,
     lang: str | None = "ja",
-    model: str = DEFAULT_MODEL,
+    model: str | None = None,
     filler_suggest: bool = False,
     pause_threshold: float = PAUSE_THRESHOLD_S,
+    verbatim: bool = False,
 ) -> dict:
     """入力wavを文字起こしし、.sc.json / .sc.txt を生成する。
+
+    model が None（未指定）のときは verbatim に応じて既定モデルを選ぶ:
+    verbatim=True なら VERBATIM_MODEL、そうでなければ DEFAULT_MODEL。
+    明示指定されたモデルはそのまま尊重する。
+
+    verbatim=True のときはフィラーを転写するため initial_prompt と
+    condition_on_previous_text=True を渡す（非verbatim時はプロンプトなし・False）。
 
     戻り値: {"json_path", "txt_path", "filler_count", "data"}
     """
     import mlx_whisper
+
+    if model is None:
+        model = VERBATIM_MODEL if verbatim else DEFAULT_MODEL
 
     input_path = Path(input_wav)
     if not input_path.exists():
@@ -379,17 +407,21 @@ def transcribe(
     cuts = build_cuts(cut_periods)
     trimmed_wav, removed_s = _write_trimmed_wav(tmp_wav, cuts)
     recog_wav = trimmed_wav
-    try:
-        result = mlx_whisper.transcribe(
-            recog_wav,
-            path_or_hf_repo=model,
-            word_timestamps=True,
-            language=lang,
-            temperature=0,
-            condition_on_previous_text=False,
-            no_speech_threshold=0.8,
-            compression_ratio_threshold=2.0,
+    whisper_kwargs = dict(
+        path_or_hf_repo=model,
+        word_timestamps=True,
+        language=lang,
+        temperature=0,
+        condition_on_previous_text=verbatim,
+        no_speech_threshold=0.8,
+        compression_ratio_threshold=2.0,
+    )
+    if verbatim:
+        whisper_kwargs["initial_prompt"] = (
+            FILLER_PROMPT_EN if lang == "en" else FILLER_PROMPT
         )
+    try:
+        result = mlx_whisper.transcribe(recog_wav, **whisper_kwargs)
     finally:
         for p in {tmp_wav, trimmed_wav}:
             try:
@@ -439,6 +471,7 @@ def transcribe(
         "source_wav": str(input_path.resolve()),
         "language": result.get("language", lang),
         "model": model,
+        "verbatim": verbatim,
         "pause_threshold": pause_threshold,
         "silence_trim": {
             "count": len(cuts),

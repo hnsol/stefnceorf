@@ -55,3 +55,32 @@ def test_uun_is_filler():
     """「うーん」が新規追加されフィラーとして検出される。"""
     ja = fillers.load_fillers("ja")
     assert fillers.is_filler("うーん", ja) is True
+
+
+# ---- verbatim: 句読点除去 / SOFT_FILLERS 読点条件 ----
+
+def test_normalize_strips_punctuation():
+    """前後の句読点・記号を除去し、長音「ー」は残す。"""
+    assert fillers.normalize_token("まあ、") == "まあ"
+    assert fillers.normalize_token("、まあ。") == "まあ"
+    assert fillers.normalize_token(" あの、") == "あの"
+    # 長音は除去しない
+    assert fillers.normalize_token("あのー、") == "あのー"
+
+
+def test_verbatim_filler_with_comma_matches_dict():
+    """読点付き辞書語（verbatim転写）も完全一致する。"""
+    ja = fillers.load_fillers("ja")
+    assert fillers.is_filler("まあ、", ja) is True
+    assert fillers.is_filler("えっと。", ja) is True
+
+
+def test_soft_filler_requires_trailing_pause():
+    """SOFT_FILLERS は読点/句点で終わるときのみフィラー。"""
+    ja = fillers.load_fillers("ja")
+    assert fillers.is_filler("あの、", ja) is True
+    assert fillers.is_filler("あの", ja) is False
+    assert fillers.is_filler("その。", ja) is True
+    assert fillers.is_filler("その", ja) is False
+    # 指示語＋名詞の誤検出はしない
+    assert fillers.is_filler("あの本", ja) is False
