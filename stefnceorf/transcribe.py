@@ -595,6 +595,7 @@ def transcribe(
         condition_on_previous_text=verbatim,
         no_speech_threshold=0.8,
         compression_ratio_threshold=2.0,
+        verbose=False,  # mlx-whisper 組み込みの進捗バー(tqdm)を有効化
     )
     if verbatim:
         whisper_kwargs["initial_prompt"] = (
