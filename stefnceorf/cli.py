@@ -21,7 +21,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_tr = sub.add_parser(
-        "transcribe", help="音声を文字起こしして .sc.txt / .sc.json を生成"
+        "transcribe", aliases=["trans"], help="音声を文字起こしして .sc.txt / .sc.json を生成"
     )
     p_tr.add_argument("input", help="入力wavファイル")
     p_tr.add_argument(
@@ -81,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "transcribe":
+    if args.command in ("transcribe", "trans"):
         from .transcribe import transcribe
 
         try:
