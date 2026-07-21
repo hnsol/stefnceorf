@@ -144,6 +144,24 @@ v1（faster-whisper＋WhisperX 2段構成）からの変更理由：導入済み
   - 方式：`transcribe(..., verbatim=False)` を追加。`--verbatim` 指定時、`--model` 未指定なら `VERBATIM_MODEL`（large-v3-mlx）に差し替え（明示モデルは尊重するため `model` を sentinel `None` 方式に変更）、`initial_prompt`（日本語 `FILLER_PROMPT` / 英語 `FILLER_PROMPT_EN`）と `condition_on_previous_text=True` を渡す。非 verbatim 時は現行どおりプロンプトなし・False。幻覚対策の既存パラメータ（temperature=0, compression_ratio_threshold=2.0, no_speech_threshold=0.8）は不変。json トップに `"verbatim"` を記録
   - フィラー辞書：verbatim 転写は読点付き（「まあ、」）で出るため、`normalize_token` を前後の句読点・記号除去に拡張（長音「ー」は残す）。指示語系（あの・その・なんか・こう）は `SOFT_FILLERS_JA` として、元トークンが読点/句点で終わる場合のみフィラー扱い（「あの、」は拾い「あの本」は誤検出しない）
   - `--filler-suggest` の自動有効化はしない（独立のまま。併用を README で推奨）
+- **繰り返し幻覚セグメントの後処理除去を追加**（2026-07-22、ユーザー承認済み）：
+  - 課題：`--verbatim`（`condition_on_previous_text=True`）で長尺ファイルの静音区間から繰り返し幻覚が発生する。実データ（55分）では「今、」だけのセグメントが数十行連続／1セグメント内に「今、」トークンが100個以上詰まった巨大セグメント／words が空のセグメントが約50行連続、といった形で現れた
+  - なぜ後処理か：condT の幻覚は initial_prompt・temperature・compression_ratio_threshold 等の入力側パラメータでは完全には防げない（condT を切ると今度はフィラーが吸収され verbatim の目的を損なう）。そのため認識結果に対する後処理として、パターンが明確な幻覚のみを保守的に除去する
+  - 方式：純関数 `drop_hallucinations(segments) -> (kept, dropped)` を追加。remap 後・ID採番前の生セグメント列に対し、セグメントループの前に適用する。検出条件は3種（いずれか該当で除去）：
+    - a. **セグメント内反復**：空白除去した単語トークン（`w["word"].strip()`）が `HALLUC_MIN_WORDS`(=5) 個以上あり、最頻トークンの割合が `HALLUC_TOP_RATIO`(=0.7) 以上（巨大反復セグメント対策）
+    - b. **セグメント列反復**：`text.strip()` が同一の非空セグメントが `HALLUC_RUN`(=3) 個以上連続する場合、その連続全部を除去（交互パターン「ああして、/こうして、」は同一連続でないため残す＝正常な繰り返し表現を巻き込まない）
+    - c. **空セグメント**：`words` が空、または `text.strip()` が空
+  - 記録：除去があれば json トップに `"hallucination_drop": {"count": N, "ranges": [{"start", "end", "sample"}]}` を追加。ranges は連続する除去を1範囲にまとめた元音源時刻（`rec_to_src(..., cuts)` で認識用wav時刻から逆写像）。CLI は stderr に「除去数＋各区間（M:SS 形式）＋先頭サンプル」を警告表示する
+  - 影響：除去区間は文字起こしが無くなるため render で音声も削除される。ゆえに警告で聞き直しを促す。残ったセグメントの ID は詰めて連番採番する（0001,0002,...）
+- **幻覚区間の再認識レスキューを追加**（2026-07-22、ユーザー承認済み）：
+  - 課題：実データで幻覚除去区間（19:43–21:33 の約2分）に実発話が存在することが判明。`drop_hallucinations` の除去だけでは発話が失われる。同区間を安全設定（`condition_on_previous_text=False`・プロンプトなし）で個別に再認識すると完全に正しく転写できることを実証済み
+  - 方式：`drop_hallucinations` はそのまま使い、その除去グループごとに**認識用wav時刻**でレスキュー窓を決めて安全設定で再認識し、生き残ったセグメントを kept 列の該当位置に差し替え挿入する。認識用wav（`trimmed_wav`）は本認識直後に削除していたが、レスキュー完了まで生存させるよう本認識〜レスキューを1つの `try/finally` に再構成した（一時ファイル削除漏れ防止）
+  - レスキュー窓（純関数 `rescue_window(prev_kept_end, next_kept_start, wav_duration)`）：窓 = 「直前の kept セグメント末尾単語の end」〜「直後の kept セグメント先頭単語の start」（認識用wav時刻）。先頭グループは 0、末尾グループは認識wav長を境界に使う。窓長 < `RESCUE_MIN_WINDOW_S`(=0.5s) なら None（内容なしとみなし従来通り除去扱い）
+  - **なぜ窓を kept 境界から取るか**：(1) kept セグメントと**重複しない**（差し替え時に二重転写を防ぐ）、(2) 除去グループに時刻を持たない**空セグメントが含まれても失われた音声を全部カバーできる**（空セグメントの窓は前後 kept 境界で確定するため）
+  - 再認識：`_slice_wav` が `soundfile` で窓のサンプルを一時wavに切り出し、`mlx_whisper.transcribe` を安全設定（`word_timestamps=True, language=lang, temperature=0, condition_on_previous_text=False, no_speech_threshold=0.8, compression_ratio_threshold=2.0`, `initial_prompt` なし）で実行。得られた単語 start/end に窓開始時刻を加算して認識用wav時刻へ戻し、レスキュー結果にも `drop_hallucinations` を1回だけ適用（ガード。再帰レスキューはしない）
+  - 記録：`hallucination_drop.ranges` の各要素を `{"start", "end", "sample", "rescued": bool, "rescued_segments": N}` に拡張。`count` は本認識で幻覚検出した除去数（レスキュー成否によらない）。時刻は元音源時刻（除去単語時刻を優先、無ければ窓境界を `rec_to_src` で逆写像）
+  - CLI：`rescued` な区間は「幻覚疑い区間を再認識で復旧: M:SS-M:SS（N セグメント）」と stdout に通常表示。復旧できなかった区間のみ従来の警告（stderr、聞き直し案内）
+  - 影響：復旧区間は安全設定（verbatim でない）で認識されるためフィラーは転写されない
 
 ## 12. 受け入れテスト
 

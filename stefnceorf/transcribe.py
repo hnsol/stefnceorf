@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 from . import fillers as fillers_mod
@@ -24,6 +25,16 @@ SILENCE_KEEP_S = 0.7
 # ポーズベース区切り（ブロック単位削除）設定
 # この秒数以上の無音を「カット可能なポーズ区切り」としてブロック境界にする
 PAUSE_THRESHOLD_S = 0.15
+
+# 繰り返し幻覚セグメントの後処理除去（--verbatim の condition_on_previous_text=True
+# で長尺の静音区間から発生する繰り返し幻覚への対策。入力側では完全に防げない）
+HALLUC_MIN_WORDS = 5     # セグメント内反復判定の最小語数
+HALLUC_TOP_RATIO = 0.7   # 最頻トークンの占有率閾値
+HALLUC_RUN = 3           # 同一テキストセグメントの連続数閾値
+
+# 幻覚区間の再認識レスキュー窓の最小長（秒）。これ未満の窓は内容なしとみなし
+# レスキューを省略する（従来通り除去扱い）。
+RESCUE_MIN_WINDOW_S = 0.5
 
 _SILENCE_RE = re.compile(r"silence_(start|end):\s*(-?\d+(?:\.\d+)?)")
 
@@ -239,6 +250,175 @@ def assign_blocks(
     return blocks
 
 
+def drop_hallucinations(
+    segments: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """繰り返し幻覚とみられるセグメントを除去し (残す, 除去した) に分ける（純関数）。
+
+    入力は Whisper result 形式のセグメント列（各 {"text", "words":
+    [{"word","start","end",...}]}）。remap 後・ID採番前の生セグメントに対して
+    呼ぶことを想定する。start/end は認識用wav時刻のままでよい。
+
+    以下のいずれかに該当したセグメントを除去する:
+    a. セグメント内反復: 空白除去した単語トークン（w["word"].strip()）が
+       HALLUC_MIN_WORDS 個以上あり最頻トークンの割合が HALLUC_TOP_RATIO 以上、
+       または3トークン以上が全て同一（「今、今、今」型）。
+    b. セグメント列反復: text.strip() が同一の非空セグメントが HALLUC_RUN 個
+       以上連続する場合、その連続全部を除去する。既に a/c で除去済みの
+       セグメントを間に挟んでも連続とみなす（幻覚は空セグメントと交互に
+       出ることがあるため）。交互パターン「ああして、/こうして、」は
+       同一連続ではないので残る。
+    c. 空セグメント: words が空、text.strip() が空、または記号・句読点のみで
+       文字（かな・漢字・英数字）を含まない。
+
+    戻り値: (残すセグメント列, 除去したセグメント列)。順序は入力順を保つ。
+    """
+    n = len(segments)
+    drop = [False] * n
+
+    for i, seg in enumerate(segments):
+        words = seg.get("words") or []
+        text = (seg.get("text") or "").strip()
+        # 条件 c: 空セグメント（記号のみも含む）
+        if not words or not text or not re.search(r"\w", text):
+            drop[i] = True
+            continue
+        # 条件 a: セグメント内反復
+        tokens = [(w.get("word") or "").strip() for w in words]
+        if len(tokens) >= 3 and len(set(tokens)) == 1:
+            drop[i] = True
+        elif len(tokens) >= HALLUC_MIN_WORDS:
+            top = Counter(tokens).most_common(1)[0][1]
+            if top / len(tokens) >= HALLUC_TOP_RATIO:
+                drop[i] = True
+
+    # 条件 b: 同一テキストの連続（a/c で除去済みのセグメントは連続を分断しない）
+    live = [i for i in range(n) if not drop[i]]
+    i = 0
+    while i < len(live):
+        text = (segments[live[i]].get("text") or "").strip()
+        j = i
+        while j < len(live) and (
+            segments[live[j]].get("text") or ""
+        ).strip() == text:
+            j += 1
+        if j - i >= HALLUC_RUN:
+            for k in range(i, j):
+                drop[live[k]] = True
+        i = j
+
+    kept = [seg for i, seg in enumerate(segments) if not drop[i]]
+    dropped = [seg for i, seg in enumerate(segments) if drop[i]]
+    return kept, dropped
+
+
+def rescue_window(
+    prev_kept_end: float | None,
+    next_kept_start: float | None,
+    wav_duration: float,
+) -> tuple[float, float] | None:
+    """幻覚除去グループの再認識レスキュー窓（認識用wav時刻）を求める（純関数）。
+
+    窓 = 「直前の kept セグメント末尾単語の end」〜「直後の kept セグメント先頭
+    単語の start」。先頭グループ（prev_kept_end is None）は 0 を、末尾グループ
+    （next_kept_start is None）は wav_duration を境界に使う。この窓なら時刻の
+    無い空セグメントも含めて失われた音声を全部カバーし、kept と重複しない。
+
+    窓長が RESCUE_MIN_WINDOW_S 未満なら内容なしとみなし None を返す。
+    """
+    start = 0.0 if prev_kept_end is None else prev_kept_end
+    end = wav_duration if next_kept_start is None else next_kept_start
+    if end - start < RESCUE_MIN_WINDOW_S:
+        return None
+    return (start, end)
+
+
+def _seg_first_start(seg: dict) -> float | None:
+    """セグメント先頭の start（None でない最初の単語）を返す。無ければ None。"""
+    for w in seg.get("words") or []:
+        if w.get("start") is not None:
+            return float(w["start"])
+    return None
+
+
+def _seg_last_end(seg: dict) -> float | None:
+    """セグメント末尾の end（None でない最後の単語）を返す。無ければ None。"""
+    for w in reversed(seg.get("words") or []):
+        if w.get("end") is not None:
+            return float(w["end"])
+    return None
+
+
+def _rescue_kwargs(model: str, lang: str | None) -> dict:
+    """レスキュー再認識用の安全設定 whisper kwargs（プロンプトなし・condT False）。"""
+    return dict(
+        path_or_hf_repo=model,
+        word_timestamps=True,
+        language=lang,
+        temperature=0,
+        condition_on_previous_text=False,
+        no_speech_threshold=0.8,
+        compression_ratio_threshold=2.0,
+    )
+
+
+def _wav_duration(path: str) -> float:
+    """wavの長さ（秒）を返す。全サンプルを読まずヘッダ情報から算出する。"""
+    import soundfile as sf
+
+    info = sf.info(path)
+    return info.frames / float(info.samplerate)
+
+
+def _slice_wav(src_wav: str, start: float, end: float) -> str:
+    """認識用wavの [start, end] 秒を切り出した一時wavを書き、パスを返す。"""
+    import soundfile as sf
+
+    audio, sr = sf.read(src_wav, dtype="float32", always_2d=False)
+    a = max(0, int(round(start * sr)))
+    b = min(len(audio), int(round(end * sr)))
+    clip = audio[a:b]
+    fd, out_path = tempfile.mkstemp(suffix=".wav", prefix="stefnceorf_rescue_")
+    os.close(fd)
+    sf.write(out_path, clip, sr)
+    return out_path
+
+
+def _rescue_transcribe(
+    recog_wav: str,
+    win_start: float,
+    win_end: float,
+    model: str,
+    lang: str | None,
+) -> list[dict]:
+    """レスキュー窓を安全設定で再認識し、幻覚ガード後の生存セグメント列を返す。
+
+    単語時刻には窓開始時刻を加算し認識用wav時刻へ戻す。得られたセグメントにも
+    drop_hallucinations を1回だけ適用する（再帰レスキューはしない）。
+    """
+    import mlx_whisper
+
+    clip = _slice_wav(recog_wav, win_start, win_end)
+    try:
+        result = mlx_whisper.transcribe(clip, **_rescue_kwargs(model, lang))
+    finally:
+        try:
+            os.unlink(clip)
+        except OSError:
+            pass
+
+    rsegs = result.get("segments", []) or []
+    # 窓内の相対時刻を認識用wav時刻へ戻す（窓開始を加算）
+    for seg in rsegs:
+        for w in seg.get("words") or []:
+            if w.get("start") is not None:
+                w["start"] = float(w["start"]) + win_start
+            if w.get("end") is not None:
+                w["end"] = float(w["end"]) + win_start
+    kept, _dropped = drop_hallucinations(rsegs)
+    return kept
+
+
 def _detect_silence(wav_path: str, d: float = SILENCE_MIN_S) -> str:
     """ffmpeg silencedetect を実行し stderr を返す。失敗時は空文字列。
 
@@ -420,8 +600,101 @@ def transcribe(
         whisper_kwargs["initial_prompt"] = (
             FILLER_PROMPT_EN if lang == "en" else FILLER_PROMPT
         )
+    # 幻覚除去グループを再認識レスキューする間、認識用wav（trimmed_wav）を
+    # 生存させる必要があるため、本認識からレスキュー完了までを1つの try で囲う。
+    halluc_ranges: list[dict] = []
+    dropped_count = 0
     try:
         result = mlx_whisper.transcribe(recog_wav, **whisper_kwargs)
+
+        # 繰り返し幻覚とみられるセグメントをループ前に除去する。
+        raw_segments = result.get("segments", []) or []
+        kept_segments, dropped_segments = drop_hallucinations(raw_segments)
+        dropped_count = len(dropped_segments)
+
+        # 除去グループごとに kept 境界からレスキュー窓を決め、安全設定で再認識して
+        # 差し替える。連続する除去を1範囲にまとめ、元音源時刻で報告する。
+        if dropped_segments:
+            dropped_ids = {id(s) for s in dropped_segments}
+            wav_dur = _wav_duration(recog_wav)
+            final_segments: list[dict] = []
+            group: list[dict] = []
+            last_kept: dict | None = None
+
+            def _process_group(
+                group: list[dict],
+                prev_kept: dict | None,
+                next_kept: dict | None,
+            ) -> list[dict]:
+                if not group:
+                    return []
+                # 除去単語時刻（元音源時刻）と先頭サンプルを収集
+                starts: list[float] = []
+                ends: list[float] = []
+                sample = ""
+                for gseg in group:
+                    for w in gseg.get("words") or []:
+                        if w.get("start") is not None:
+                            starts.append(rec_to_src(float(w["start"]), cuts))
+                        if w.get("end") is not None:
+                            ends.append(rec_to_src(float(w["end"]), cuts))
+                    if not sample:
+                        sample = (gseg.get("text") or "").strip()[:20]
+
+                prev_end = _seg_last_end(prev_kept) if prev_kept else None
+                next_start = (
+                    _seg_first_start(next_kept) if next_kept else None
+                )
+                win = rescue_window(prev_end, next_start, wav_dur)
+
+                # 窓もテキストも時刻も無い純粋な空セグメント群は音声内容を
+                # 失わないため報告もレスキューもしない（従来挙動）
+                if win is None and not starts and not sample:
+                    return []
+
+                rescued_segs: list[dict] = []
+                if win is not None:
+                    rescued_segs = _rescue_transcribe(
+                        recog_wav, win[0], win[1], model, lang
+                    )
+
+                # 報告時刻: 除去単語時刻を優先し、無ければ窓境界を逆写像する
+                if starts:
+                    rng_start: float | None = min(starts)
+                elif win is not None:
+                    rng_start = rec_to_src(win[0], cuts)
+                else:
+                    rng_start = None
+                if ends:
+                    rng_end: float | None = max(ends)
+                elif win is not None:
+                    rng_end = rec_to_src(win[1], cuts)
+                else:
+                    rng_end = None
+
+                halluc_ranges.append(
+                    {
+                        "start": rng_start,
+                        "end": rng_end,
+                        "sample": sample,
+                        "rescued": bool(rescued_segs),
+                        "rescued_segments": len(rescued_segs),
+                    }
+                )
+                return rescued_segs
+
+            for seg in raw_segments:
+                if id(seg) in dropped_ids:
+                    group.append(seg)
+                else:
+                    final_segments.extend(
+                        _process_group(group, last_kept, seg)
+                    )
+                    group = []
+                    final_segments.append(seg)
+                    last_kept = seg
+            final_segments.extend(_process_group(group, last_kept, None))
+            kept_segments = final_segments
     finally:
         for p in {tmp_wav, trimmed_wav}:
             try:
@@ -436,7 +709,7 @@ def transcribe(
     lines: list[str] = []
     total_fillers = 0
 
-    for i, seg in enumerate(result.get("segments", [])):
+    for i, seg in enumerate(kept_segments):
         seg_id = _seg_id(i)
         words = []
         for w in seg.get("words", []) or []:
@@ -479,6 +752,11 @@ def transcribe(
         },
         "segments": segments_out,
     }
+    if dropped_count:
+        data["hallucination_drop"] = {
+            "count": dropped_count,
+            "ranges": halluc_ranges,
+        }
 
     base = _strip_wav_suffix(input_path)
     json_path = base.parent / f"{base.name}.sc.json"
@@ -495,6 +773,8 @@ def transcribe(
         "filler_count": total_fillers,
         "silence_cut_count": len(cuts),
         "silence_removed_s": removed_s,
+        "hallucination_drop_count": dropped_count,
+        "hallucination_ranges": halluc_ranges,
         "data": data,
     }
 

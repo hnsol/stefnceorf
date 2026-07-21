@@ -98,6 +98,35 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"生成: {res['txt_path']}")
         print(f"生成: {res['json_path']}")
+        if res.get("hallucination_ranges"):
+            from .transcribe import _format_time
+
+            def _fmt(v):
+                return _format_time(v) if v is not None else "?"
+
+            ranges = res["hallucination_ranges"]
+            rescued = [r for r in ranges if r.get("rescued")]
+            failed = [r for r in ranges if not r.get("rescued")]
+            for r in rescued:
+                n = r.get("rescued_segments", 0)
+                print(
+                    f"幻覚疑い区間を再認識で復旧: {_fmt(r.get('start'))}-"
+                    f"{_fmt(r.get('end'))}（{n} セグメント）"
+                )
+            if failed:
+                print(
+                    "警告: 幻覚疑いのセグメントを除去しました。以下の区間は"
+                    "再認識でも復旧できず render で音声が削除されるため、必要なら"
+                    "聞き直してください:",
+                    file=sys.stderr,
+                )
+                for r in failed:
+                    sample = r.get("sample", "")
+                    print(
+                        f"  {_fmt(r.get('start'))}-{_fmt(r.get('end'))} "
+                        f"(「{sample}…」)",
+                        file=sys.stderr,
+                    )
         if res.get("silence_cut_count"):
             print(
                 f"無音切り詰め: {res['silence_cut_count']}箇所 "

@@ -298,6 +298,131 @@ def test_remap_words_applies_and_monotonic():
     assert out[0]["end"] <= out[1]["start"]
 
 
+# ---- drop_hallucinations（純関数） ----
+
+def _seg(text, words):
+    return {"text": text, "words": words}
+
+
+def _rep_words(word, n):
+    return [{"word": word, "start": float(i), "end": float(i) + 0.5,
+             "probability": 0.9} for i in range(n)]
+
+
+def test_drop_halluc_in_segment_repetition():
+    # "今、"×10 → セグメント内反復で除去
+    seg = _seg("今、" * 10, _rep_words("今、", 10))
+    kept, dropped = transcribe.drop_hallucinations([seg])
+    assert kept == []
+    assert dropped == [seg]
+
+
+def test_drop_halluc_below_top_ratio_kept():
+    # 10語中6語同一（0.6 < 0.7）→ 残す
+    words = _rep_words("今、", 6) + _rep_words("他", 4)
+    seg = _seg("今、今、今、今、今、今、他他他他", words)
+    kept, dropped = transcribe.drop_hallucinations([seg])
+    assert kept == [seg]
+    assert dropped == []
+
+
+def test_drop_halluc_all_identical_three_removed():
+    # 3語以上が全て同一（「今、今、今」型）→ 除去
+    seg = _seg("今、" * 3, _rep_words("今、", 3))
+    kept, dropped = transcribe.drop_hallucinations([seg])
+    assert kept == []
+    assert dropped == [seg]
+
+
+def test_drop_halluc_two_identical_kept():
+    # 2語同一は除去しない（「はい、はい」等の正常発話がありうる）
+    seg = _seg("今、" * 2, _rep_words("今、", 2))
+    kept, dropped = transcribe.drop_hallucinations([seg])
+    assert kept == [seg]
+    assert dropped == []
+
+
+def test_drop_halluc_min_words_boundary_kept():
+    # 5語未満で全同一でもない → セグメント内条件では残す
+    words = _rep_words("今、", 3) + _rep_words("違う", 1)
+    seg = _seg("今、今、今、違う", words)
+    kept, dropped = transcribe.drop_hallucinations([seg])
+    assert kept == [seg]
+    assert dropped == []
+
+
+def test_drop_halluc_run_three_removed():
+    # 同一テキスト3連続 → 3つとも除去
+    segs = [_seg("今、", _rep_words("今、", 1)) for _ in range(3)]
+    kept, dropped = transcribe.drop_hallucinations(segs)
+    assert kept == []
+    assert len(dropped) == 3
+
+
+def test_drop_halluc_run_two_kept():
+    # 同一テキスト2連続 → 残す
+    segs = [_seg("今、", _rep_words("今、", 1)) for _ in range(2)]
+    kept, dropped = transcribe.drop_hallucinations(segs)
+    assert kept == segs
+    assert dropped == []
+
+
+def test_drop_halluc_alternating_kept():
+    # 交互パターン A/B/A/B → 残す（同一連続ではない）
+    segs = [
+        _seg("ああして、", _rep_words("ああして、", 1)),
+        _seg("こうして、", _rep_words("こうして、", 1)),
+        _seg("ああして、", _rep_words("ああして、", 1)),
+        _seg("こうして、", _rep_words("こうして、", 1)),
+    ]
+    kept, dropped = transcribe.drop_hallucinations(segs)
+    assert kept == segs
+    assert dropped == []
+
+
+def test_drop_halluc_empty_words_removed():
+    seg = _seg("何か", [])
+    kept, dropped = transcribe.drop_hallucinations([seg])
+    assert kept == []
+    assert dropped == [seg]
+
+
+def test_drop_halluc_empty_text_removed():
+    seg = _seg("  ", _rep_words("x", 1))
+    kept, dropped = transcribe.drop_hallucinations([seg])
+    assert kept == []
+    assert dropped == [seg]
+
+
+def test_drop_halluc_punct_only_removed():
+    # 記号のみのセグメント（「!」等）→ 除去
+    seg = _seg("!", _rep_words("!", 1))
+    kept, dropped = transcribe.drop_hallucinations([seg])
+    assert kept == []
+    assert dropped == [seg]
+
+
+def test_drop_halluc_run_across_dropped_gap():
+    # 「今、」が空セグメントを挟んで散在しても連続とみなし RUN=3 で除去
+    ima = lambda: _seg("今、", _rep_words("今、", 1))
+    empty = lambda: _seg("", [])
+    segs = [ima(), empty(), ima(), empty(), ima()]
+    kept, dropped = transcribe.drop_hallucinations(segs)
+    assert kept == []
+    assert len(dropped) == 5
+
+
+def test_drop_halluc_normal_all_kept():
+    segs = [
+        _seg("結局", _rep_words("結局", 1)),
+        _seg("面倒な作業", _rep_words("面倒", 2)),
+        _seg("だった", _rep_words("だった", 1)),
+    ]
+    kept, dropped = transcribe.drop_hallucinations(segs)
+    assert kept == segs
+    assert dropped == []
+
+
 # ---- transcribe 全体（mlx_whisper と ffmpeg をモック） ----
 
 @pytest.fixture
@@ -586,6 +711,237 @@ def test_transcribe_pause_threshold_zero_no_separator_dense(tmp_path, monkeypatc
     assert [w["block"] for w in ws] == [0, 1]
     txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
     assert txt.splitlines()[0] == "[0001 0:00] 結局／面倒"
+
+
+def test_transcribe_drops_hallucinations_and_renumbers(tmp_path, monkeypatch):
+    """幻覚セグメントが json から消え、メタ記録・残セグメントのID詰めを確認。"""
+    fake_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "結局",
+                "words": [
+                    {"word": "結局", "start": 0.0, "end": 0.5, "probability": 0.9},
+                ],
+            },
+            # 幻覚: セグメント内反復（"今、"×10）
+            {
+                "text": "今、" * 10,
+                "words": [
+                    {"word": "今、", "start": 1.0 + i * 0.1,
+                     "end": 1.05 + i * 0.1, "probability": 0.9}
+                    for i in range(10)
+                ],
+            },
+            # 幻覚: 空 words
+            {"text": "何か", "words": []},
+            {
+                "text": "面倒",
+                "words": [
+                    {"word": "面倒", "start": 3.0, "end": 3.5, "probability": 0.9},
+                ],
+            },
+        ],
+    }
+    # レスキュー再認識でも幻覚しか出ない → 除去にフォールバックする
+    rescue_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "今、" * 10,
+                "words": [
+                    {"word": "今、", "start": i * 0.1,
+                     "end": 0.05 + i * 0.1, "probability": 0.9}
+                    for i in range(10)
+                ],
+            },
+        ],
+    }
+
+    def fake_transcribe(path, **kwargs):
+        if path == "rescue_clip.wav":
+            return rescue_result
+        return fake_result
+
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = fake_transcribe
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 10.0)
+    monkeypatch.setattr(transcribe, "_slice_wav", lambda src, s, e: "rescue_clip.wav")
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja")
+    data = res["data"]
+
+    # 幻覚2セグメント（反復＋空words）が消え、レスキューも幻覚のため
+    # 正常2セグメントのみ残る
+    assert len(data["segments"]) == 2
+    assert data["segments"][0]["text"] == "結局"
+    assert data["segments"][1]["text"] == "面倒"
+    # ID が連番で詰まる
+    assert data["segments"][0]["id"] == "0001"
+    assert data["segments"][1]["id"] == "0002"
+    # メタ記録
+    assert res["hallucination_drop_count"] == 2
+    assert data["hallucination_drop"]["count"] == 2
+    assert len(res["hallucination_ranges"]) >= 1
+    # レスキュー失敗 → rescued=False
+    assert res["hallucination_ranges"][0]["rescued"] is False
+
+
+# ---- rescue_window（純関数） ----
+
+def test_rescue_window_middle_group():
+    # 中間グループ: prev end 〜 next start
+    assert transcribe.rescue_window(5.0, 8.0, 100.0) == (5.0, 8.0)
+
+
+def test_rescue_window_first_group():
+    # 先頭グループ: prev なし → 0 〜 next start
+    assert transcribe.rescue_window(None, 8.0, 100.0) == (0.0, 8.0)
+
+
+def test_rescue_window_last_group():
+    # 末尾グループ: next なし → prev end 〜 wav長
+    assert transcribe.rescue_window(5.0, None, 100.0) == (5.0, 100.0)
+
+
+def test_rescue_window_full_when_both_none():
+    assert transcribe.rescue_window(None, None, 42.0) == (0.0, 42.0)
+
+
+def test_rescue_window_too_short_returns_none():
+    # 窓 0.5 秒未満 → None
+    assert transcribe.rescue_window(5.0, 5.3, 100.0) is None
+
+
+def test_rescue_window_exactly_min_kept():
+    # 0.5 秒ちょうどは残す
+    assert transcribe.rescue_window(5.0, 5.5, 100.0) == (5.0, 5.5)
+
+
+# ---- transcribe レスキュー統合（soundfile 系を monkeypatch） ----
+
+def _rescue_main_result():
+    """本認識結果: 正常 / 幻覚 / 正常 の3セグメント。"""
+    return {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "前",
+                "words": [
+                    {"word": "前", "start": 0.0, "end": 1.0, "probability": 0.9},
+                ],
+            },
+            {
+                "text": "今、" * 10,
+                "words": [
+                    {"word": "今、", "start": 2.0 + i * 0.1,
+                     "end": 2.05 + i * 0.1, "probability": 0.9}
+                    for i in range(10)
+                ],
+            },
+            {
+                "text": "後",
+                "words": [
+                    {"word": "後", "start": 13.0, "end": 14.0, "probability": 0.9},
+                ],
+            },
+        ],
+    }
+
+
+def _setup_rescue(monkeypatch, main_result, rescue_result):
+    """本認識と rescue で別結果を返す fake を仕込み、呼び出し記録を返す。"""
+    calls = []
+
+    def fake_transcribe(path, **kwargs):
+        calls.append({"path": path, "kwargs": kwargs})
+        if path == "rescue_clip.wav":
+            return rescue_result
+        return main_result
+
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = fake_transcribe
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 20.0)
+    monkeypatch.setattr(
+        transcribe, "_slice_wav", lambda src, s, e: "rescue_clip.wav"
+    )
+    return calls
+
+
+def test_transcribe_rescue_success_inserts_and_offsets(tmp_path, monkeypatch):
+    """幻覚区間を再認識で復旧し、正しい位置に挿入・窓オフセット加算する。"""
+    rescue_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "救出テキスト",
+                "words": [
+                    {"word": "救出", "start": 0.5, "end": 1.5, "probability": 0.9},
+                ],
+            },
+        ],
+    }
+    calls = _setup_rescue(monkeypatch, _rescue_main_result(), rescue_result)
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja")
+    data = res["data"]
+
+    # 前 / 救出 / 後 の3セグメントに復旧
+    assert [s["text"] for s in data["segments"]] == ["前", "救出テキスト", "後"]
+    assert [s["id"] for s in data["segments"]] == ["0001", "0002", "0003"]
+
+    # 窓 = 前末尾 end 1.0 〜 後先頭 start 13.0。救出単語 start0.5 に +1.0
+    resc = data["segments"][1]["words"][0]
+    assert resc["start"] == pytest.approx(1.5)
+    assert resc["end"] == pytest.approx(2.5)
+
+    # whisper は本認識＋レスキューで2回呼ばれる
+    assert len(calls) == 2
+    # レスキュー呼び出しは安全設定（condT False・プロンプトなし）
+    rescue_kw = calls[1]["kwargs"]
+    assert rescue_kw["condition_on_previous_text"] is False
+    assert "initial_prompt" not in rescue_kw
+
+    # メタ: rescued=True・セグメント数
+    rng = res["hallucination_ranges"][0]
+    assert rng["rescued"] is True
+    assert rng["rescued_segments"] == 1
+
+
+def test_transcribe_rescue_fallback_when_hallucination(tmp_path, monkeypatch):
+    """レスキュー結果も幻覚なら除去にフォールバックし rescued=False。"""
+    rescue_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "今、" * 10,
+                "words": [
+                    {"word": "今、", "start": i * 0.1,
+                     "end": 0.05 + i * 0.1, "probability": 0.9}
+                    for i in range(10)
+                ],
+            },
+        ],
+    }
+    _setup_rescue(monkeypatch, _rescue_main_result(), rescue_result)
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja")
+    data = res["data"]
+
+    # 復旧されず 前 / 後 のみ
+    assert [s["text"] for s in data["segments"]] == ["前", "後"]
+    rng = res["hallucination_ranges"][0]
+    assert rng["rescued"] is False
+    assert rng["rescued_segments"] == 0
 
 
 def test_transcribe_default_lang_is_ja(tmp_path, fake_whisper):
