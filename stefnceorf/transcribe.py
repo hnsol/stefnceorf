@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -56,6 +57,17 @@ def _convert_to_16k_mono(input_wav: str) -> str:
     return tmp_path
 
 
+def _format_time(seconds: float) -> str:
+    """秒数を M:SS または H:MM:SS 形式の文字列に変換する（秒は floor・ゼロ埋め2桁）。"""
+    total_sec = int(math.floor(seconds))
+    h = total_sec // 3600
+    m = (total_sec % 3600) // 60
+    s = total_sec % 60
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
 def _seg_id(index: int) -> str:
     """0始まりのindexを4桁ゼロ埋めの1始まりIDに変換する。"""
     return f"{index + 1:04d}"
@@ -85,6 +97,10 @@ def build_segment_line(seg_id: str, words: list[dict], fillers: set[str],
         parts.append(lead + piece)
 
     text = "".join(parts)
+    if words:
+        start = words[0].get("start")
+        if start is not None:
+            return f"[{seg_id} {_format_time(start)}] {text}", filler_count
     return f"[{seg_id}] {text}", filler_count
 
 

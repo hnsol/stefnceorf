@@ -13,6 +13,24 @@ def test_parse_plain():
     assert render.parse_edited_txt(txt) == [("0001", "結局面倒"), ("0002", "作業")]
 
 
+def test_parse_with_timestamp():
+    """新形式 [ID 時刻] はIDのみ抽出し、テキストは正常にパースされる。"""
+    txt = "[0001 0:12] 結局面倒\n[0002 12:34] 作業\n"
+    assert render.parse_edited_txt(txt) == [("0001", "結局面倒"), ("0002", "作業")]
+
+
+def test_parse_timestamp_hhmmss():
+    """H:MM:SS 形式の時刻付き行もIDのみ抽出できる。"""
+    txt = "[0001 1:02:03] テスト\n"
+    assert render.parse_edited_txt(txt) == [("0001", "テスト")]
+
+
+def test_parse_legacy_and_new_mixed():
+    """旧形式と新形式が混在してもそれぞれ正しくパースされる。"""
+    txt = "[0001] 旧形式\n[0002 0:05] 新形式\n"
+    assert render.parse_edited_txt(txt) == [("0001", "旧形式"), ("0002", "新形式")]
+
+
 def test_parse_ignores_blank_lines():
     txt = "[0001] あ\n\n   \n[0002] い\n"
     assert render.parse_edited_txt(txt) == [("0001", "あ"), ("0002", "い")]

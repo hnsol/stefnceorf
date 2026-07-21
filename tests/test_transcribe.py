@@ -22,7 +22,7 @@ def test_line_plain():
     ja = fillers_mod.load_fillers("ja")
     words = _words(("結局", 0.9), ("面倒", 0.9))
     line, fc = transcribe.build_segment_line("0001", words, ja, True)
-    assert line == "[0001] 結局面倒"
+    assert line == "[0001 0:00] 結局面倒"
     assert fc == 0
 
 
@@ -30,7 +30,7 @@ def test_line_low_conf_mark():
     ja = fillers_mod.load_fillers("ja")
     words = _words(("結局", 0.9), ("面倒", 0.3))
     line, fc = transcribe.build_segment_line("0001", words, ja, True)
-    assert line == "[0001] 結局◆面倒"
+    assert line == "[0001 0:00] 結局◆面倒"
     assert fc == 0
 
 
@@ -38,7 +38,7 @@ def test_line_filler_wrapped():
     ja = fillers_mod.load_fillers("ja")
     words = _words(("まあ", 0.9), ("とか", 0.9))
     line, fc = transcribe.build_segment_line("0002", words, ja, True)
-    assert line == "[0002] 〔まあ〕とか"
+    assert line == "[0002 0:00] 〔まあ〕とか"
     assert fc == 1
 
 
@@ -46,8 +46,34 @@ def test_line_no_filler_suggest():
     ja = fillers_mod.load_fillers("ja")
     words = _words(("まあ", 0.9), ("とか", 0.9))
     line, fc = transcribe.build_segment_line("0002", words, ja, False)
-    assert line == "[0002] まあとか"
+    assert line == "[0002 0:00] まあとか"
     assert fc == 0
+
+
+def test_line_empty_words_no_timestamp():
+    """words が空のときは時刻なし [ID] 形式になる。"""
+    ja = fillers_mod.load_fillers("ja")
+    line, fc = transcribe.build_segment_line("0001", [], ja, True)
+    assert line == "[0001] "
+    assert fc == 0
+
+
+def test_line_timestamp_over_60min():
+    """60分以上のセグメントは H:MM:SS 形式で表示される。"""
+    ja = fillers_mod.load_fillers("ja")
+    words = [{"word": "テスト", "start": 3723.9, "end": 3724.5, "probability": 0.9}]
+    line, _ = transcribe.build_segment_line("0001", words, ja, False)
+    # 3723.9 → floor → 3723秒 = 1時間2分3秒
+    assert line == "[0001 1:02:03] テスト"
+
+
+def test_format_time_various():
+    """_format_time のフォーマット確認。"""
+    assert transcribe._format_time(0.0) == "0:00"
+    assert transcribe._format_time(5.9) == "0:05"
+    assert transcribe._format_time(754.0) == "12:34"
+    assert transcribe._format_time(3600.0) == "1:00:00"
+    assert transcribe._format_time(3723.0) == "1:02:03"
 
 
 def test_line_marker_removal_matches_word_concat():
@@ -148,9 +174,10 @@ def test_transcribe_txt_markers(tmp_path, fake_whisper):
     res = transcribe.transcribe(str(wav), lang="ja")
     txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
     lines = txt.splitlines()
-    # 〔まあ〕 と 面倒(prob0.3)の◆
-    assert lines[0] == "[0001] 結局〔まあ〕◆面倒"
-    assert lines[1] == "[0002] 作業"
+    # seg1: 最初の単語 start=0.0 → 0:00、〔まあ〕 と 面倒(prob0.3)の◆
+    assert lines[0] == "[0001 0:00] 結局〔まあ〕◆面倒"
+    # seg2: 最初の単語 start=1.2 → floor=1秒 → 0:01
+    assert lines[1] == "[0002 0:01] 作業"
     assert res["filler_count"] == 1
 
 
@@ -159,7 +186,7 @@ def test_transcribe_no_filler_suggest(tmp_path, fake_whisper):
     res = transcribe.transcribe(str(wav), lang="ja", filler_suggest=False)
     txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
     lines = txt.splitlines()
-    assert lines[0] == "[0001] 結局まあ◆面倒"
+    assert lines[0] == "[0001 0:00] 結局まあ◆面倒"
     assert res["filler_count"] == 0
 
 
@@ -221,5 +248,5 @@ def test_transcribe_auto_lang_uses_detected_dict(tmp_path, fake_whisper_en):
     res = transcribe.transcribe(str(wav), lang=None)
     txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
     lines = txt.splitlines()
-    assert lines[0] == "[0001]  so 〔um〕 yeah"
+    assert lines[0] == "[0001 0:00]  so 〔um〕 yeah"
     assert res["filler_count"] == 1

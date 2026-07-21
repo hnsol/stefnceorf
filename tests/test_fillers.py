@@ -3,8 +3,11 @@ from stefnceorf import fillers
 
 def test_load_ja_defaults():
     ja = fillers.load_fillers("ja")
-    for w in ["あの", "あのー", "その", "えー", "まあ", "なんか", "こう"]:
+    for w in ["あのー", "そのー", "えー", "え", "えっと", "まあ", "うーん"]:
         assert w in ja
+    # 間投詞でない語は辞書から除外されている
+    for w in ["あの", "その", "なんか", "こう"]:
+        assert w not in ja
 
 
 def test_load_en_defaults():
@@ -39,3 +42,16 @@ def test_normalize_strips_leading_space():
 def test_non_filler():
     ja = fillers.load_fillers("ja")
     assert fillers.is_filler("結局", ja) is False
+
+
+def test_sono_not_filler_but_etto_is():
+    """「その」は辞書から削除済み→フィラーでない。「えっと」は辞書に残る→フィラー。"""
+    ja = fillers.load_fillers("ja")
+    assert fillers.is_filler("その", ja) is False
+    assert fillers.is_filler("えっと", ja) is True
+
+
+def test_uun_is_filler():
+    """「うーん」が新規追加されフィラーとして検出される。"""
+    ja = fillers.load_fillers("ja")
+    assert fillers.is_filler("うーん", ja) is True

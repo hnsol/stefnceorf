@@ -24,8 +24,9 @@ FILLER_CLOSE = "〕"
 MARGIN_S = 0.02
 FADE_S = 0.008
 
-# `[ID] text` 行のパターン（ID は非空・`]` を含まない）
-_LINE_RE = re.compile(r"^\[([^\]]+)\]\s?(.*)$")
+# `[ID] text` 行のパターン。`[...]` 内の最初の空白区切りトークンをIDとし、以降は無視。
+# 新形式 `[0001 0:12] text` でも旧形式 `[0001] text` でも動く。
+_LINE_RE = re.compile(r"^\[([^\]\s]+)(?:\s+[^\]]*)?\]\s?(.*)$")
 # 〔...〕（フィラー提案）を中身ごと削除するためのパターン
 _FILLER_RE = re.compile(re.escape(FILLER_OPEN) + r"[^" + re.escape(FILLER_CLOSE) + r"]*" + re.escape(FILLER_CLOSE))
 
