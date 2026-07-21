@@ -24,6 +24,11 @@ FILLER_CLOSE = "〕"
 MARGIN_S = 0.02
 FADE_S = 0.008
 
+# ギャップ（無音ポーズ）保持・切り詰めのしきい値と上限（秒）
+# g ≤ GAP_THRESHOLD_S: そのまま保持 / g > GAP_THRESHOLD_S: GAP_MAX_S に切り詰め
+GAP_THRESHOLD_S = 1.5
+GAP_MAX_S = 0.7
+
 # `[ID] text` 行のパターン。`[...]` 内の最初の空白区切りトークンをIDとし、以降は無視。
 # 新形式 `[0001 0:12] text` でも旧形式 `[0001] text` でも動く。
 _LINE_RE = re.compile(r"^\[([^\]\s]+)(?:\s+[^\]]*)?\]\s?(.*)$")
@@ -165,6 +170,68 @@ def words_to_intervals(
     return intervals
 
 
+def _word_in_gap(spans: list[tuple[float, float]], pe: float, ns: float,
+                 tol: float = 1e-6) -> bool:
+    """開区間 (pe, ns) に重なる単語区間が1つでもあれば True。
+
+    削除単語（残さない単語）がギャップに挟まっているかの判定に使う。
+    保持/切り出し済みの隣接単語自身は端がマージン分だけ (pe, ns) の外にあるため
+    重ならない（このためこの判定は「間に挟まる別単語」だけを検出する）。
+    """
+    for s, e in spans:
+        if s < ns - tol and e > pe + tol:
+            return True
+    return False
+
+
+def plan_output_intervals(
+    intervals: list[tuple[float, float]],
+    word_spans: list[tuple[float, float]],
+    gap_threshold: float = GAP_THRESHOLD_S,
+    gap_max: float = GAP_MAX_S,
+) -> list[tuple[float, float]]:
+    """出力順のソース区間列から、ギャップ保持/切り詰めを適用した出力区間列を返す。
+
+    隣接する区間 (prev, cur) の境界について、ソース時間軸上のギャップ
+    g = cur.start - prev.end を評価する:
+
+    - g < 0（ソースが逆行 = 並べ替え等）: 従来どおり別区間としてクロスフェード結合
+    - 間に単語（削除単語）が挟まる: 従来どおり別区間としてクロスフェード結合
+    - 純粋な無音ギャップ かつ g ≤ gap_threshold: ギャップ音声を保持
+      （＝1つの連続区間としてマージ。クロスフェードは入らない）
+    - 純粋な無音ギャップ かつ g > gap_threshold: gap_max に切り詰め
+      （前側 gap_max/2 ＋ 後側 gap_max/2 を残し中間をカット、境界はクロスフェード）
+
+    戻り値は crossfade_concat へ渡す前提の区間列（連続する区間はクロスフェード結合される）。
+    """
+    if not intervals:
+        return []
+
+    out: list[tuple[float, float]] = []
+    pending = [intervals[0][0], intervals[0][1]]
+    half = gap_max / 2.0
+    for k in range(1, len(intervals)):
+        cur = intervals[k]
+        pe = intervals[k - 1][1]
+        ns = cur[0]
+        g = ns - pe
+        eligible = g >= 0 and not _word_in_gap(word_spans, pe, ns)
+        if eligible:
+            if g <= gap_threshold or g <= gap_max:
+                # 保持: ギャップ音声を含めて連続区間にマージ
+                pending[1] = cur[1]
+            else:
+                # 切り詰め: 前側 half を残して確定、後側 half から次区間を開始
+                pending[1] = pe + half
+                out.append((pending[0], pending[1]))
+                pending = [ns - half, cur[1]]
+        else:
+            out.append((pending[0], pending[1]))
+            pending = [cur[0], cur[1]]
+    out.append((pending[0], pending[1]))
+    return out
+
+
 def _apply_weights(block, weights):
     """1次元(mono) / 2次元(multi-channel) 双方に weights を掛ける。"""
     if block.ndim == 2:
@@ -213,7 +280,12 @@ def _base_name(txt_path: Path) -> str:
     return name
 
 
-def render(txt_path: str, output: str | None = None) -> str:
+def render(
+    txt_path: str,
+    output: str | None = None,
+    gap_threshold: float = GAP_THRESHOLD_S,
+    gap_max: float = GAP_MAX_S,
+) -> str:
     """編集後 txt と json を突き合わせて音声を再構成し、出力パスを返す。"""
     import numpy as np
     import soundfile as sf
@@ -261,7 +333,15 @@ def render(txt_path: str, output: str | None = None) -> str:
         hi_b = float(next_words[0]["start"]) if next_words else file_length_s
         seg_bounds[seg["id"]] = (lo_b, hi_b)
 
-    chunks = []
+    # 全セグメントの単語区間（ソース時刻・生値）。ギャップに削除単語が挟まるかの判定に使う。
+    word_spans: list[tuple[float, float]] = []
+    for seg in segments:
+        for w in seg.get("words", []) or []:
+            s, e = w.get("start"), w.get("end")
+            if s is not None and e is not None:
+                word_spans.append((float(s), float(e)))
+
+    plan_intervals: list[tuple[float, float]] = []
     all_warnings: list[str] = []
     for seg_id, edited in parsed:
         seg = seg_map.get(seg_id)
@@ -278,11 +358,18 @@ def render(txt_path: str, output: str | None = None) -> str:
         intervals = words_to_intervals(
             words, keep, margin=MARGIN_S, lo=lo_b, hi=hi_b
         )
-        for start, end in intervals:
-            s0 = max(0, int(round(start * samplerate)))
-            s1 = min(total_samples, int(round(end * samplerate)))
-            if s1 > s0:
-                chunks.append(audio[s0:s1])
+        plan_intervals.extend(intervals)
+
+    out_intervals = plan_output_intervals(
+        plan_intervals, word_spans, gap_threshold=gap_threshold, gap_max=gap_max
+    )
+
+    chunks = []
+    for start, end in out_intervals:
+        s0 = max(0, int(round(start * samplerate)))
+        s1 = min(total_samples, int(round(end * samplerate)))
+        if s1 > s0:
+            chunks.append(audio[s0:s1])
 
     fade_samples = int(round(FADE_S * samplerate))
     result = crossfade_concat(chunks, fade_samples)

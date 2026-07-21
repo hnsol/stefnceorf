@@ -104,6 +104,89 @@ def test_line_english_preserves_spaces():
     assert fc == 1
 
 
+# ---- 無音切り詰め: silencedetect パース / cuts / 逆写像（純関数） ----
+
+def test_parse_silence_periods():
+    stderr = (
+        "[silencedetect @ 0x1] silence_start: 12.345\n"
+        "[silencedetect @ 0x1] silence_end: 30.678 | silence_duration: 18.333\n"
+        "[silencedetect @ 0x1] silence_start: 40.0\n"
+        "[silencedetect @ 0x1] silence_end: 42.5 | silence_duration: 2.5\n"
+    )
+    assert transcribe.parse_silence_periods(stderr) == [
+        (12.345, 30.678),
+        (40.0, 42.5),
+    ]
+
+
+def test_parse_silence_periods_unmatched_start_ignored():
+    stderr = (
+        "silence_start: 5.0\n"
+        "silence_end: 8.0\n"
+        "silence_start: 20.0\n"  # 末尾まで無音、end なし
+    )
+    assert transcribe.parse_silence_periods(stderr) == [(5.0, 8.0)]
+
+
+def test_parse_silence_periods_empty():
+    assert transcribe.parse_silence_periods("no silence here") == []
+
+
+def test_build_cuts_filters_short_and_computes_middle():
+    # 無音 [10,13] 長さ3.0 > keep0.7 → cut [10.35, 12.65] len 2.3
+    # 無音 [20,20.5] 長さ0.5 ≤ keep → 除外
+    cuts = transcribe.build_cuts([(10.0, 13.0), (20.0, 20.5)], keep=0.7)
+    assert cuts == [(pytest.approx(10.35), pytest.approx(2.3))]
+
+
+def test_rec_to_src_identity_no_cuts():
+    for t in [0.0, 1.5, 100.0]:
+        assert transcribe.rec_to_src(t, []) == t
+
+
+def test_rec_to_src_single_cut():
+    # cut at src 10.35, len 2.3 → rec点 10.35。以降の rec 時刻に +2.3
+    cuts = [(10.35, 2.3)]
+    assert transcribe.rec_to_src(5.0, cuts) == pytest.approx(5.0)  # 前
+    assert transcribe.rec_to_src(10.35, cuts) == pytest.approx(10.35)  # 境界=前寄せ
+    assert transcribe.rec_to_src(11.0, cuts) == pytest.approx(13.3)  # 後
+
+
+def test_rec_to_src_multiple_cuts():
+    # cut1: src10, len2 (rec点10) / cut2: src20, len3 (rec点 20-2=18)
+    cuts = [(10.0, 2.0), (20.0, 3.0)]
+    assert transcribe.rec_to_src(5.0, cuts) == pytest.approx(5.0)
+    assert transcribe.rec_to_src(15.0, cuts) == pytest.approx(17.0)  # cut1後
+    assert transcribe.rec_to_src(19.0, cuts) == pytest.approx(24.0)  # 両cut後
+
+
+def test_rec_to_src_boundary_clamps_to_near():
+    # カット点ちょうどはソース側の近傍境界（カット開始）へクランプ
+    cuts = [(10.0, 5.0)]
+    assert transcribe.rec_to_src(10.0, cuts) == pytest.approx(10.0)
+
+
+def test_remap_words_identity():
+    words = [{"word": "a", "start": 1.0, "end": 2.0, "probability": 0.9}]
+    out = transcribe.remap_words(words, [])
+    assert out[0]["start"] == 1.0 and out[0]["end"] == 2.0
+
+
+def test_remap_words_applies_and_monotonic():
+    cuts = [(10.0, 2.0)]
+    words = [
+        {"word": "a", "start": 5.0, "end": 9.0, "probability": 0.9},
+        {"word": "b", "start": 11.0, "end": 12.0, "probability": 0.9},
+    ]
+    out = transcribe.remap_words(words, cuts)
+    assert out[0]["start"] == pytest.approx(5.0)
+    assert out[0]["end"] == pytest.approx(9.0)
+    assert out[1]["start"] == pytest.approx(13.0)
+    assert out[1]["end"] == pytest.approx(14.0)
+    # 単調性
+    assert out[0]["end"] <= out[1]["start"]
+
+
 # ---- transcribe 全体（mlx_whisper と ffmpeg をモック） ----
 
 @pytest.fixture
@@ -137,8 +220,9 @@ def fake_whisper(monkeypatch):
     fake_mod = types.ModuleType("mlx_whisper")
     fake_mod.transcribe = fake_transcribe
     monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
-    # ffmpeg変換は行わずダミーパスを返す
+    # ffmpeg変換・無音検出は行わない（無音なし＝逆写像は恒等）
     monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p: "")
     return captured
 
 
@@ -232,7 +316,60 @@ def fake_whisper_en(monkeypatch):
     fake_mod.transcribe = fake_transcribe
     monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
     monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p: "")
     return fake_result
+
+
+def test_transcribe_silence_trim_remaps_and_meta(tmp_path, monkeypatch):
+    """無音検出あり: 認識用wavを切り詰め、単語時刻を元時刻へ逆写像しメタを付与する。"""
+    import numpy as np
+    import soundfile as sf
+
+    sr = 16000
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), np.zeros(10 * sr, dtype="float32"), sr)
+
+    # 無音 [2,5]（3s）→ cut (2.35, 2.3)。rec点 2.35 以降は +2.3。
+    fake_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "前後",
+                "words": [
+                    {"word": "前", "start": 1.0, "end": 2.0, "probability": 0.9},
+                    {"word": "後", "start": 3.0, "end": 4.0, "probability": 0.9},
+                ],
+            },
+        ],
+    }
+    captured = {}
+
+    def fake_transcribe(path, **kwargs):
+        captured["path"] = path
+        return fake_result
+
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = fake_transcribe
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: str(wav))
+    monkeypatch.setattr(
+        transcribe,
+        "_detect_silence",
+        lambda p: "silence_start: 2.0\nsilence_end: 5.0 | silence_duration: 3.0\n",
+    )
+
+    res = transcribe.transcribe(str(wav), lang="ja")
+    data = res["data"]
+    w = data["segments"][0]["words"]
+    # 「前」rec[1,2] は cut点2.35より前 → そのまま
+    assert w[0]["start"] == pytest.approx(1.0)
+    assert w[0]["end"] == pytest.approx(2.0)
+    # 「後」rec[3,4] は cut点以降 → +2.3
+    assert w[1]["start"] == pytest.approx(5.3)
+    assert w[1]["end"] == pytest.approx(6.3)
+    assert data["silence_trim"]["count"] == 1
+    assert data["silence_trim"]["removed_s"] == pytest.approx(2.3, abs=0.01)
+    assert res["silence_cut_count"] == 1
 
 
 def test_transcribe_default_lang_is_ja(tmp_path, fake_whisper):

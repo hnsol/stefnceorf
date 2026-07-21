@@ -10,7 +10,7 @@
 
 - Apple Silicon Mac / Python 3.11+
 - ffmpeg インストール済み
-- 入力は沈黙・ノイズ除去済みの wav（前処理は Audacity 等で）
+- 入力はノイズ除去済みの wav（無音処理は不要。長い無音の切り詰めは sc が行う）
 
 ## インストール
 
@@ -55,19 +55,21 @@ stefnceorf transcribe input.wav [--lang ja|en] [--model MODEL] [--no-filler-sugg
 - `--lang` 既定 `ja`。英語は `--lang en` で明示指定。自動判定は `--lang` なし呼び出し (`lang=None`) で可能
 - `--model` 既定 `mlx-community/whisper-large-v3-turbo`
 - フィラー候補数を表示。`--no-filler-suggest` で提案を無効化
+- 認識用の一時 wav に限り長い無音（1.5秒以上）を 0.7秒へ切り詰めて Whisper の幻覚を抑える。単語時刻は元音源の時刻へ逆写像するため出力音声には影響しない（元 wav は不変）。切り詰めがあれば箇所数と短縮秒数を表示する
 
 ### 2. 編集して音声へ反映
 
 `input.sc.txt` を編集したら:
 
 ```sh
-stefnceorf render input.sc.txt [-o output.wav]
+stefnceorf render input.sc.txt [-o output.wav] [--gap-threshold 1.5] [--gap-max 0.7]
 # sc render input.sc.txt でも同じ
 ```
 
 - 編集後 txt と同じ場所の `input.sc.json` を突き合わせ、残す単語の時間区間を算出し、**元の input.wav**（`.sc.json` の `source_wav`）から切り出して再構成する
 - `-o` 省略時の出力は `input.edited.wav`
 - 出力は元 wav と同一のサンプルレート・ビット深度。カット境界は等パワークロスフェードでクリックノイズを防ぐ
+- セグメント間の無音ポーズは保持される。`--gap-threshold`（既定 1.5秒）以下のポーズはそのまま残し、超える長い無音は `--gap-max`（既定 0.7秒）に切り詰める（間が詰まりすぎるのを防ぐ）
 - 非破壊。何度でも再実行できる
 
 ## 編集ルール（input.sc.txt）
@@ -102,4 +104,4 @@ stefnceorf render input.sc.txt [-o output.wav]
 - 単語タイムスタンプの誤差で語尾欠け・隣音混入が起こりうる。前後 20ms のマージンと境界クロスフェードで大半を緩和するが、**最終的に通しで1回聞くことを前提**とする
 - フィラー誤検出はレビューで却下する運用
 - turbo モデルが気になる場合は `--model mlx-community/whisper-large-v3-mlx` に切り替え可能
-- 対象は音声のみ。動画・テロップ出力、加筆・言い換え、沈黙/ノイズ除去は対象外（前処理は Audacity 等で済ませておく）
+- 対象は音声のみ。動画・テロップ出力、加筆・言い換え、ノイズ除去は対象外（ノイズ除去は Audacity 等で済ませておく。無音の切り詰めは sc が対応）

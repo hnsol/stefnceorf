@@ -148,6 +148,60 @@ def test_intervals_empty_when_none_kept():
     assert render.words_to_intervals(words, set(), margin=0.02, hi=1.0) == []
 
 
+# ---- plan_output_intervals（ギャップ保持/切り詰め 純関数） ----
+
+def test_plan_single_interval_unchanged():
+    assert render.plan_output_intervals([(0.0, 1.0)], []) == [(0.0, 1.0)]
+
+
+def test_plan_short_gap_kept_merges():
+    # ギャップ 0.5s（<1.5）で純無音 → 連続区間にマージ
+    ivs = [(0.0, 1.0), (1.5, 2.5)]
+    out = render.plan_output_intervals(ivs, [], gap_threshold=1.5, gap_max=0.7)
+    assert out == [(0.0, 2.5)]
+
+
+def test_plan_contiguous_merges():
+    # g==0（隙間なし）でも純無音扱い → 連続マージ
+    ivs = [(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)]
+    out = render.plan_output_intervals(ivs, [], gap_threshold=1.5, gap_max=0.7)
+    assert out == [(0.0, 3.0)]
+
+
+def test_plan_long_gap_trimmed():
+    # ギャップ 3.0s（>1.5）で純無音 → 0.7s に切り詰め（前0.35+後0.35）
+    ivs = [(0.0, 1.0), (4.0, 5.0)]
+    out = render.plan_output_intervals(ivs, [], gap_threshold=1.5, gap_max=0.7)
+    assert out == [
+        (0.0, pytest.approx(1.35)),
+        (pytest.approx(3.65), 5.0),
+    ]
+
+
+def test_plan_deleted_word_in_gap_not_merged():
+    # ギャップ [1.0,4.0] に削除単語 [1.5,3.5] が挟まる → 従来動作（別区間）
+    ivs = [(0.0, 1.0), (4.0, 5.0)]
+    out = render.plan_output_intervals(
+        ivs, [(1.5, 3.5)], gap_threshold=1.5, gap_max=0.7
+    )
+    assert out == [(0.0, 1.0), (4.0, 5.0)]
+
+
+def test_plan_reverse_join_not_merged():
+    # 並べ替えでソース逆行（g<0）→ 従来動作（別区間）
+    ivs = [(4.0, 5.0), (0.0, 1.0)]
+    out = render.plan_output_intervals(ivs, [], gap_threshold=1.5, gap_max=0.7)
+    assert out == [(4.0, 5.0), (0.0, 1.0)]
+
+
+def test_plan_kept_neighbor_words_do_not_block_merge():
+    # 隣接単語自身（区間端の外側）は間の単語とみなされない → マージされる
+    ivs = [(0.0, 1.0), (1.5, 2.5)]
+    spans = [(0.0, 0.98), (1.52, 2.5)]  # 区間端のマージン外に単語end/start
+    out = render.plan_output_intervals(ivs, spans, gap_threshold=1.5, gap_max=0.7)
+    assert out == [(0.0, 2.5)]
+
+
 # ---- crossfade_concat ----
 
 def test_crossfade_length_reduced_by_fade():
@@ -379,6 +433,69 @@ def test_render_edge_segment_margin_uses_file_bounds(tmp_path):
     o_audio, _ = sf.read(out)
     # [1.0,2.0] のみ、前後マージンは隣接単語境界でクランプ → 約1秒(16000)
     assert abs(len(o_audio) - 16000) < 200
+
+
+def _make_gap_project(tmp_path, sr=16000):
+    """3セグメント。seg1[0-1], 長無音(3s), seg2[4-5], 短ポーズ(0.5s), seg3[5.5-6.5]。
+
+    無音区間には単語が無い純無音。全長 6.5s。
+    """
+    import soundfile as sf
+
+    audio = np.zeros(int(6.5 * sr))
+    specs = [(0.0, 1.0, 220.0), (4.0, 5.0, 440.0), (5.5, 6.5, 660.0)]
+    for s, e, fr in specs:
+        t = np.arange(int((e - s) * sr)) / sr
+        audio[int(s * sr): int(s * sr) + len(t)] = 0.3 * np.sin(2 * np.pi * fr * t)
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), audio, sr, subtype="PCM_16")
+
+    data = {
+        "source_wav": str(wav.resolve()),
+        "language": "ja",
+        "model": "test",
+        "segments": [
+            {"id": "0001", "text": "あ",
+             "words": [{"word": "あ", "start": 0.0, "end": 1.0, "probability": 0.9}]},
+            {"id": "0002", "text": "い",
+             "words": [{"word": "い", "start": 4.0, "end": 5.0, "probability": 0.9}]},
+            {"id": "0003", "text": "う",
+             "words": [{"word": "う", "start": 5.5, "end": 6.5, "probability": 0.9}]},
+        ],
+    }
+    (tmp_path / "input.sc.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+    return wav
+
+
+def test_render_gap_trim_and_keep(tmp_path):
+    """既定: 長無音は0.7sに切り詰め、短ポーズは保持される。"""
+    import soundfile as sf
+
+    _make_gap_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あ\n[0002] い\n[0003] う\n", encoding="utf-8")
+
+    out = render.render(str(txt))
+    o_audio, sr = sf.read(out)
+    # 期待: seg1(≈1.04) + トリム無音(≈0.7) + seg2〜seg3を短ポーズ込みで連続(≈2.87)
+    # ≈ 4.24s。単純に単語だけ残す旧動作(≈3.08s)より長く、全保持(6.5s)より短い。
+    dur = len(o_audio) / sr
+    assert dur == pytest.approx(4.24, abs=0.15)
+
+
+def test_render_gap_threshold_keeps_all(tmp_path):
+    """--gap-threshold を大きくすると長無音も保持され元尺に近づく。"""
+    import soundfile as sf
+
+    _make_gap_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あ\n[0002] い\n[0003] う\n", encoding="utf-8")
+
+    out = render.render(str(txt), gap_threshold=100.0)
+    o_audio, sr = sf.read(out)
+    assert len(o_audio) / sr == pytest.approx(6.5, abs=0.05)
 
 
 def test_cli_render(tmp_path):
