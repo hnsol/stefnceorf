@@ -183,6 +183,110 @@ def test_snap_empty_keep():
     assert extra == set()
 
 
+# ---- snap_with_filler_exemption ----
+
+def test_snap_exemption_filler_only_keeps_block_survivor():
+    # block0={0,1}。word1 はフィラー削除確定 → word0 は生存（ブロック巻き込み無し）
+    keep, extra = render.snap_with_filler_exemption({0}, [0, 0, 1], {1})
+    assert keep == {0}
+    assert extra == set()
+
+
+def test_snap_exemption_filler_plus_normal_delete_wipes_block():
+    # block0={0,1,2}。word2 は通常削除（keep にも filler_del にも無い）→
+    # ブロック全体が従来スナップで全滅する。extra は snap_to_blocks の値を
+    # そのまま返すので keep|filler_del の全要素（{0,1}）を含む。
+    keep, extra = render.snap_with_filler_exemption({0}, [0, 0, 0], {1})
+    assert keep == set()
+    assert extra == {0, 1}
+
+
+def test_snap_exemption_empty_filler_equals_snap_to_blocks():
+    keep_a, extra_a = render.snap_with_filler_exemption({0, 2}, [0, 0, 1], set())
+    keep_b, extra_b = render.snap_to_blocks({0, 2}, [0, 0, 1])
+    assert (keep_a, extra_a) == (keep_b, extra_b)
+
+
+# ---- boundary_rms ----
+
+def test_boundary_rms_silence_very_low():
+    audio = np.zeros(16000)
+    assert render.boundary_rms(audio, 16000, 0.5) == float("-inf")
+
+
+def test_boundary_rms_sine_about_minus_9db():
+    sr = 16000
+    t = np.arange(sr) / sr
+    sine = 0.5 * np.sin(2 * np.pi * 220.0 * t)
+    db = render.boundary_rms(sine, sr, 0.5, half_window_s=0.05)
+    # 振幅0.5正弦波の RMS = 0.5/sqrt(2) ≈ 0.354 → 20log10 ≈ -9.03 dBFS
+    assert db == pytest.approx(-9.03, abs=0.3)
+
+
+def test_boundary_rms_clamps_to_file_edge():
+    sr = 16000
+    t = np.arange(sr) / sr
+    sine = 0.5 * np.sin(2 * np.pi * 220.0 * t)
+    # t=0 でも窓は [0, +half] にクランプされ計算可能
+    db = render.boundary_rms(sine, sr, 0.0)
+    assert db > -20.0
+
+
+def test_boundary_rms_stereo_channel_mean():
+    sr = 16000
+    t = np.arange(sr) / sr
+    mono = 0.5 * np.sin(2 * np.pi * 220.0 * t)
+    stereo = np.stack([mono, mono], axis=1)
+    d_mono = render.boundary_rms(mono, sr, 0.5, half_window_s=0.05)
+    d_stereo = render.boundary_rms(stereo, sr, 0.5, half_window_s=0.05)
+    assert d_stereo == pytest.approx(d_mono, abs=0.01)
+
+
+# ---- filler_cut_is_safe ----
+
+def _sine(sr, freq, dur, amp=0.5):
+    t = np.arange(int(dur * sr)) / sr
+    return amp * np.sin(2 * np.pi * freq * t)
+
+
+def test_filler_cut_safe_both_boundaries_silent():
+    sr = 16000
+    audio = np.zeros(3 * sr)  # 全無音
+    word = {"start": 1.0, "end": 2.0}
+    assert render.filler_cut_is_safe(audio, sr, word, silences=None) is True
+
+
+def test_filler_cut_unsafe_when_boundary_continuous_sine():
+    sr = 16000
+    audio = _sine(sr, 220.0, 3.0)  # 連続高RMS
+    word = {"start": 1.0, "end": 2.0}
+    assert render.filler_cut_is_safe(audio, sr, word, silences=None) is False
+
+
+def test_filler_cut_safe_via_silence_edge_tolerance():
+    sr = 16000
+    audio = _sine(sr, 220.0, 3.0)  # RMS は高いが silences 端で安全
+    word = {"start": 1.0, "end": 2.0}
+    # 端±10ms 一致（1.0 と 2.0 が各 silence の端に接する）
+    silences = [[0.5, 0.995], [2.005, 2.5]]
+    assert render.filler_cut_is_safe(audio, sr, word, silences=silences) is True
+
+
+def test_filler_cut_silences_none_uses_rms_only():
+    sr = 16000
+    audio = np.zeros(3 * sr)
+    word = {"start": 1.0, "end": 2.0}
+    # silences=None でも RMS が低ければ安全
+    assert render.filler_cut_is_safe(audio, sr, word, silences=None) is True
+
+
+def test_filler_cut_start_none_is_unsafe():
+    sr = 16000
+    audio = np.zeros(3 * sr)
+    word = {"start": None, "end": 2.0}
+    assert render.filler_cut_is_safe(audio, sr, word, silences=None) is False
+
+
 # ---- surviving_words ----
 
 def test_survive_no_edit():
@@ -356,6 +460,74 @@ def test_plan_kept_neighbor_words_do_not_block_merge():
     out, flags = render.plan_output_intervals(ivs, spans, gap_threshold=1.5, gap_max=0.7)
     assert out == [(0.0, 2.5)]
     assert flags == []
+
+
+# ---- plan_output_intervals（フィラーポーズ分岐） ----
+
+def test_plan_filler_gap_keeps_pause_total():
+    # gap [1.0,3.0] にフィラー span [1.0,3.0] のみ（両端に十分な余地）
+    ivs = [(0.0, 1.0), (3.0, 4.0)]
+    out, flags = render.plan_output_intervals(
+        ivs, [], filler_spans=[(1.5, 2.5)], filler_pause_keep=0.25
+    )
+    # pre 側 f_start=1.5, post 側 f_end=2.5。pre_keep=post_keep=0.125
+    assert out == [
+        (0.0, pytest.approx(1.125)),
+        (pytest.approx(2.875), 4.0),
+    ]
+    assert flags == [False]
+    # 残る間の合計 = (1.125-1.0) + (3.0-2.875) = 0.25
+    total = (out[0][1] - 1.0) + (3.0 - out[1][0])
+    assert total == pytest.approx(0.25)
+
+
+def test_plan_filler_pre_short_redistributes_to_post():
+    # フィラー span が pe に密着（pre_avail 小）→ 余りが post へ再配分
+    ivs = [(0.0, 1.0), (3.0, 4.0)]
+    out, flags = render.plan_output_intervals(
+        ivs, [], filler_spans=[(1.05, 2.0)], filler_pause_keep=0.25
+    )
+    # pre_avail=0.05, post_avail=1.0。pre_keep=0.05, post_keep=0.125+0.075=0.2
+    assert out[0][1] == pytest.approx(1.05)
+    assert out[1][0] == pytest.approx(3.0 - 0.2)
+    total = (out[0][1] - 1.0) + (3.0 - out[1][0])
+    assert total == pytest.approx(0.25)
+    assert flags == [False]
+
+
+def test_plan_filler_both_short_caps_at_available():
+    # 両側の avail 合計 < keep → 合計は avail 合計まで
+    ivs = [(0.0, 1.0), (1.15, 2.15)]
+    out, flags = render.plan_output_intervals(
+        ivs, [], filler_spans=[(1.05, 1.10)], filler_pause_keep=0.25
+    )
+    # pre_avail=0.05, post_avail=0.05 → 合計 0.10
+    total = (out[0][1] - 1.0) + (1.15 - out[1][0])
+    assert total == pytest.approx(0.10)
+    assert flags == [False]
+
+
+def test_plan_filler_with_normal_delete_prefers_crossfade():
+    # フィラー span と通常削除語が同 gap → 分岐2（単語挟まり）優先でクロスフェード
+    ivs = [(0.0, 1.0), (4.0, 5.0)]
+    out, flags = render.plan_output_intervals(
+        ivs, [(1.5, 3.5)], filler_spans=[(1.2, 1.4)], filler_pause_keep=0.25
+    )
+    assert out == [(0.0, 1.0), (4.0, 5.0)]
+    assert flags == [True]
+
+
+def test_plan_filler_none_matches_existing():
+    # filler_spans=None は既存挙動（純無音の長ギャップ切り詰め）
+    ivs = [(0.0, 1.0), (4.0, 5.0)]
+    out, flags = render.plan_output_intervals(
+        ivs, [], gap_threshold=1.5, gap_max=0.7, filler_spans=None
+    )
+    assert out == [
+        (0.0, pytest.approx(1.35)),
+        (pytest.approx(3.65), 5.0),
+    ]
+    assert flags == [False]
 
 
 def test_crossfade_concat_no_crossfade_flag():
@@ -647,6 +819,9 @@ def _make_ambiguous_filler_project(tmp_path, sr=16000):
         "language": "ja",
         "model": "test",
         "pause_threshold": 0.15,
+        # まあ[1,2] の両境界に無音を用意し音響安全判定を通す（連続音でないと
+        # みなさせ、精密カットを許可する。安全判定は§4c）。
+        "silences": [[0.98, 1.02], [1.98, 2.02]],
         "segments": [
             {
                 "id": "0001",
@@ -707,6 +882,127 @@ def test_render_warns_on_insertion(tmp_path, capsys):
     render.render(str(txt))
     err = capsys.readouterr().err
     assert "警告" in err
+
+
+# ---- end-to-end: フィラー精密カット（安全判定・片側ポーズ残し・手動削除） ----
+
+def _write_words_project(tmp_path, specs, silences=None, sr=16000):
+    """word 仕様列から wav + json を書く。
+
+    specs: [(word, start, end, freq, block, suggest_bool), ...]。
+    audio は全体を無音(zeros)で作り、各 word の [start,end] に sine を書く
+    （word 間に無音の gap を作れる）。silences は json に付与する。
+    """
+    import soundfile as sf
+
+    total = max(e for _, _, e, _, _, _ in specs)
+    audio = np.zeros(int(round(total * sr)))
+    words = []
+    text = ""
+    for word, s, e, fr, block, suggest in specs:
+        t = np.arange(int(round((e - s) * sr))) / sr
+        a = int(round(s * sr))
+        audio[a: a + len(t)] = 0.3 * np.sin(2 * np.pi * fr * t)
+        wd = {"word": word, "start": s, "end": e, "probability": 0.9,
+              "block": block}
+        if suggest:
+            wd["suggest"] = True
+        words.append(wd)
+        text += word
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), audio, sr, subtype="PCM_16")
+
+    data = {
+        "source_wav": str(wav.resolve()),
+        "language": "ja",
+        "model": "test",
+        "pause_threshold": 0.15,
+        "segments": [{"id": "0001", "text": text, "words": words}],
+    }
+    if silences is not None:
+        data["silences"] = silences
+    (tmp_path / "input.sc.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+    return wav
+
+
+def test_render_filler_pause_precise_cut(tmp_path, capsys):
+    """前後に実無音を持つフィラーの〔〕削除 → フィラーだけ消え、接合部に
+    約0.25秒の間が残り、隣接語は残存する。"""
+    import soundfile as sf
+
+    # 結局[0,1]220 / 無音[1,1.3] / まあ[1.3,2.0]440(filler) / 無音[2,2.3] / 面倒[2.3,3.3]660
+    _write_words_project(
+        tmp_path,
+        [("結局", 0.0, 1.0, 220.0, 0, False),
+         ("まあ", 1.3, 2.0, 440.0, 1, True),
+         ("面倒", 2.3, 3.3, 660.0, 2, False)],
+        silences=[[1.0, 1.3], [2.0, 2.3]],
+    )
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] 結局〔まあ〕面倒\n", encoding="utf-8")
+
+    out = render.render(str(txt))
+    o_audio, sr = sf.read(out)
+    dur = len(o_audio) / sr
+    # 出力 = [0,1.3] + [2.13,3.3] = 2.47s（pre_keep 0.1 + post_keep 0.15 = 0.25 の
+    # ポーズ残し込み）。フィラーを通常削除扱いで詰めると約2.22s になるため区別できる。
+    assert dur == pytest.approx(2.47, abs=0.08)
+    err = capsys.readouterr().err
+    assert "残しました" not in err
+
+
+def test_render_filler_continuous_audio_kept(tmp_path, capsys):
+    """フィラーが隣接語と連続音（無音なし・高RMS）→ 尺が減らず警告が出る。"""
+    import soundfile as sf
+
+    _write_words_project(
+        tmp_path,
+        [("結局", 0.0, 1.0, 220.0, 0, False),
+         ("まあ", 1.0, 2.0, 440.0, 1, True),
+         ("面倒", 2.0, 3.0, 660.0, 2, False)],
+        silences=None,  # 無音区間情報なし・境界は連続高RMS
+    )
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] 結局〔まあ〕面倒\n", encoding="utf-8")
+
+    out = render.render(str(txt))
+    o_audio, sr = sf.read(out)
+    dur = len(o_audio) / sr
+    # フィラーは安全でないため残る → ほぼ元尺（3.0s）
+    assert dur == pytest.approx(3.0, abs=0.1)
+    err = capsys.readouterr().err
+    assert "残しました" in err
+    assert "まあ" in err
+
+
+def test_render_manual_filler_delete_no_block_wipe(tmp_path, capsys):
+    """手動削除フィラー（〔〕でなく文字を直接消す・同ブロックに他語あり）→
+    ブロック巻き込みなしで該当フィラーのみ消える。"""
+    import soundfile as sf
+
+    # 結局 と まあ が同ブロック(0)。まあ の両境界には無音があり安全にカット可能。
+    _write_words_project(
+        tmp_path,
+        [("結局", 0.0, 1.0, 220.0, 0, False),
+         ("まあ", 1.3, 2.0, 440.0, 0, False),
+         ("面倒", 2.3, 3.3, 660.0, 1, False)],
+        silences=[[1.0, 1.3], [2.0, 2.3]],
+    )
+    txt = tmp_path / "input.sc.txt"
+    # 〔〕でなく「まあ」の文字を直接削除（＝結局面倒）
+    txt.write_text("[0001] 結局面倒\n", encoding="utf-8")
+
+    out = render.render(str(txt))
+    o_audio, sr = sf.read(out)
+    dur = len(o_audio) / sr
+    # 4a により まあ のみ精密カット、同ブロックの 結局 は残存 → 約2.47s。
+    # ブロック巻き込みで 結局 まで消えると約1.2s になるため区別できる。
+    assert dur == pytest.approx(2.47, abs=0.08)
+    err = capsys.readouterr().err
+    assert "ポーズ区切りに合わせて追加削除" not in err
+    assert "残しました" not in err
 
 
 # ---- CLI end-to-end ----

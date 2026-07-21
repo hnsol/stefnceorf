@@ -37,6 +37,12 @@ FADE_S = 0.008
 GAP_THRESHOLD_S = 1.5
 GAP_MAX_S = 0.7
 
+# フィラー精密カットの定数群
+FILLER_PAUSE_KEEP_S = 0.25  # フィラー削除後に残す間の合計（日本語の句間ポーズ自然域 0.2〜0.35s の下限寄り）
+RMS_SAFE_WINDOW_S = 0.03    # 安全判定の境界±窓（調音結合のスケール 20〜50ms）
+RMS_SAFE_DBFS = -40.0       # この RMS 以下なら境界は発話でないとみなす（発話 RMS −25〜−15dBFS の十分下）
+SILENCE_EDGE_TOL_S = 0.01   # json silences の端との一致許容（±10ms）
+
 # `[ID] text` 行のパターン。`[...]` 内の最初の空白区切りトークンをIDとし、以降は無視。
 # 新形式 `[0001 0:12] text` でも旧形式 `[0001] text` でも動く。
 _LINE_RE = re.compile(r"^\[([^\]\s]+)(?:\s+[^\]]*)?\]\s?(.*)$")
@@ -231,6 +237,81 @@ def snap_to_blocks(
     return new_keep, extra
 
 
+def snap_with_filler_exemption(
+    keep: set[int], blocks: list[int], filler_del: set[int]
+) -> tuple[set[int], set[int]]:
+    """filler_del をスナップ判定上「残存扱い」にして snap_to_blocks を適用し、
+    (filler_del を除いた keep, 巻き込み追加削除 index) を返す（純関数）。
+
+    フィラー精密カット確定分（filler_del）は同ブロックに残す単語があっても
+    ブロック全体を巻き込ませないため、スナップ判定上は残存扱いにする。判定後に
+    filler_del 自身を keep から除いて返すことで、フィラーだけを精密にカットする。
+    filler_del が空なら snap_to_blocks と同値。
+    """
+    snapped, extra = snap_to_blocks(keep | filler_del, blocks)
+    return snapped - filler_del, extra
+
+
+def boundary_rms(
+    audio, samplerate, t: float, half_window_s: float = RMS_SAFE_WINDOW_S
+) -> float:
+    """時刻 t±half_window_s の RMS を dBFS で返す。範囲はファイル内にクランプ。
+
+    stereo(2D) はチャンネル平均を取ってから RMS を計算する。全ゼロ・空窓は
+    -inf 扱い（十分小さい値）とする。dBFS は 20*log10(rms)（フルスケール1.0基準）。
+    """
+    import numpy as np
+
+    total = len(audio)
+    if total == 0 or samplerate <= 0:
+        return float("-inf")
+    a = int(round((t - half_window_s) * samplerate))
+    b = int(round((t + half_window_s) * samplerate))
+    a = max(0, a)
+    b = min(total, b)
+    if b <= a:
+        return float("-inf")
+    block = audio[a:b]
+    if getattr(block, "ndim", 1) == 2:
+        block = block.mean(axis=1)
+    rms = float(np.sqrt(np.mean(np.square(block.astype(np.float64)))))
+    if rms <= 0.0:
+        return float("-inf")
+    return 20.0 * float(np.log10(rms))
+
+
+def filler_cut_is_safe(
+    audio, samplerate, word: dict,
+    silences: list | None,
+    rms_threshold_db: float = RMS_SAFE_DBFS,
+) -> bool:
+    """フィラー単語 word のカット両境界（start / end）が安全なら True。
+
+    各境界 t は次のいずれかで安全とみなす:
+    (1) silences のいずれかの区間 [s, e] について
+        s-SILENCE_EDGE_TOL_S <= t <= e+SILENCE_EDGE_TOL_S
+        （端±10ms 込みで無音に接している）
+    (2) boundary_rms(t) <= rms_threshold_db（境界近傍が発話レベルでない）
+
+    silences が None（旧 json）は (2) のみで判定する。start/end のいずれかが
+    None なら安全と言えないため False。両境界がともに安全なときだけ True。
+    """
+    start = word.get("start")
+    end = word.get("end")
+    if start is None or end is None:
+        return False
+
+    def _safe(t: float) -> bool:
+        if silences is not None:
+            for span in silences:
+                s, e = float(span[0]), float(span[1])
+                if s - SILENCE_EDGE_TOL_S <= t <= e + SILENCE_EDGE_TOL_S:
+                    return True
+        return boundary_rms(audio, samplerate, t) <= rms_threshold_db
+
+    return _safe(float(start)) and _safe(float(end))
+
+
 def words_to_intervals(
     words: list[dict],
     keep_indices: set[int],
@@ -302,47 +383,84 @@ def plan_output_intervals(
     word_spans: list[tuple[float, float]],
     gap_threshold: float = GAP_THRESHOLD_S,
     gap_max: float = GAP_MAX_S,
+    filler_spans: list[tuple[float, float]] | None = None,
+    filler_pause_keep: float = FILLER_PAUSE_KEEP_S,
 ) -> tuple[list[tuple[float, float]], list[bool]]:
     """出力順のソース区間列から、ギャップ保持/切り詰めを適用した出力区間列を返す。
 
     隣接する区間 (prev, cur) の境界について、ソース時間軸上のギャップ
-    g = cur.start - prev.end を評価する:
+    g = cur.start - prev.end を次の順に評価する:
 
-    - g < 0（ソースが逆行 = 並べ替え等）: 従来どおり別区間としてクロスフェード結合
-    - 間に単語（削除単語）が挟まる: 従来どおり別区間としてクロスフェード結合
-    - 純粋な無音ギャップ かつ g ≤ gap_threshold: ギャップ音声を保持
-      （＝1つの連続区間としてマージ。クロスフェードは入らない）
-    - 純粋な無音ギャップ かつ g > gap_threshold: gap_max に切り詰め
-      （前側 gap_max/2 ＋ 後側 gap_max/2 を残し中間をカット、単純結合）
+    1. g < 0（ソースが逆行 = 並べ替え等）: 従来どおり別区間としてクロスフェード結合
+    2. 間に単語（フィラー以外の削除単語）が挟まる: 従来どおりクロスフェード結合
+    3. filler_spans のうち (pe, ns) に重なるものがある: フィラーポーズ分岐。
+       安全にカットされたフィラーが挟まる無音ギャップなので、削除後に残す間の
+       合計を filler_pause_keep に収める。フィラー span の前後で使える無音量
+       （pre_avail / post_avail）に応じ、片側 filler_pause_keep/2 を基本とし、
+       片側で余った分は他方の avail 範囲で再配分する（合計 =
+       min(pre_avail + post_avail, filler_pause_keep)）。無音中のカットなので
+       単純結合（cf_flags False）。
+    4. 純粋な無音ギャップ かつ g ≤ gap_threshold: ギャップ音声を保持（連続マージ）
+       g > gap_threshold: gap_max に切り詰め（前後 gap_max/2 を残し単純結合）
 
     戻り値: (区間列, クロスフェードフラグ列)。フラグ列の長さは len(区間列)-1。
-    True=クロスフェード結合、False=単純結合（ギャップ切り詰め境界）。
+    True=クロスフェード結合、False=単純結合（ギャップ切り詰め・フィラーポーズ境界）。
     """
     if not intervals:
         return [], []
 
+    fspans = filler_spans or []
     out: list[tuple[float, float]] = []
     cf_flags: list[bool] = []
     pending = [intervals[0][0], intervals[0][1]]
     half = gap_max / 2.0
+    fhalf = filler_pause_keep / 2.0
     for k in range(1, len(intervals)):
         cur = intervals[k]
         pe = intervals[k - 1][1]
         ns = cur[0]
         g = ns - pe
-        eligible = g >= 0 and not _word_in_gap(word_spans, pe, ns)
-        if eligible:
-            if g <= gap_threshold or g <= gap_max:
-                pending[1] = cur[1]
-            else:
-                pending[1] = pe + half
-                out.append((pending[0], pending[1]))
-                cf_flags.append(False)
-                pending = [ns - half, cur[1]]
-        else:
+        if g < 0:
+            # 1. ソース逆行 → クロスフェード結合
             out.append((pending[0], pending[1]))
             cf_flags.append(True)
             pending = [cur[0], cur[1]]
+            continue
+        if _word_in_gap(word_spans, pe, ns):
+            # 2. フィラー以外の削除単語が挟まる → クロスフェード結合
+            out.append((pending[0], pending[1]))
+            cf_flags.append(True)
+            pending = [cur[0], cur[1]]
+            continue
+        overlap = [(s, e) for s, e in fspans if s < ns and e > pe]
+        if overlap:
+            # 3. フィラーポーズ分岐（無音中カット → 単純結合）
+            f_start = min(max(s, pe) for s, e in overlap)
+            f_end = max(min(e, ns) for s, e in overlap)
+            pre_avail = max(0.0, f_start - pe)
+            post_avail = max(0.0, ns - f_end)
+            pre_keep = min(pre_avail, fhalf)
+            post_keep = min(post_avail, fhalf)
+            # 片側の余り（fhalf を使い切れなかった分）を他方の avail 範囲で再配分。
+            # 合計は min(pre_avail + post_avail, filler_pause_keep) に収まる。
+            leftover = filler_pause_keep - pre_keep - post_keep
+            add_pre = min(leftover, pre_avail - pre_keep)
+            pre_keep += add_pre
+            leftover -= add_pre
+            post_keep += min(leftover, post_avail - post_keep)
+            pending[1] = pe + pre_keep
+            out.append((pending[0], pending[1]))
+            cf_flags.append(False)
+            pending = [ns - post_keep, cur[1]]
+            continue
+        # 4. 純無音ギャップ
+        if g <= gap_threshold or g <= gap_max:
+            pending[1] = cur[1]
+        else:
+            pending[1] = pe + half
+            out.append((pending[0], pending[1]))
+            cf_flags.append(False)
+            pending = [ns - half, cur[1]]
     out.append((pending[0], pending[1]))
     return out, cf_flags
 
@@ -431,6 +549,8 @@ def render(
 
     data = json.loads(json_path.read_text(encoding="utf-8"))
     segments = data.get("segments", [])
+    # 音響安全判定用の無音区間（旧 json は None → RMS のみで判定）
+    silences = data.get("silences")
     seg_map: dict[str, dict] = {}
     for seg in segments:
         seg_map[seg["id"]] = seg
@@ -464,16 +584,10 @@ def render(
         hi_b = float(next_words[0]["start"]) if next_words else file_length_s
         seg_bounds[seg["id"]] = (lo_b, hi_b)
 
-    # 全セグメントの単語区間（ソース時刻・生値）。ギャップに削除単語が挟まるかの判定に使う。
-    word_spans: list[tuple[float, float]] = []
-    for seg in segments:
-        for w in seg.get("words", []) or []:
-            s, e = w.get("start"), w.get("end")
-            if s is not None and e is not None:
-                word_spans.append((float(s), float(e)))
-
     plan_intervals: list[tuple[float, float]] = []
     all_warnings: list[str] = []
+    # 安全にカットされたフィラー単語の span（片側ポーズ残しの分岐判定に使う）。
+    filler_cut_spans: list[tuple[float, float]] = []
     for seg_id, edited, brackets in parsed:
         seg = seg_map.get(seg_id)
         if seg is None:
@@ -497,13 +611,41 @@ def render(
         for w in warns:
             all_warnings.append(f"[{seg_id}] {w}")
 
-        # ポーズ区切り（ブロック）単位にスナップ。block を持たない旧 json は
-        # 各単語を独立ブロック扱い（＝従来の単語スナップ）にフォールバック。
+        # ポーズ区切り（ブロック）単位。block を持たない旧 json は各単語を独立
+        # ブロック扱い（＝従来の単語スナップ）にフォールバック。
         if words and all("block" in w for w in words):
             blocks = [w["block"] for w in words]
         else:
             blocks = list(range(len(words)))
-        keep, extra = snap_to_blocks(keep, blocks)
+
+        # 4a. 手動削除フィラーの取り込み。〔〕でなく文字を直接消したフィラーも、
+        # 同ブロックに残す単語があるならブロック巻き込みでなく精密カット対象にする。
+        for wi in range(len(words)):
+            if wi in keep or wi in filler_del:
+                continue
+            if not fillers_mod.is_filler(word_strs[wi], fillers_set):
+                continue
+            b = blocks[wi]
+            if any(kj in keep and blocks[kj] == b for kj in keep):
+                filler_del.add(wi)
+
+        # 4c. 音響安全判定。カット両境界が前後音声と連続していないフィラーだけを
+        # 精密カットの対象とする。unsafe なら keep に戻し警告する。
+        for wi in sorted(filler_del):
+            if filler_cut_is_safe(audio, samplerate, words[wi], silences):
+                w = words[wi]
+                s, e = w.get("start"), w.get("end")
+                if s is not None and e is not None:
+                    filler_cut_spans.append((float(s), float(e)))
+            else:
+                filler_del.discard(wi)
+                keep.add(wi)
+                all_warnings.append(
+                    f"[{seg_id}] フィラー〔{word_strs[wi]}〕は前後の音声と連続しているため残しました"
+                )
+
+        # 4b. filler_del をスナップ判定上「残存扱い」にしてブロックスナップ。
+        keep, extra = snap_with_filler_exemption(keep, blocks, filler_del)
         if extra:
             removed = "".join(word_strs[i] for i in sorted(extra))
             all_warnings.append(
@@ -516,8 +658,23 @@ def render(
         )
         plan_intervals.extend(intervals)
 
+    # 全セグメントの単語区間（ソース時刻・生値）。ギャップに削除単語が挟まるかの
+    # 判定に使う。安全カットしたフィラー span は除外する（さもないと分岐2が先に
+    # 発火してフィラーポーズ分岐に到達しない）。
+    safe_filler = set(filler_cut_spans)
+    word_spans: list[tuple[float, float]] = []
+    for seg in segments:
+        for w in seg.get("words", []) or []:
+            s, e = w.get("start"), w.get("end")
+            if s is not None and e is not None:
+                span = (float(s), float(e))
+                if span in safe_filler:
+                    continue
+                word_spans.append(span)
+
     out_intervals, cf_flags = plan_output_intervals(
-        plan_intervals, word_spans, gap_threshold=gap_threshold, gap_max=gap_max
+        plan_intervals, word_spans, gap_threshold=gap_threshold, gap_max=gap_max,
+        filler_spans=filler_cut_spans,
     )
 
     chunks = []

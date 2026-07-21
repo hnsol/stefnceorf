@@ -26,13 +26,16 @@ WORD_DUR = 1.0  # 1単語=1秒
 
 # ---- 合成プロジェクト生成 -------------------------------------------------
 
-def _build_project(tmp_path, segments, sr=SR, subtype="PCM_16", blocks=None):
+def _build_project(tmp_path, segments, sr=SR, subtype="PCM_16", blocks=None,
+                   silences=None):
     """合成 wav + .sc.json を生成し、(wav パス, 無編集の txt 本文) を返す。
 
     segments: [[(word_str, freq_hz), ...], ...]  各内側リストが1セグメント。
     単語は 1秒ずつ、ソース時間軸で連続配置する。波形は位相連続。
     blocks: segments と同形の [[block_idx, ...], ...]。指定時は各 word の json に
     "block" を付与する（ポーズ区切り＝ブロック単位削除の検証用）。
+    silences: [[s, e], ...]。指定時は json に "silences" を付与する（フィラー
+    精密カットの音響安全判定用）。
     """
     inst_freq_parts: list[np.ndarray] = []
     json_segs: list[dict] = []
@@ -74,6 +77,8 @@ def _build_project(tmp_path, segments, sr=SR, subtype="PCM_16", blocks=None):
         "model": "test",
         "segments": json_segs,
     }
+    if silences is not None:
+        data["silences"] = silences
     (tmp_path / "input.sc.json").write_text(
         json.dumps(data, ensure_ascii=False), encoding="utf-8"
     )
@@ -217,8 +222,12 @@ def test_reorder_lines(tmp_path):
 
 def test_filler_bracket_kept_is_removed(tmp_path):
     freqs = [200, 400, 600]
-    # 中央単語「まあ」= 400Hz。前後は「まあ」と文字が衝突しない語にする
-    _build_project(tmp_path, [[("か", 200), ("まあ", 400), ("き", 600)]])
+    # 中央単語「まあ」= 400Hz。前後は「まあ」と文字が衝突しない語にする。
+    # まあ[1,2] の両境界に無音を用意し音響安全判定（§4c）を通す。
+    _build_project(
+        tmp_path, [[("か", 200), ("まあ", 400), ("き", 600)]],
+        silences=[[0.98, 1.02], [1.98, 2.02]],
+    )
     txt = tmp_path / "input.sc.txt"
     txt.write_text("[0001] か〔まあ〕き\n", encoding="utf-8")  # 括弧残し
 
