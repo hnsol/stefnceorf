@@ -941,6 +941,32 @@ def test_transcribe_verbatim_en_prompt(tmp_path, fake_whisper):
     assert fake_whisper["kwargs"]["initial_prompt"] == transcribe.FILLER_PROMPT_EN
 
 
+def test_transcribe_passes_runtime_silence_keep_to_build_cuts(
+    tmp_path, monkeypatch
+):
+    """認識用カットは実行時の SILENCE_KEEP_S を明示して組み立てる。"""
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda path, **kwargs: {"language": "ja", "segments": []}
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(
+        transcribe,
+        "_detect_silence",
+        lambda p, **k: "silence_start: 1.0\nsilence_end: 3.0\n",
+    )
+    monkeypatch.setattr(transcribe, "_write_trimmed_wav", lambda p, cuts: (p, 0.0))
+    monkeypatch.setattr(transcribe, "SILENCE_KEEP_S", 0.25)
+    calls = []
+
+    def spy_build_cuts(periods, **kwargs):
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(transcribe, "build_cuts", spy_build_cuts)
+    transcribe.transcribe(str(_make_input(tmp_path)), lang="ja")
+    assert calls == [{"keep": 0.25}]
+
+
 def test_transcribe_verbatim_chunks_and_offsets_words(tmp_path, monkeypatch):
     calls = []
     clip_paths = []

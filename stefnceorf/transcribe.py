@@ -1043,7 +1043,7 @@ def transcribe(
     else:
         block_silences = []
     # 認識用wavのみ長い無音を切り詰める。単語時刻は後段で元時刻へ逆写像。
-    cuts = build_cuts(cut_periods)
+    cuts = build_cuts(cut_periods, keep=SILENCE_KEEP_S)
     trimmed_wav, removed_s = _write_trimmed_wav(tmp_wav, cuts)
     recog_wav = trimmed_wav
     # verbatim では温度フォールバックと無音スキップを無効にする（A/B実測:
