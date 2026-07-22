@@ -620,6 +620,76 @@ def test_drop_halluc_normal_all_kept():
     assert dropped == []
 
 
+# ---- drop_hallucinations 条件d（時間密度異常）・条件e（エコー） ----
+
+def _timed_words(tokens, start, end):
+    """tokens を [start, end] に等間隔で割り付けた words を返す。"""
+    n = len(tokens)
+    step = (end - start) / n if n else 0.0
+    return [
+        {"word": t, "start": start + step * i, "end": start + step * (i + 1),
+         "probability": 0.9}
+        for i, t in enumerate(tokens)
+    ]
+
+
+def test_drop_halluc_density_zero_duration():
+    # 5語以上・全単語が同時刻（duration≈0）→ 条件d で除去
+    toks = list("あいうえお")
+    seg = _seg("あいうえお", _timed_words(toks, 1.0, 1.0))
+    kept, dropped = transcribe.drop_hallucinations([seg])
+    assert kept == []
+    assert dropped == [seg]
+
+
+def test_drop_halluc_density_32chars_012s():
+    # 32文字が0.12秒（266文字/秒）の実測パターン → 条件d で除去
+    s = "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみ"
+    assert len(s) == 32
+    seg = _seg(s, _timed_words(list(s), 1.0, 1.12))
+    kept, dropped = transcribe.drop_hallucinations([seg])
+    assert kept == []
+    assert dropped == [seg]
+
+
+def test_drop_halluc_density_normal_kept():
+    # 36文字4.9秒（約7.3文字/秒）→ 残す
+    toks = ["あいうえおか", "きくけこさし", "すせそたちつ",
+            "てとなにぬね", "のはひふへほ", "まみむめもや"]
+    assert len("".join(toks)) == 36
+    seg = _seg("".join(toks), _timed_words(toks, 1.0, 5.9))
+    kept, dropped = transcribe.drop_hallucinations([seg])
+    assert kept == [seg]
+    assert dropped == []
+
+
+def test_drop_halluc_echo_regression():
+    # 実測回帰: A(正常密度・残す), B/C(0.12秒), D(14文字/秒でCのエコー) を除去
+    a = "あるいはえー生成AI使ってたの残り使用量みたいなものを見るとえー"
+    bc = "えー生成AI使ってたの残り使用量みたいなものを見るとえー"
+    d = bc + "どれぐらいトークンを"
+    seg_a = _seg(a, _timed_words(list(a), 0.0, 7.6))
+    seg_b = _seg(bc, _timed_words(list(bc), 8.0, 8.12))
+    seg_c = _seg(bc, _timed_words(list(bc), 8.5, 8.62))
+    # D: 密度 = len/duration が 12〜25 の範囲（条件d非該当・条件e該当）
+    seg_d = _seg(d, _timed_words(list(d), 9.0, 9.0 + len(d) / 14.0))
+    kept, dropped = transcribe.drop_hallucinations(
+        [seg_a, seg_b, seg_c, seg_d])
+    assert kept == [seg_a]
+    assert dropped == [seg_b, seg_c, seg_d]
+
+
+def test_drop_halluc_echo_normal_density_kept():
+    # 直前と共通接頭辞は長いが密度が正常（ゆっくり言い直し）→ 残す
+    p = "今日はとても良い天気ですねそうですね"
+    q = p + "本当にそう思います"
+    seg_p = _seg(p, _timed_words(list(p), 0.0, 4.0))
+    seg_q = _seg(q, _timed_words(list(q), 5.0, 11.0))  # 約4.5文字/秒
+    kept, dropped = transcribe.drop_hallucinations([seg_p, seg_q])
+    assert kept == [seg_p, seg_q]
+    assert dropped == []
+
+
 # ---- transcribe 全体（mlx_whisper と ffmpeg をモック） ----
 
 @pytest.fixture
@@ -721,6 +791,10 @@ def test_transcribe_passes_whisper_kwargs(tmp_path, fake_whisper):
     assert kw["condition_on_previous_text"] is False
     assert kw["no_speech_threshold"] == 0.8
     assert kw["compression_ratio_threshold"] == 2.0
+    assert (
+        kw["hallucination_silence_threshold"]
+        == transcribe.HALLUC_SILENCE_SKIP_S
+    )
 
 
 # ---- verbatim モード ----

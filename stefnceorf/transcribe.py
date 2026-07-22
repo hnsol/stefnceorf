@@ -35,6 +35,19 @@ HALLUC_MIN_WORDS = 5     # セグメント内反復判定の最小語数
 HALLUC_TOP_RATIO = 0.7   # 最頻トークンの占有率閾値
 HALLUC_RUN = 3           # 同一テキストセグメントの連続数閾値
 
+# 幻覚疑い時に無音をスキップする本家 whisper 由来の抑止しきい値（秒）。
+# word_timestamps=True が必要（当ツールは常に満たす）。本家 whisper 推奨域で
+# あり、ポーズ区切り 0.3s より十分長いため発話間の自然なポーズを誤スキップしない。
+HALLUC_SILENCE_SKIP_S = 2.0
+
+# 時間密度異常による幻覚除去（条件d）。実発話は 5〜7 文字/秒だが幻覚は
+# 全単語 zero-duration 等で 200 文字/秒超になる。実発話の 3 倍超をしきい値とする。
+HALLUC_DENSITY_CHARS_S = 25.0
+
+# エコー幻覚除去（条件e）。直前セグメントの近似繰り返しを捕まえる。
+HALLUC_ECHO_PREFIX = 15          # 直前との共通接頭辞の閾値文字数
+HALLUC_ECHO_DENSITY_CHARS_S = 12.0  # エコー判定に用いる文字密度しきい値
+
 # 幻覚区間の再認識レスキュー窓の最小長（秒）。これ未満の窓は内容なしとみなし
 # レスキューを省略する（従来通り除去扱い）。
 RESCUE_MIN_WINDOW_S = 0.5
@@ -388,11 +401,36 @@ def drop_hallucinations(
        同一連続ではないので残る。
     c. 空セグメント: words が空、text.strip() が空、または記号・句読点のみで
        文字（かな・漢字・英数字）を含まない。
+    d. 時間密度異常: トークンが HALLUC_MIN_WORDS 個以上あり、発話時間（先頭単語
+       の start 〜 末尾単語の end）が正で文字密度が HALLUC_DENSITY_CHARS_S 超、
+       または発話時間が 0 以下（全単語 zero-duration）。実発話 5〜7 文字/秒に
+       対し幻覚は 200 文字/秒超になるため。
+    e. エコー（直前セグメントの近似繰り返し）: 正規化テキスト（空白・句読点を
+       除去）が直前セグメント（除去済みか否かを問わない生の直前）と共通接頭辞
+       HALLUC_ECHO_PREFIX 文字以上で、かつ文字密度が HALLUC_ECHO_DENSITY_CHARS_S
+       超なら除去。幻覚エコーは直前文の微変形（前置き欠落・末尾延長）で出るため
+       完全一致の条件bでは捕まらない。実発話の言い直し反復はセグメント全体が
+       12 文字/秒超にならないので密度条件で誤除去を防ぐ。
 
     戻り値: (残すセグメント列, 除去したセグメント列)。順序は入力順を保つ。
     """
     n = len(segments)
     drop = [False] * n
+
+    def _norm(text: str) -> str:
+        """正規化: 空白と句読点を除去する（エコー接頭辞比較用）。"""
+        return re.sub(r"[\s、。，．！？!?…・,.]", "", text or "")
+
+    def _density(seg: dict, tokens: list[str]) -> float | None:
+        """文字密度（文字/秒）。発話時間>0 なら密度、<=0 なら None を返す。"""
+        start = _seg_first_start(seg)
+        end = _seg_last_end(seg)
+        if start is None or end is None:
+            return None
+        dur = end - start
+        if dur <= 0:
+            return None
+        return len("".join(tokens)) / dur
 
     for i, seg in enumerate(segments):
         words = seg.get("words") or []
@@ -409,6 +447,32 @@ def drop_hallucinations(
             top = Counter(tokens).most_common(1)[0][1]
             if top / len(tokens) >= HALLUC_TOP_RATIO:
                 drop[i] = True
+        # 条件 d: 時間密度異常（a に該当しなかった場合に評価）
+        if not drop[i] and len(tokens) >= HALLUC_MIN_WORDS:
+            dens = _density(seg, tokens)
+            if dens is None or dens > HALLUC_DENSITY_CHARS_S:
+                drop[i] = True
+
+    # 条件 e: 直前セグメント（生の直前）の近似繰り返し
+    for i in range(1, n):
+        if drop[i]:
+            continue
+        words = segments[i].get("words") or []
+        tokens = [(w.get("word") or "").strip() for w in words]
+        if len(tokens) < HALLUC_MIN_WORDS:
+            continue
+        cur = _norm(segments[i].get("text") or "")
+        prev = _norm(segments[i - 1].get("text") or "")
+        prefix = 0
+        for a, b in zip(cur, prev):
+            if a != b:
+                break
+            prefix += 1
+        if prefix < HALLUC_ECHO_PREFIX:
+            continue
+        dens = _density(segments[i], tokens)
+        if dens is None or dens > HALLUC_ECHO_DENSITY_CHARS_S:
+            drop[i] = True
 
     # 条件 b: 同一テキストの連続（a/c で除去済みのセグメントは連続を分断しない）
     live = [i for i in range(n) if not drop[i]]
@@ -477,6 +541,7 @@ def _rescue_kwargs(model: str, lang: str | None) -> dict:
         condition_on_previous_text=False,
         no_speech_threshold=0.8,
         compression_ratio_threshold=2.0,
+        hallucination_silence_threshold=HALLUC_SILENCE_SKIP_S,
     )
 
 
@@ -739,6 +804,8 @@ def transcribe(
         condition_on_previous_text=verbatim,
         no_speech_threshold=0.8,
         compression_ratio_threshold=2.0,
+        # 非verbatimでも condT=False で幻覚は起き得るため常時付与する。
+        hallucination_silence_threshold=HALLUC_SILENCE_SKIP_S,
         verbose=False,  # mlx-whisper 組み込みの進捗バー(tqdm)を有効化
     )
     if verbatim:
