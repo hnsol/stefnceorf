@@ -232,10 +232,13 @@ def test_reorder_lines(tmp_path):
 def test_filler_bracket_kept_is_removed(tmp_path):
     freqs = [200, 400, 600]
     # 中央単語「まあ」= 400Hz。前後は「まあ」と文字が衝突しない語にする。
-    # まあ[1,2] の両境界に無音を用意し音響安全判定（§4c）を通す。
+    # まあ[1,2] の両境界に無音を用意し音響安全判定（§4c）を通す。谷スナップは
+    # 実波形の RMS 最小点へ寄せるため、宣言した silences と同区間を実際に無音化する
+    # （実録音では宣言無音＝実低RMSであることを反映）。
     _build_project(
         tmp_path, [[("か", 200), ("まあ", 400), ("き", 600)]],
         silences=[[0.98, 1.02], [1.98, 2.02]],
+        zero_ranges=[[0.98, 1.02], [1.98, 2.02]],
     )
     txt = tmp_path / "input.sc.txt"
     txt.write_text("[0001] か〔まあ〕き\n", encoding="utf-8")  # 括弧残し
@@ -265,11 +268,12 @@ def test_filler_bracket_removed_is_kept(tmp_path):
 def test_multiple_fillers_deleted_in_one_line(tmp_path):
     freqs = [200, 400, 600, 800, 1000]
     # か・まあ(filler)・き・えっと(filler)・く。まあ[1,2] えっと[3,4] の各境界に
-    # 無音を用意し音響安全判定を通す。
+    # 無音を用意し音響安全判定を通す。谷スナップ用に宣言無音と同区間を実無音化する。
     _build_project(
         tmp_path,
         [[("か", 200), ("まあ", 400), ("き", 600), ("えっと", 800), ("く", 1000)]],
         silences=[[0.98, 1.02], [1.98, 2.02], [2.98, 3.02], [3.98, 4.02]],
+        zero_ranges=[[0.98, 1.02], [1.98, 2.02], [2.98, 3.02], [3.98, 4.02]],
     )
     txt = tmp_path / "input.sc.txt"
     txt.write_text("[0001] か〔まあ〕き〔えっと〕く\n", encoding="utf-8")
@@ -298,6 +302,7 @@ def test_filler_delete_with_line_delete_and_reorder(tmp_path):
             [("さ", 1000)],
         ],
         silences=[[1.98, 2.02], [2.98, 3.02]],  # まあ[2,3] の両境界
+        zero_ranges=[[1.98, 2.02], [2.98, 3.02]],  # 谷スナップ用に実無音化
     )
     txt = tmp_path / "input.sc.txt"
     # 0001(あ) を行削除、0003 を 0002 より前へ入れ替え、0002 内のフィラー削除

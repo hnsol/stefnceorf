@@ -43,6 +43,16 @@ RMS_SAFE_WINDOW_S = 0.03    # 安全判定の境界±窓（調音結合のスケ
 RMS_SAFE_DBFS = -40.0       # この RMS 以下なら境界は発話でないとみなす（発話 RMS −25〜−15dBFS の十分下）
 SILENCE_EDGE_TOL_S = 0.01   # json silences の端との一致許容（±10ms）
 
+# フィラーカット境界の谷スナップ＋相対RMS閾値の定数群。
+# 実データ検証: 絶対閾値 -40dB が録音の発話帯域（中央値 -38dB）とほぼ重なり、
+# クランプ済み境界が音の減衰尾に留まって多数のフィラーが誤って unsafe 判定された。
+# 対策は (1) 境界を近傍のRMS最小点（無音の谷）へスナップ (2) 閾値を発話レベルからの相対値化。
+SNAP_SEARCH_S = 0.10       # 谷スナップの探索半幅（フィラー前後のポーズ・減衰尾のスケール）
+SNAP_STEP_S = 0.005        # 谷探索の刻み
+SNAP_RMS_WINDOW_S = 0.015  # 谷探索時のRMS窓半幅（boundary_rms のwindowより狭く、谷を鋭く検出）
+RMS_SAFE_REL_DB = 15.0     # 発話中央値からこのdB下を無音側とみなす（実測: 発話-38dB/無音-73dB帯の中間）
+MIN_FILLER_CUT_S = 0.03    # スナップ後のカット区間がこれ未満なら意味がないのでカットしない
+
 # `[ID] text` 行のパターン。`[...]` 内の最初の空白区切りトークンをIDとし、以降は無視。
 # 新形式 `[0001 0:12] text` でも旧形式 `[0001] text` でも動く。
 _LINE_RE = re.compile(r"^\[([^\]\s]+)(?:\s+[^\]]*)?\]\s?(.*)$")
@@ -310,6 +320,110 @@ def filler_cut_is_safe(
         return boundary_rms(audio, samplerate, t) <= rms_threshold_db
 
     return _safe(float(start)) and _safe(float(end))
+
+
+def speech_median_dbfs(
+    audio, samplerate, word_spans: list[tuple[float, float]]
+) -> float | None:
+    """全単語の中央時刻の boundary_rms の中央値（発話レベルの推定）を返す。
+
+    word_spans は (start, end) 列。長さ 0.05s 未満の単語は調音の途中や境界の
+    誤差が支配的で発話レベルの代表になりにくいため除外する。対象が無ければ、
+    または全て無音（-inf）で有効値が無ければ None を返す。相対閾値
+    (発話中央値 - RMS_SAFE_REL_DB) の基準として使う。
+    """
+    import numpy as np
+
+    vals: list[float] = []
+    for s, e in word_spans:
+        if e - s < 0.05:
+            continue
+        db = boundary_rms(audio, samplerate, (s + e) / 2.0)
+        if np.isfinite(db):
+            vals.append(db)
+    if not vals:
+        return None
+    return float(np.median(vals))
+
+
+def snap_to_trough(
+    audio, samplerate, t: float, lo: float, hi: float,
+    search_s: float = SNAP_SEARCH_S, step_s: float = SNAP_STEP_S,
+    window_s: float = SNAP_RMS_WINDOW_S,
+) -> tuple[float, float]:
+    """[max(lo, t-search_s), min(hi, t+search_s)] を step_s 刻みで走査し、
+    boundary_rms(・, half_window_s=window_s) が最小の時刻へスナップする。
+
+    戻り値 (スナップ後時刻, そのRMS dBFS)。範囲が空（lo/hi クランプで下限>上限）
+    なら (t, boundary_rms(t)) を返す。狭い RMS 窓で走査するのは、発話→無音→発話の
+    谷（減衰尾を過ぎた無音点）を鋭く捉えて境界をそこへ寄せるため。
+    """
+    a = max(lo, t - search_s)
+    b = min(hi, t + search_s)
+    if b < a:
+        return t, boundary_rms(audio, samplerate, t, half_window_s=window_s)
+
+    best_t = t
+    best_rms = float("inf")
+    x = a
+    while x <= b + 1e-9:
+        db = boundary_rms(audio, samplerate, x, half_window_s=window_s)
+        if db < best_rms:
+            best_rms = db
+            best_t = x
+        x += step_s
+    return best_t, best_rms
+
+
+def plan_filler_cut(
+    audio, samplerate, word: dict,
+    lo: float, hi: float,
+    silences: list | None,
+    rms_threshold_db: float,
+) -> tuple[float, float] | None:
+    """フィラー word のカット区間を谷スナップ込みで計画する（純関数）。
+
+    start / end それぞれを近傍の RMS 最小点（無音の谷）へスナップし、両端とも
+    安全なら (snapped_start, snapped_end) を返す。安全とは各境界 t について:
+    (1) silences のいずれかの区間 [s,e] で s-SILENCE_EDGE_TOL_S <= t <=
+        e+SILENCE_EDGE_TOL_S（端±許容込みで無音に接する/内部）
+    (2) スナップ後 RMS <= rms_threshold_db
+    のいずれか。加えて snapped_end - snapped_start >= MIN_FILLER_CUT_S を要求する。
+    どれかを満たさない、または start/end が None なら None（カットしない）。
+
+    lo/hi は隣接語に食い込まないための探索クランプ（lo=前の単語の end もしくは
+    セグメント下限、hi=次の単語の start もしくはセグメント上限）。start 側の探索
+    範囲は [max(lo, start-search), min(start+search, end)]、end 側は
+    [max(end-search, start), min(hi, end+search)] とし互いに逆転しないようにする。
+    """
+    start = word.get("start")
+    end = word.get("end")
+    if start is None or end is None:
+        return None
+    start = float(start)
+    end = float(end)
+
+    s_lo = max(lo, start - SNAP_SEARCH_S)
+    s_hi = min(start + SNAP_SEARCH_S, end)
+    snapped_start, srms = snap_to_trough(audio, samplerate, start, s_lo, s_hi)
+
+    e_lo = max(end - SNAP_SEARCH_S, start)
+    e_hi = min(hi, end + SNAP_SEARCH_S)
+    snapped_end, erms = snap_to_trough(audio, samplerate, end, e_lo, e_hi)
+
+    def _safe(t: float, rms: float) -> bool:
+        if silences is not None:
+            for span in silences:
+                s, e = float(span[0]), float(span[1])
+                if s - SILENCE_EDGE_TOL_S <= t <= e + SILENCE_EDGE_TOL_S:
+                    return True
+        return rms <= rms_threshold_db
+
+    if not (_safe(snapped_start, srms) and _safe(snapped_end, erms)):
+        return None
+    if snapped_end - snapped_start < MIN_FILLER_CUT_S:
+        return None
+    return snapped_start, snapped_end
 
 
 def words_to_intervals(
@@ -584,15 +698,36 @@ def render(
         hi_b = float(next_words[0]["start"]) if next_words else file_length_s
         seg_bounds[seg["id"]] = (lo_b, hi_b)
 
+    # 発話レベル（全単語中央時刻 RMS の中央値）から相対 RMS 閾値を決める。
+    # 録音の発話帯域が絶対閾値 -40dB と重なると境界がほぼ全て unsafe になるため、
+    # 発話中央値 - RMS_SAFE_REL_DB と -40dB のうち低い（厳しい）方を採る
+    # （静かな録音では相対値、大きい録音でも -40dB より緩めない）。
+    all_word_spans: list[tuple[float, float]] = []
+    for seg in segments:
+        for w in seg.get("words", []) or []:
+            s, e = w.get("start"), w.get("end")
+            if s is not None and e is not None:
+                all_word_spans.append((float(s), float(e)))
+    speech_med = speech_median_dbfs(audio, samplerate, all_word_spans)
+    rms_threshold = (
+        min(RMS_SAFE_DBFS, speech_med - RMS_SAFE_REL_DB)
+        if speech_med is not None else RMS_SAFE_DBFS
+    )
+
     plan_intervals: list[tuple[float, float]] = []
     all_warnings: list[str] = []
     # 安全にカットされたフィラー単語の span（片側ポーズ残しの分岐判定に使う）。
+    # スナップ後の値を持つため、word_spans からの除外は値一致でなく (seg_id, wi)
+    # キーで行う（スナップで元 span と一致しなくなるため）。
     filler_cut_spans: list[tuple[float, float]] = []
+    safe_filler_keys: set[tuple[str, int]] = set()
     for seg_id, edited, brackets in parsed:
         seg = seg_map.get(seg_id)
         if seg is None:
             raise ValueError(f"json に存在しない ID です: [{seg_id}]")
-        words = seg.get("words", []) or []
+        # words は json 由来の共有 dict。谷スナップで start/end を書き換えるため
+        # 要素ごとにコピーして他所（後段の word_spans 構築等）への副作用を防ぐ。
+        words = [dict(w) for w in (seg.get("words", []) or [])]
         word_strs = [w.get("word", "").replace(BLOCK_SEP, "") for w in words]
 
         # 〔〕削除の構造マッチ: 提案単語へ順序対応させて削除確定 index を得る。
@@ -629,14 +764,24 @@ def render(
             if any(kj in keep and blocks[kj] == b for kj in keep):
                 filler_del.add(wi)
 
-        # 4c. 音響安全判定。カット両境界が前後音声と連続していないフィラーだけを
-        # 精密カットの対象とする。unsafe なら keep に戻し警告する。
+        # 4c. 音響安全判定＋谷スナップ。カット両境界を近傍の無音の谷へ寄せ、
+        # 両端とも安全（無音接触/相対RMS以下）でカット長が十分なフィラーだけを
+        # 精密カット対象にする。unsafe なら keep に戻し警告する。探索は隣接語に
+        # 食い込まないよう lo=前語 end / hi=次語 start（無ければセグメント境界）で
+        # クランプする。
+        lo_seg, hi_seg = seg_bounds.get(seg_id, (0.0, file_length_s))
         for wi in sorted(filler_del):
-            if filler_cut_is_safe(audio, samplerate, words[wi], silences):
-                w = words[wi]
-                s, e = w.get("start"), w.get("end")
-                if s is not None and e is not None:
-                    filler_cut_spans.append((float(s), float(e)))
+            lo_s = float(words[wi - 1]["end"]) if wi > 0 else lo_seg
+            hi_s = float(words[wi + 1]["start"]) if wi + 1 < len(words) else hi_seg
+            cut = plan_filler_cut(
+                audio, samplerate, words[wi], lo_s, hi_s, silences, rms_threshold
+            )
+            if cut is not None:
+                filler_cut_spans.append(cut)
+                safe_filler_keys.add((seg_id, wi))
+                # スナップ値を words[wi]（コピー）へ反映し、以降の
+                # words_to_intervals の隣接クランプにスナップ境界を使わせる。
+                words[wi]["start"], words[wi]["end"] = cut
             else:
                 filler_del.discard(wi)
                 keep.add(wi)
@@ -652,25 +797,24 @@ def render(
                 f"[{seg_id}] ポーズ区切りに合わせて追加削除: {removed!r}"
             )
 
-        lo_b, hi_b = seg_bounds.get(seg_id, (0.0, file_length_s))
         intervals = words_to_intervals(
-            words, keep, margin=MARGIN_S, lo=lo_b, hi=hi_b
+            words, keep, margin=MARGIN_S, lo=lo_seg, hi=hi_seg
         )
         plan_intervals.extend(intervals)
 
     # 全セグメントの単語区間（ソース時刻・生値）。ギャップに削除単語が挟まるかの
-    # 判定に使う。安全カットしたフィラー span は除外する（さもないと分岐2が先に
-    # 発火してフィラーポーズ分岐に到達しない）。
-    safe_filler = set(filler_cut_spans)
+    # 判定に使う。安全カットしたフィラーは除外する（さもないと分岐2が先に発火して
+    # フィラーポーズ分岐に到達しない）。除外はスナップで値が変わるため (seg_id, wi)
+    # キーで行う。
     word_spans: list[tuple[float, float]] = []
     for seg in segments:
-        for w in seg.get("words", []) or []:
+        sid = seg.get("id")
+        for wi, w in enumerate(seg.get("words", []) or []):
+            if (sid, wi) in safe_filler_keys:
+                continue
             s, e = w.get("start"), w.get("end")
             if s is not None and e is not None:
-                span = (float(s), float(e))
-                if span in safe_filler:
-                    continue
-                word_spans.append(span)
+                word_spans.append((float(s), float(e)))
 
     out_intervals, cf_flags = plan_output_intervals(
         plan_intervals, word_spans, gap_threshold=gap_threshold, gap_max=gap_max,

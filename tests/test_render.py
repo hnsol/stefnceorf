@@ -287,6 +287,146 @@ def test_filler_cut_start_none_is_unsafe():
     assert render.filler_cut_is_safe(audio, sr, word, silences=None) is False
 
 
+# ---- speech_median_dbfs ----
+
+def test_speech_median_near_sine_rms():
+    # 発話単語2つ（間に無音）→ 中央値は sine の RMS 近傍
+    sr = 16000
+    audio = np.zeros(3 * sr)
+    for a in (0, 2):
+        t = np.arange(sr) / sr
+        audio[a * sr:(a + 1) * sr] = 0.5 * np.sin(2 * np.pi * 220.0 * t)
+    med = render.speech_median_dbfs(audio, sr, [(0.0, 1.0), (2.0, 3.0)])
+    assert med == pytest.approx(-9.03, abs=0.5)
+
+
+def test_speech_median_excludes_short_words():
+    # 0.05s 未満の単語は除外される。長単語A(-9dB) と長単語B(-29dB) の中央値=-19dB。
+    # 短単語(loud) が含まれていれば中央値が -9dB 側へ寄るはずだが、除外されるため -19dB。
+    sr = 16000
+    audio = np.zeros(3 * sr)
+    t = np.arange(sr) / sr
+    audio[0:sr] = 0.5 * np.sin(2 * np.pi * 220.0 * t)           # A: -9dB
+    audio[sr:2 * sr] = 0.05 * np.sin(2 * np.pi * 220.0 * t)     # B: -29dB
+    audio[2 * sr:2 * sr + int(0.03 * sr)] = 0.5                 # 短単語(loud)
+    med = render.speech_median_dbfs(
+        audio, sr, [(0.0, 1.0), (1.0, 2.0), (2.0, 2.03)]
+    )
+    assert med == pytest.approx(-19.0, abs=1.5)
+
+
+def test_speech_median_empty_returns_none():
+    sr = 16000
+    assert render.speech_median_dbfs(np.zeros(sr), sr, []) is None
+    # 全て無音（有効値なし）でも None
+    assert render.speech_median_dbfs(np.zeros(sr), sr, [(0.0, 1.0)]) is None
+
+
+# ---- snap_to_trough ----
+
+def test_snap_finds_trough():
+    # 音[0,0.4] / 無音[0.4,0.6] / 音[0.6,1.0] → 谷[0.4,0.6]へスナップ
+    sr = 16000
+    audio = np.zeros(sr)
+    t = np.arange(sr) / sr
+    tone = 0.5 * np.sin(2 * np.pi * 220.0 * t)
+    audio[:int(0.4 * sr)] = tone[:int(0.4 * sr)]
+    audio[int(0.6 * sr):] = tone[int(0.6 * sr):]
+    snapped, db = render.snap_to_trough(audio, sr, 0.45, lo=0.0, hi=1.0)
+    assert 0.4 <= snapped <= 0.6
+    assert db < -40.0
+
+
+def test_snap_respects_lo_hi_clamp():
+    # lo/hi で探索範囲を制限 → 範囲外へ出ない
+    sr = 16000
+    audio = np.zeros(sr)
+    snapped, _ = render.snap_to_trough(audio, sr, 0.32, lo=0.30, hi=0.35)
+    assert 0.30 <= snapped <= 0.35
+
+
+def test_snap_empty_range_returns_t():
+    # lo>hi で範囲が空 → t のまま返す
+    sr = 16000
+    t = np.arange(sr) / sr
+    audio = 0.5 * np.sin(2 * np.pi * 220.0 * t)
+    snapped, db = render.snap_to_trough(audio, sr, 0.5, lo=0.8, hi=0.2)
+    assert snapped == 0.5
+    assert db == pytest.approx(
+        render.boundary_rms(audio, sr, 0.5, half_window_s=render.SNAP_RMS_WINDOW_S)
+    )
+
+
+# ---- plan_filler_cut ----
+
+def test_plan_filler_cut_snaps_decay_tail_to_safe():
+    # 素の境界(1.0/2.0)は発話レベル(unsafe)だが、±100ms 内に無音の谷 → スナップして safe
+    sr = 16000
+    audio = np.zeros(3 * sr)
+
+    def put(s, e, fr):
+        t = np.arange(int(round((e - s) * sr))) / sr
+        a = int(round(s * sr))
+        audio[a:a + len(t)] = 0.5 * np.sin(2 * np.pi * fr * t)
+
+    put(0.0, 1.03, 220.0)   # 前語＋減衰尾（境界1.0を跨ぐ）
+    put(1.15, 1.85, 440.0)  # フィラー本体
+    put(1.97, 3.0, 660.0)   # 次語（立ち上がりが2.0を跨ぐ）
+    word = {"start": 1.0, "end": 2.0}
+    # 旧判定（絶対RMS）では両境界とも発話レベルで unsafe
+    assert render.filler_cut_is_safe(audio, sr, word, silences=None) is False
+    cut = render.plan_filler_cut(
+        audio, sr, word, lo=0.0, hi=3.0, silences=None, rms_threshold_db=-40.0
+    )
+    assert cut is not None
+    s, e = cut
+    assert 1.0 <= s <= 1.15
+    assert 1.85 <= e <= 2.0
+
+
+def test_plan_filler_cut_no_trough_returns_none():
+    # 全域が発話レベルで谷が無い → None
+    sr = 16000
+    t = np.arange(3 * sr) / sr
+    audio = 0.5 * np.sin(2 * np.pi * 440.0 * t)
+    word = {"start": 1.0, "end": 2.0}
+    cut = render.plan_filler_cut(
+        audio, sr, word, lo=0.0, hi=3.0, silences=None, rms_threshold_db=-40.0
+    )
+    assert cut is None
+
+
+def test_plan_filler_cut_too_short_returns_none():
+    # スナップ後の区間が MIN_FILLER_CUT_S 未満 → None（両端 safe でもカットしない）
+    sr = 16000
+    audio = np.zeros(3 * sr)
+    word = {"start": 1.0, "end": 1.02}  # 20ms
+    cut = render.plan_filler_cut(
+        audio, sr, word, lo=1.0, hi=1.02, silences=None, rms_threshold_db=-40.0
+    )
+    assert cut is None
+
+
+def test_plan_filler_cut_lo_clamp_prevents_prev_word_intrusion():
+    # start 側の谷が lo より手前にある構成。lo で探索下限を絞ると谷に届かず None。
+    sr = 16000
+    t = np.arange(3 * sr) / sr
+    audio = 0.3 * np.sin(2 * np.pi * 440.0 * t)
+    audio[int(0.88 * sr):int(0.94 * sr)] = 0.0   # start 側の谷（前語寄り）
+    audio[int(1.90 * sr):int(1.97 * sr)] = 0.0   # end 側の谷
+    word = {"start": 1.0, "end": 2.0}
+    # lo=0.90 → 谷[0.88,0.94]に届き両端 safe → カット。s は lo を割らない
+    cut = render.plan_filler_cut(
+        audio, sr, word, lo=0.90, hi=3.0, silences=None, rms_threshold_db=-40.0
+    )
+    assert cut is not None
+    assert cut[0] >= 0.90
+    # lo=0.95 → 探索下限が谷より後になり start 側の谷に届かない → None
+    assert render.plan_filler_cut(
+        audio, sr, word, lo=0.95, hi=3.0, silences=None, rms_threshold_db=-40.0
+    ) is None
+
+
 # ---- surviving_words ----
 
 def test_survive_no_edit():
@@ -811,6 +951,10 @@ def _make_ambiguous_filler_project(tmp_path, sr=16000):
     for s, e, fr in specs:
         t = np.arange(int((e - s) * sr)) / sr
         audio[int(s * sr): int(s * sr) + len(t)] = 0.3 * np.sin(2 * np.pi * fr * t)
+    # まあ[1,2] の両境界に実無音を用意する（谷スナップは実波形の RMS 谷へ寄せる
+    # ため、宣言 silences と同区間を実際に無音化して安全判定を通す）。
+    for zs, ze in [(0.98, 1.02), (1.98, 2.02)]:
+        audio[int(zs * sr): int(ze * sr)] = 0.0
     wav = tmp_path / "input.wav"
     sf.write(str(wav), audio, sr, subtype="PCM_16")
 
@@ -1002,6 +1146,55 @@ def test_render_manual_filler_delete_no_block_wipe(tmp_path, capsys):
     assert dur == pytest.approx(2.47, abs=0.08)
     err = capsys.readouterr().err
     assert "ポーズ区切りに合わせて追加削除" not in err
+    assert "残しました" not in err
+
+
+def test_render_snap_rescues_decay_tail_filler(tmp_path, capsys):
+    """谷スナップ統合: 発話レベルの境界でも±100ms内に無音の谷があれば削除される。
+
+    silences 無し（旧実装なら両境界とも高RMSで unsafe→残す）。json 境界を減衰尾/
+    立ち上がりに置き、実無音の谷を近傍に用意する。"""
+    import soundfile as sf
+
+    sr = 16000
+    audio = np.zeros(int(3.0 * sr))
+
+    def put(s, e, fr):
+        t = np.arange(int(round((e - s) * sr))) / sr
+        a = int(round(s * sr))
+        audio[a:a + len(t)] = 0.3 * np.sin(2 * np.pi * fr * t)
+
+    put(0.0, 1.05, 220.0)   # 結局（減衰尾が1.0を跨ぐ）
+    put(1.2, 1.8, 440.0)    # まあ本体
+    put(1.95, 3.0, 660.0)   # 面倒（立ち上がりが2.0を跨ぐ）
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), audio, sr, subtype="PCM_16")
+
+    data = {
+        "source_wav": str(wav.resolve()),
+        "language": "ja", "model": "test", "pause_threshold": 0.15,
+        # silences 無し → RMS のみの判定（谷スナップ後の実無音で safe になる）
+        "segments": [{
+            "id": "0001", "text": "結局まあ面倒", "words": [
+                {"word": "結局", "start": 0.0, "end": 1.0, "probability": 0.9, "block": 0},
+                {"word": "まあ", "start": 1.0, "end": 2.0, "probability": 0.9,
+                 "block": 1, "suggest": True},
+                {"word": "面倒", "start": 2.0, "end": 3.0, "probability": 0.9, "block": 2},
+            ],
+        }],
+    }
+    (tmp_path / "input.sc.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] 結局〔まあ〕面倒\n", encoding="utf-8")
+
+    out = render.render(str(txt))
+    o_audio, o_sr = sf.read(out)
+    dur = len(o_audio) / o_sr
+    # まあがカットされ尺が縮む（旧実装なら残して約3.0s）
+    assert dur < 2.8
+    err = capsys.readouterr().err
     assert "残しました" not in err
 
 
