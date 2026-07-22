@@ -1124,14 +1124,16 @@ def test_transcribe_drops_hallucinations_and_renumbers(tmp_path, monkeypatch):
     res = transcribe.transcribe(str(wav), lang="ja")
     data = res["data"]
 
-    # 幻覚2セグメント（反復＋空words）が消え、レスキューも幻覚のため
-    # 正常2セグメントのみ残る
-    assert len(data["segments"]) == 2
+    # 幻覚2セグメント（反復＋空words）はレスキューに
+    # 失敗しても、未認識区間として保持する
+    assert len(data["segments"]) == 3
     assert data["segments"][0]["text"] == "結局"
-    assert data["segments"][1]["text"] == "面倒"
+    assert data["segments"][1]["kind"] == "unrecognized"
+    assert data["segments"][2]["text"] == "面倒"
     # ID が連番で詰まる
     assert data["segments"][0]["id"] == "0001"
     assert data["segments"][1]["id"] == "0002"
+    assert data["segments"][2]["id"] == "0003"
     # メタ記録
     assert res["hallucination_drop_count"] == 2
     assert data["hallucination_drop"]["count"] == 2
@@ -1140,7 +1142,16 @@ def test_transcribe_drops_hallucinations_and_renumbers(tmp_path, monkeypatch):
     assert res["hallucination_ranges"][0]["rescued"] is False
 
 
-# ---- rescue_window（純関数） ----
+# ---- audio_gap_window / rescue_window（純関数） ----
+
+def test_audio_gap_window_keeps_short_middle_gap():
+    assert transcribe.audio_gap_window(5.0, 5.3, 100.0) == (5.0, 5.3)
+
+
+def test_audio_gap_window_covers_file_edges():
+    assert transcribe.audio_gap_window(None, 8.0, 100.0) == (0.0, 8.0)
+    assert transcribe.audio_gap_window(92.0, None, 100.0) == (92.0, 100.0)
+
 
 def test_rescue_window_middle_group():
     # 中間グループ: prev end 〜 next start
@@ -1266,7 +1277,7 @@ def test_transcribe_rescue_success_inserts_and_offsets(tmp_path, monkeypatch):
 
 
 def test_transcribe_rescue_fallback_when_hallucination(tmp_path, monkeypatch):
-    """レスキュー結果も幻覚なら除去にフォールバックし rescued=False。"""
+    """レスキュー結果も幻覚なら未認識区間として保持する。"""
     rescue_result = {
         "language": "ja",
         "segments": [
@@ -1286,8 +1297,14 @@ def test_transcribe_rescue_fallback_when_hallucination(tmp_path, monkeypatch):
     res = transcribe.transcribe(str(wav), lang="ja")
     data = res["data"]
 
-    # 復旧されず 前 / 後 のみ
-    assert [s["text"] for s in data["segments"]] == ["前", "後"]
+    assert [s.get("kind", "speech") for s in data["segments"]] == [
+        "speech", "unrecognized", "speech"
+    ]
+    u = data["segments"][1]
+    assert u["source_start"] == pytest.approx(1.0)
+    assert u["source_end"] == pytest.approx(13.0)
+    assert u["words"] == []
+    assert "未認識区間" in (tmp_path / "input.sc.txt").read_text()
     rng = res["hallucination_ranges"][0]
     assert rng["rescued"] is False
     assert rng["rescued_segments"] == 0

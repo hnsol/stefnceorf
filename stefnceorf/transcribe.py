@@ -505,6 +505,17 @@ def drop_hallucinations(
     return kept, dropped
 
 
+def audio_gap_window(
+    prev_kept_end: float | None,
+    next_kept_start: float | None,
+    wav_duration: float,
+) -> tuple[float, float]:
+    """幻覚除去グループの保持窓（認識用wav時刻）を求める（純関数）。"""
+    start = 0.0 if prev_kept_end is None else float(prev_kept_end)
+    end = float(wav_duration) if next_kept_start is None else float(next_kept_start)
+    return start, max(start, end)
+
+
 def rescue_window(
     prev_kept_end: float | None,
     next_kept_start: float | None,
@@ -519,8 +530,7 @@ def rescue_window(
 
     窓長が RESCUE_MIN_WINDOW_S 未満なら内容なしとみなし None を返す。
     """
-    start = 0.0 if prev_kept_end is None else prev_kept_end
-    end = wav_duration if next_kept_start is None else next_kept_start
+    start, end = audio_gap_window(prev_kept_end, next_kept_start, wav_duration)
     if end - start < RESCUE_MIN_WINDOW_S:
         return None
     return (start, end)
@@ -876,12 +886,10 @@ def transcribe(
                 next_start = (
                     _seg_first_start(next_kept) if next_kept else None
                 )
+                gap_start, gap_end = audio_gap_window(
+                    prev_end, next_start, wav_dur
+                )
                 win = rescue_window(prev_end, next_start, wav_dur)
-
-                # 窓もテキストも時刻も無い純粋な空セグメント群は音声内容を
-                # 失わないため報告もレスキューもしない（従来挙動）
-                if win is None and not starts and not sample:
-                    return []
 
                 rescued_segs: list[dict] = []
                 if win is not None:
@@ -912,7 +920,17 @@ def transcribe(
                         "rescued_segments": len(rescued_segs),
                     }
                 )
-                return rescued_segs
+                if rescued_segs:
+                    return rescued_segs
+                return [
+                    {
+                        "kind": "unrecognized",
+                        "source_start": rec_to_src(gap_start, cuts),
+                        "source_end": rec_to_src(gap_end, cuts),
+                        "text": sample,
+                        "words": [],
+                    }
+                ]
 
             for seg in raw_segments:
                 if id(seg) in dropped_ids:
@@ -942,6 +960,25 @@ def transcribe(
 
     for i, seg in enumerate(kept_segments):
         seg_id = _seg_id(i)
+        if seg.get("kind") == "unrecognized":
+            source_start = float(seg["source_start"])
+            source_end = float(seg["source_end"])
+            segments_out.append(
+                {
+                    "id": seg_id,
+                    "kind": "unrecognized",
+                    "source_start": source_start,
+                    "source_end": source_end,
+                    "text": seg.get("text", ""),
+                    "words": [],
+                }
+            )
+            duration = max(0.0, source_end - source_start)
+            lines.append(
+                f"[{seg_id} {_format_time(source_start)}] "
+                f"⚠ 未認識区間 {duration:.1f}秒（音声保持）"
+            )
+            continue
         words = []
         for w in seg.get("words", []) or []:
             words.append(
