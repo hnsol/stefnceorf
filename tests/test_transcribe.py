@@ -679,6 +679,66 @@ def test_drop_halluc_echo_regression():
     assert dropped == [seg_b, seg_c, seg_d]
 
 
+def test_drop_halluc_echo_skips_empty_intervening_segment():
+    # normal / 0.12秒echo / empty / echo+real continuation
+    normal_text = "あるいは生成AIの残り使用量を見ると"
+    echo_text = "えー生成AIの残り使用量を見ると"
+    normal = _seg(normal_text, _timed_words(list(normal_text), 0.0, 5.0))
+    short_echo = _seg(echo_text, _timed_words(list(echo_text), 5.0, 5.12))
+    empty = _seg("", [])
+    extended_text = echo_text + "どれぐらいトークンが残っているか"
+    extended_echo = _seg(
+        extended_text, _timed_words(list(extended_text), 6.0, 8.0)
+    )
+    kept, dropped = transcribe.drop_hallucinations(
+        [normal, short_echo, empty, extended_echo]
+    )
+    assert normal in kept
+    assert short_echo in dropped
+    assert empty in dropped
+    assert extended_echo in dropped
+
+
+def test_drop_halluc_echo_unrelated_high_density_kept():
+    # 正常な高速発話でも共通接頭辞がなければ除去しない
+    first_text = "今日は会議で新しい計画を詳しく説明します"
+    second_text = "明日は顧客と次の提案内容を確認します"
+    first = _seg(
+        first_text, _timed_words(list(first_text), 0.0, len(first_text) / 15.0)
+    )
+    second = _seg(
+        second_text,
+        _timed_words(list(second_text), 2.0, 2.0 + len(second_text) / 15.0),
+    )
+    kept, dropped = transcribe.drop_hallucinations([first, second])
+    assert kept == [first, second]
+    assert dropped == []
+
+
+def test_drop_halluc_echo_ignores_fourth_previous_nonempty_segment():
+    # 比較対象は直近3件の非空raw segmentに限定する
+    old_text = "生成AIの残り使用量を詳しく確認する"
+    old = _seg(old_text, _timed_words(list(old_text), 0.0, 3.0))
+    intervening = [
+        _seg(text, _timed_words(list(text), start, start + 1.0))
+        for text, start in [
+            ("最初の別の話題です", 3.0),
+            ("続いて別の論点です", 4.0),
+            ("最後に異なる話です", 5.0),
+        ]
+    ]
+    current_text = old_text + "追加"
+    current = _seg(
+        current_text,
+        _timed_words(list(current_text), 6.0, 6.0 + len(current_text) / 15.0),
+    )
+    kept, dropped = transcribe.drop_hallucinations(
+        [old, *intervening, current]
+    )
+    assert kept == [old, *intervening, current]
+    assert dropped == []
+
+
 def test_drop_halluc_echo_normal_density_kept():
     # 直前と共通接頭辞は長いが密度が正常（ゆっくり言い直し）→ 残す
     p = "今日はとても良い天気ですねそうですね"

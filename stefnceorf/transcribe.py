@@ -46,8 +46,9 @@ HALLUC_SILENCE_SKIP_S = 2.0
 # 全単語 zero-duration 等で 200 文字/秒超になる。実発話の 3 倍超をしきい値とする。
 HALLUC_DENSITY_CHARS_S = 25.0
 
-# エコー幻覚除去（条件e）。直前セグメントの近似繰り返しを捕まえる。
-HALLUC_ECHO_PREFIX = 15          # 直前との共通接頭辞の閾値文字数
+# エコー幻覚除去（条件e）。直近の非空raw segmentの近似繰り返しを捕まえる。
+HALLUC_ECHO_LOOKBACK = 3         # 比較する非空raw segmentの最大件数
+HALLUC_ECHO_PREFIX = 15          # 過去segmentとの共通接頭辞の閾値文字数
 HALLUC_ECHO_DENSITY_CHARS_S = 12.0  # エコー判定に用いる文字密度しきい値
 
 # デコード温度のフォールバック列（whisper 既定と同じ）。正常窓は先頭 0.0 の
@@ -435,12 +436,11 @@ def drop_hallucinations(
        の start 〜 末尾単語の end）が正で文字密度が HALLUC_DENSITY_CHARS_S 超、
        または発話時間が 0 以下（全単語 zero-duration）。実発話 5〜7 文字/秒に
        対し幻覚は 200 文字/秒超になるため。
-    e. エコー（直前セグメントの近似繰り返し）: 正規化テキスト（空白・句読点を
-       除去）が直前セグメント（除去済みか否かを問わない生の直前）と共通接頭辞
-       HALLUC_ECHO_PREFIX 文字以上で、かつ文字密度が HALLUC_ECHO_DENSITY_CHARS_S
-       超なら除去。幻覚エコーは直前文の微変形（前置き欠落・末尾延長）で出るため
-       完全一致の条件bでは捕まらない。実発話の言い直し反復はセグメント全体が
-       12 文字/秒超にならないので密度条件で誤除去を防ぐ。
+    e. エコー（直近セグメントの近似繰り返し）: 正規化テキスト（空白・句読点を
+       除去）が直近 HALLUC_ECHO_LOOKBACK 件の非空raw segment（除去済みか否かを
+       問わない）のいずれかと共通接頭辞 HALLUC_ECHO_PREFIX 文字以上で、かつ
+       文字密度が HALLUC_ECHO_DENSITY_CHARS_S 超なら除去。ここで非空とは正規化後
+       に1文字以上あること。実発話の言い直し反復は密度条件で誤除去を防ぐ。
 
     戻り値: (残すセグメント列, 除去したセグメント列)。順序は入力順を保つ。
     """
@@ -483,26 +483,32 @@ def drop_hallucinations(
             if dens is None or dens > HALLUC_DENSITY_CHARS_S:
                 drop[i] = True
 
-    # 条件 e: 直前セグメント（生の直前）の近似繰り返し
-    for i in range(1, n):
-        if drop[i]:
-            continue
-        words = segments[i].get("words") or []
-        tokens = [(w.get("word") or "").strip() for w in words]
-        if len(tokens) < HALLUC_MIN_WORDS:
-            continue
+    # 条件 e: 直近3件の非空raw segment（drop済みを含む）の近似繰り返し。
+    # raw_historyには正規化後に1文字以上ある入力textを、drop状態と無関係に積む。
+    raw_history: list[str] = []
+    for i in range(n):
         cur = _norm(segments[i].get("text") or "")
-        prev = _norm(segments[i - 1].get("text") or "")
-        prefix = 0
-        for a, b in zip(cur, prev):
-            if a != b:
-                break
-            prefix += 1
-        if prefix < HALLUC_ECHO_PREFIX:
-            continue
-        dens = _density(segments[i], tokens)
-        if dens is None or dens > HALLUC_ECHO_DENSITY_CHARS_S:
-            drop[i] = True
+        if not drop[i]:
+            words = segments[i].get("words") or []
+            tokens = [(w.get("word") or "").strip() for w in words]
+            if len(tokens) >= HALLUC_MIN_WORDS:
+                for prev in raw_history[-HALLUC_ECHO_LOOKBACK:]:
+                    prefix = 0
+                    for a, b in zip(cur, prev):
+                        if a != b:
+                            break
+                        prefix += 1
+                    if prefix < HALLUC_ECHO_PREFIX:
+                        continue
+                    dens = _density(segments[i], tokens)
+                    if (
+                        dens is not None
+                        and dens > HALLUC_ECHO_DENSITY_CHARS_S
+                    ):
+                        drop[i] = True
+                    break
+        if cur:
+            raw_history.append(cur)
 
     # 条件 b: 同一テキストの連続（a/c で除去済みのセグメントは連続を分断しない）
     live = [i for i in range(n) if not drop[i]]
