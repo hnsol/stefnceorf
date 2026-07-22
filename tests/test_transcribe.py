@@ -1700,14 +1700,20 @@ def test_long_rescue_window_is_split_into_90_second_chunks(
 
     monkeypatch.setattr(transcribe, "plan_chunks", spy_plan_chunks)
 
+    clip_durations = {}
+
     def fake_slice(src, start, end):
         slices.append((start, end))
         clip = tmp_path / f"rescue-{len(slices)}.wav"
         clip.write_bytes(b"clip")
         clips.append(clip)
+        clip_durations[str(clip)] = end - start
         return str(clip)
 
     monkeypatch.setattr(transcribe, "_slice_wav", fake_slice)
+    monkeypatch.setattr(
+        transcribe, "_wav_duration", lambda path: clip_durations[path]
+    )
 
     segments = transcribe._rescue_transcribe(
         "source.wav", 0.0, 200.0, "model", "ja", verbatim=True
@@ -1744,7 +1750,11 @@ def test_verbatim_rescue_falls_back_when_word_is_outside_subchunk(
             _clean_rescue_result("安全復旧"),
         ],
     )
-    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 220.0)
+    monkeypatch.setattr(
+        transcribe,
+        "_wav_duration",
+        lambda path: 90.0 if path == "rescue_clip.wav" else 220.0,
+    )
 
     result = transcribe.transcribe(str(_make_input(tmp_path)), lang="ja")
 
@@ -1754,6 +1764,67 @@ def test_verbatim_rescue_falls_back_when_word_is_outside_subchunk(
     rescue_range = result["hallucination_ranges"][0]
     assert rescue_range["attempts"] == ["verbatim", "safe"]
     assert rescue_range["status"] == "rescued"
+
+
+def test_rescue_rejects_words_outside_actual_rounded_clip_duration(
+    tmp_path, monkeypatch
+):
+    """要求0.50003秒でも、16kHz丸め後の0.5秒clip外wordは採用しない。"""
+    import numpy as np
+    import soundfile as sf
+
+    wav = tmp_path / "rounded.wav"
+    sf.write(str(wav), np.zeros(8002, dtype="float32"), 16000)
+    main_result = _rescue_main_result()
+    main_result["segments"][0]["words"][0].update(start=0.0, end=0.0)
+    main_result["segments"][2]["words"][0].update(
+        start=0.50003, end=0.5001
+    )
+    rounded_outside = _clean_rescue_result(
+        "丸め境界", start=0.50001, end=0.50002
+    )
+    calls = []
+
+    def fake_transcribe(path, **kwargs):
+        calls.append(kwargs)
+        return [main_result, rounded_outside, rounded_outside][len(calls) - 1]
+
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = fake_transcribe
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda path: path)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda path, **kwargs: "")
+    real_slice_wav = transcribe._slice_wav
+    slice_requests = []
+
+    def record_slice_wav(src, start, end):
+        slice_requests.append((start, end))
+        return real_slice_wav(src, start, end)
+
+    monkeypatch.setattr(transcribe, "_slice_wav", record_slice_wav)
+    real_wav_duration = transcribe._wav_duration
+    clip_durations = []
+
+    def record_wav_duration(path):
+        duration = real_wav_duration(path)
+        if path != str(wav):
+            clip_durations.append(duration)
+        return duration
+
+    monkeypatch.setattr(transcribe, "_wav_duration", record_wav_duration)
+
+    result = transcribe.transcribe(str(wav), lang="ja")
+
+    assert len(calls) == 3
+    assert slice_requests == [(0.0, 0.50003), (0.0, 0.50003)]
+    assert clip_durations == [0.5, 0.5]
+    assert calls[1]["condition_on_previous_text"] is True
+    assert calls[2]["condition_on_previous_text"] is False
+    unrecognized = result["data"]["segments"][1]
+    assert unrecognized["kind"] == "unrecognized"
+    rescue_range = result["hallucination_ranges"][0]
+    assert rescue_range["attempts"] == ["verbatim", "safe"]
+    assert rescue_range["status"] == "unrecognized"
 
 
 def test_verbatim_rescue_clamps_partial_word_to_subchunk_bounds(
@@ -1773,6 +1844,7 @@ def test_verbatim_rescue_clamps_partial_word_to_subchunk_bounds(
         "_slice_wav",
         lambda src, start, end: str(tmp_path / "missing-clip.wav"),
     )
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda path: 90.0)
 
     segments = transcribe._rescue_transcribe(
         "source.wav", 0.0, 200.0, "model", "ja", verbatim=True
@@ -1804,6 +1876,7 @@ def test_long_rescue_prefers_valid_silence_before_90_second_limit(
         return str(tmp_path / "missing-clip.wav")
 
     monkeypatch.setattr(transcribe, "_slice_wav", fake_slice)
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda path: 90.0)
 
     transcribe._rescue_transcribe(
         "source.wav", 0.0, 200.0, "model", "ja", verbatim=True
@@ -1830,20 +1903,21 @@ def test_verbatim_rescue_rejects_all_subchunks_when_one_is_anomalous(
         "_slice_wav",
         lambda src, start, end: str(tmp_path / "missing-clip.wav"),
     )
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda path: 90.0)
 
     assert transcribe._rescue_transcribe(
         "source.wav", 0.0, 200.0, "model", "ja", verbatim=True
     ) == []
 
 
-@pytest.mark.parametrize("raises", [False, True])
+@pytest.mark.parametrize("failure", [None, "decode", "duration"])
 def test_rescue_clip_is_deleted_on_success_and_exception(
-    tmp_path, monkeypatch, raises
+    tmp_path, monkeypatch, failure
 ):
     clip = tmp_path / "rescue-clip.wav"
 
     def fake_transcribe(path, **kwargs):
-        if raises:
+        if failure == "decode":
             raise RuntimeError("decode failed")
         return _clean_rescue_result()
 
@@ -1857,9 +1931,20 @@ def test_rescue_clip_is_deleted_on_success_and_exception(
         return str(clip)
 
     monkeypatch.setattr(transcribe, "_slice_wav", fake_slice)
+    if failure == "duration":
+        def fail_duration(path):
+            raise RuntimeError("duration failed")
 
-    if raises:
-        with pytest.raises(RuntimeError, match="decode failed"):
+        monkeypatch.setattr(
+            transcribe,
+            "_wav_duration",
+            fail_duration,
+        )
+    else:
+        monkeypatch.setattr(transcribe, "_wav_duration", lambda path: 20.0)
+
+    if failure:
+        with pytest.raises(RuntimeError, match=f"{failure} failed"):
             transcribe._rescue_transcribe(
                 "source.wav", 0.0, 20.0, "model", "ja", verbatim=True
             )

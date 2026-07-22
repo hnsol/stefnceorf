@@ -740,9 +740,9 @@ def _rescue_transcribe(
         chunks.append((start + pos, end))
 
     for chunk_start, chunk_end in chunks:
-        chunk_duration = chunk_end - chunk_start
         clip = _slice_wav(src_wav, chunk_start, chunk_end)
         try:
+            clip_duration = _wav_duration(clip)
             result = mlx_whisper.transcribe(
                 clip, **_rescue_kwargs(model, lang, verbatim)
             )
@@ -787,8 +787,8 @@ def _rescue_transcribe(
                     or not math.isfinite(word_end)
                 ):
                     return []
-                word_start = min(max(word_start, 0.0), chunk_duration)
-                word_end = min(max(word_end, 0.0), chunk_duration)
+                word_start = min(max(word_start, 0.0), clip_duration)
+                word_end = min(max(word_end, 0.0), clip_duration)
                 if (
                     word_end <= word_start
                     or (
