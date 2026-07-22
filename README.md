@@ -1,149 +1,250 @@
 <p align="center">
-  <img src="assets/logo-light.svg" alt="Stefnceorf" width="160" height="160">
+  <img src="assets/logo-light.svg#gh-light-mode-only" alt="Stefnceorf" width="160" height="160">
+  <img src="assets/logo-dark.svg#gh-dark-mode-only" alt="Stefnceorf" width="160" height="160">
 </p>
 
-# Stefnceorf
+<h1 align="center">Stefnceorf</h1>
 
-Text-based audio editing をローカルで実現するCLIツール。
+<p align="center">
+  <strong>Edit audio by editing text — local, free, and built for AI agents to customize.</strong>
+</p>
 
-音声を文字起こしし、生成されたテキストを編集（削除・行の並べ替え）すると、その結果が音声ファイルへ反映される。全処理ローカル・クラウド不使用。
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+  <img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black.svg" alt="Apple Silicon">
+  <a href="README_ja.md">日本語</a>
+</p>
 
-正式コマンドは `stefnceorf`、2文字エイリアス `sc`（同一動作）。
+---
 
-## 特徴
+Stefnceorf is a free, open-source CLI tool for **text-based podcast and audio editing**. Transcribe your audio, edit the transcript as a plain text file, and the edits are applied to the audio — delete a line to remove a segment, delete a word to cut it, rearrange lines to reorder the audio. All processing runs locally on Apple Silicon GPU. No cloud, no subscription, no data leaves your machine.
 
-- 全処理ローカル完結・無料（mlx-whisperによるApple Silicon GPU文字起こし）
-- 単語単位のタイムスタンプ・信頼度スコア付き文字起こし
-- フィラー語（言い淀み）の自動検出・削除提案（辞書ベース、誤検出は却下可能）
-- 低信頼箇所の自動マーキングで聞き直し箇所を絞り込み
-- 長い無音の自動切り詰め（Whisperの幻覚対策＋出力の間延び防止）
-- テキスト削除・並べ替えを非破壊で音声へ反映（何度でも再実行可能）
-- カット境界は等パワークロスフェードでクリックノイズを防止
+A local, free, privacy-first alternative to [Descript](https://www.descript.com/) for podcast post-production — with native Japanese support and a codebase designed for AI coding agents to fork and customize.
 
-## クイックスタート
+> **Requires Apple Silicon Mac** (M1/M2/M3/M4). Intel Macs are not supported. See [FAQ](#can-i-use-stefnceorf-on-windows-or-linux) for cross-platform options.
+
+## Quick Start — Edit a Podcast Episode in 3 Commands
 
 ```sh
-sc transcribe input.wav          # input.sc.txt / input.sc.json を生成
-$EDITOR input.sc.txt             # テキストを編集（削除・並べ替え）
-sc render input.sc.txt           # input.edited.wav を生成
+sc transcribe episode.wav      # generates episode.sc.txt + episode.sc.json
+$EDITOR episode.sc.txt          # edit the transcript (delete lines, words, filler)
+sc render episode.sc.txt        # generates episode.edited.wav
 ```
 
-## 前提
+Three commands. That's the entire workflow.
 
-- Apple Silicon Mac / Python 3.11+
-- ffmpeg インストール済み
-- 入力はノイズ除去済みの wav（無音処理は不要。長い無音の切り詰めは sc が行う）
+## What Is Text-Based Audio Editing?
 
-## インストール
+Instead of scrubbing through a waveform to find and cut sections, you work with a text transcript. The tool maintains a mapping between each word in the transcript and its position in the audio. When you delete text, the corresponding audio is removed. When you rearrange lines, the audio follows.
 
-editable インストール（推奨。開発・利用とも）:
+```
+[0001 0:00] We ended up deciding that／if there's tedious work／just build a tool
+[0002 0:12] 〔um〕and／remove words like that
+[0003 0:25] I have◆plenty of things／I want to talk about
+```
+
+- **Delete a line** → that entire segment is removed from the audio
+- **Delete words within a line** → those words are cut from the audio
+- **Rearrange lines** → audio segments play in the new order
+- **`〔...〕` filler suggestions** → keep the brackets to delete, remove brackets to keep
+- **`／` pause boundaries** → safe cut points (partial deletion removes the whole block between pauses)
+- **`◆` low-confidence markers** → words to double-check by listening
+
+Editing is **non-destructive** — the original audio file is never modified, and you can re-render as many times as you want.
+
+## Features
+
+- **Fully local & free** — Transcription runs on Apple Silicon GPU via [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper). No cloud services, no API keys, no cost.
+- **Text-based editing** — Edit a plain text file in your favorite editor. Delete text to delete audio.
+- **Filler word detection** — Automatically suggests filler words (`um`, `uh`, `えー`, `まあ`) for removal. You review each suggestion and decide.
+- **Pause-based block editing** — Cuts snap to natural pause boundaries, preventing unnatural audio joins.
+- **Long silence trimming** — Silences over 1.5 seconds are automatically shortened, both for Whisper hallucination prevention and tighter output.
+- **Verbatim mode** — Transcribes filler words and hesitations that Whisper normally absorbs, enabling a filler-removal workflow.
+- **Hallucination detection & rescue** — Automatically detects Whisper hallucinations, rescues the affected audio by re-transcribing with safe settings.
+- **Quality preservation** — Output matches original sample rate and bit depth. Equal-power crossfade at cut boundaries prevents click noise.
+- **Japanese & English** — Full support for both languages with language-specific filler dictionaries.
+
+## Stefnceorf vs Descript
+
+| | Stefnceorf | Descript |
+|---|---|---|
+| **Price** | Free (MIT License) | $24+/month |
+| **Audio processing** | Local (Apple Silicon GPU) | Cloud-based |
+| **Privacy** | Audio never leaves your machine | Audio uploaded to servers |
+| **Japanese support** | Native (transcription + filler detection) | Limited |
+| **Filler removal** | Semi-automatic (suggest → you review) | Automatic |
+| **Customizable by AI agents** | Yes — CLAUDE.md, AGENTS.md, full test suite | No |
+| **Interface** | CLI + any text editor | GUI application |
+| **Platform** | macOS (Apple Silicon) | macOS, Windows, Web |
+| **Video editing** | Audio only | Audio + Video |
+
+**Choose Stefnceorf when:** you want free, local, privacy-first audio editing, especially for Japanese content, and you're comfortable with a CLI. **Choose Descript when:** you need a GUI, video editing, or cross-platform support.
+
+## Who Is This For?
+
+- **Podcasters** — Cut filler words, remove false starts, tighten pacing. A 1-hour episode edit that takes 45 minutes with a waveform editor becomes a 10-minute text edit.
+- **Interview editors** — Remove tangents and rearrange segments to improve narrative flow.
+- **Lecture & talk producers** — Remove verbal tics and long pauses from recorded presentations.
+- **Anyone recording spoken audio** — Get a transcript and clean up the audio simultaneously.
+
+## Fork & Customize with AI Agents
+
+Stefnceorf is designed to be **forked and customized** using AI coding agents like [Claude Code](https://docs.anthropic.com/en/docs/claude-code), Cursor, or GitHub Copilot.
+
+The repository includes:
+
+- **`CLAUDE.md`** — Project context and conventions for Claude Code
+- **`AGENTS.md`** — Workflow instructions for AI coding agents
+- **Comprehensive test suite** — Unit tests, CLI tests, and acceptance tests
+- **Clean Python codebase** — ~2,500 lines across 4 modules, well-structured for AI modification
+
+Example prompts for your AI agent:
+
+> "Add SRT subtitle export to the render command."
+
+> "Add a `--speaker` flag that uses pyannote for speaker diarization."
+
+> "Integrate with my podcast RSS publishing script."
+
+> "Replace mlx-whisper with faster-whisper so it runs on Linux."
+
+The codebase is intentionally kept simple and self-contained so that an AI agent can understand the full architecture and make meaningful modifications.
+
+## Requirements
+
+- **Apple Silicon Mac** (M1 / M2 / M3 / M4) — required for mlx-whisper GPU acceleration
+- **Python 3.11+**
+- **ffmpeg** — install via `brew install ffmpeg`
+- **Input format** — WAV file (apply noise reduction beforehand with Audacity or similar; silence trimming is handled by Stefnceorf)
+
+## Installation
 
 ```sh
-# uv を使う場合
+# Using uv (recommended)
 uv venv
 uv pip install -e .
 
-# 素の pip を使う場合
+# Using pip
 python -m venv .venv
 .venv/bin/pip install -e .
 ```
 
-`stefnceorf` と `sc` の2コマンドが同一エントリポイントとして登録される。
+Both `stefnceorf` and `sc` (shorthand) commands are registered. Subcommands can be abbreviated: `sc trans` = `sc transcribe`.
 
-依存: mlx-whisper, numpy, soundfile（mlx-whisper は Apple Silicon 前提）
+Dependencies: [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper), numpy, soundfile.
 
-### どこからでも使えるようにする（任意）
+## Usage
 
-editable インストール後、`.venv/bin/` にある実行ファイルへシンボリックリンクを張ると、`.venv/bin/` を毎回指定したり `activate` したりせずに、どのディレクトリからでも `stefnceorf` / `sc` を実行できる。
-
-```sh
-cd /path/to/stefnceorf  # このプロジェクトのルート
-ln -s "$(pwd)/.venv/bin/stefnceorf" /opt/homebrew/bin/stefnceorf
-ln -s "$(pwd)/.venv/bin/sc" /opt/homebrew/bin/sc
-```
-
-（`/opt/homebrew/bin` は Apple Silicon の Homebrew の既定 PATH。別の PATH の通ったディレクトリでもよい。リンク先はプロジェクトの `.venv` を指すので、`.venv` を削除・再作成する場合は張り直しが必要）
-
-## 使い方
-
-### 1. 文字起こし
+### Transcribe
 
 ```sh
-stefnceorf transcribe input.wav [--lang ja|en] [--model MODEL] [--no-filler-suggest] [--no-verbatim] [--pause-threshold 0.15]
-# sc transcribe input.wav でも同じ（sc trans と省略もできる）
+sc transcribe input.wav [--lang ja|en] [--verbatim] [--no-filler-suggest] [--model MODEL] [--pause-threshold 0.15]
 ```
 
-- `input.sc.txt`（人間が編集するテキスト）と `input.sc.json`（単語→時刻・信頼度の対応表、触らない）を生成する
-  - `.sc.json` には単語時刻・信頼度に加え、検出した無音区間 `silences`（`--pause-threshold` 以上のポーズ。フィラー精密カットの音響安全判定に使う）と、フィラー提案フラグ `suggest`（`〔〕` を付けた単語の目印。削除指定の構造マッチに使う）も保存される。単語時刻は検出済み無音で補正され、フィラー等の時刻ズレを抑える
-- `--lang` 既定 `ja`。英語は `--lang en` で明示指定。自動判定は `--lang` なし呼び出し (`lang=None`) で可能
-- `--model` 既定 `mlx-community/whisper-large-v3-turbo`（`--verbatim` 時は自動で verbatim 用モデルに切り替わる。`--model` を明示した場合はそちらを尊重）
-- フィラー提案は既定で有効（候補数を表示）。`--no-filler-suggest` で無効化できる
-- `--verbatim`（既定で有効。`--no-verbatim` で無効化）: フィラーや言い淀み（「まあ、」「あの、」「えっと」等）も転写する。既定モデル（turbo）は日本語でフィラーを吸収してしまうため、`mlx-community/whisper-large-v3-mlx` ＋ フィラー例文プロンプト ＋ `condition_on_previous_text=True` で認識する
-  - トレードオフ: 処理が約2倍遅い／出力が句読点付きになる（「まあ、」等）／ごく稀に繰り返し幻覚が出ることがある。繰り返し幻覚（同一トークンの反復・同一セグメントの連続・空セグメント）は自動で検出され、その区間は安全設定（プロンプトなし・`condition_on_previous_text=False`）で自動的に再認識して復旧する。復旧できた区間は「幻覚疑い区間を再認識で復旧: M:SS-M:SS」と通常表示され、復旧できなかった区間のみ stderr に警告表示される。**復旧できず警告された区間は文字起こしが無くなり render で音声も削除されるため、必要に応じて聞き直すこと**。なお復旧区間は verbatim ではない安全設定で認識されるため、フィラーは転写されない（言い淀みは吸収される）。幻覚が多い場合は再実行するか `--verbatim` なしで文字起こしする
-  - フィラー削除ワークフロー: verbatim・フィラー提案は既定で有効なので `transcribe input.wav` だけで転写し、残った `〔...〕` のうち**残す＝削除指定**（括弧ごと残したものが削除される）。消したくない（音声に残したい）フィラーは括弧だけ外す（`〔まあ、〕` → `まあ、`）。提案 `〔〕` は前後にポーズがある単独ブロックのフィラーだけに付き、削除しても不自然になる（前後の音と連続調音している）フィラーは自動で残して警告する（自然さ優先）。削除後は前後の無音から合計約0.25秒の間が残る。〔〕を使わず手動でフィラーの文字だけを消した場合も、同ブロックに他の語が残っていれば巻き込まず精密にカットする
-- `--pause-threshold`（既定 0.15秒）: この秒数以上の無音を「カット可能なポーズ区切り」と判定し、`.sc.txt` に区切り記号 `／` を挿入する。削除はこの `／` で挟まれたブロック単位にスナップされ、音のつながっている箇所での不自然な結合を防ぐ。`0` を指定すると全単語が独立ブロックになる（＝旧来の単語単位削除）
-- 認識用の一時 wav に限り長い無音（1.5秒以上）を 0.7秒へ切り詰めて Whisper の幻覚を抑える。単語時刻は元音源の時刻へ逆写像するため出力音声には影響しない（元 wav は不変）。切り詰めがあれば箇所数と短縮秒数を表示する
+Generates two files:
 
-### 2. 編集して音声へ反映
+- `input.sc.txt` — editable transcript (one line per segment, with timestamps and filler suggestions)
+- `input.sc.json` — word-level timestamp and confidence data (do not edit)
 
-`input.sc.txt` を編集したら:
+Key options:
+
+- `--lang` — Language (default: `ja`). Use `--lang en` for English.
+- `--verbatim` — **Enabled by default.** Transcribes filler words that Whisper normally absorbs, using a slower but more accurate model. Disable with `--no-verbatim`.
+- `--no-filler-suggest` — Disables filler word detection.
+- `--pause-threshold` — Minimum pause duration (seconds) for block boundaries (default: `0.15`). Set to `0` for word-level editing (legacy behavior).
+
+### Edit
+
+Open `input.sc.txt` in any text editor. The editing rules are described in the [What Is Text-Based Audio Editing?](#what-is-text-based-audio-editing) section above.
+
+Key points:
+
+- Only **deletion** is supported. Adding or rewriting text has no effect (the original audio for new words doesn't exist).
+- Rearrangement is **line-level only** (reordering words within a line is not supported).
+- Unknown IDs or malformed lines cause an error — the tool never silently ignores problems.
+
+### Render
 
 ```sh
-stefnceorf render input.sc.txt [-o output.wav] [--gap-threshold 1.5] [--gap-max 1.0]
-# sc render input.sc.txt でも同じ
+sc render input.sc.txt [-o output.wav] [--gap-threshold 1.5] [--gap-max 1.0]
 ```
 
-- 編集後 txt と同じ場所の `input.sc.json` を突き合わせ、残す単語の時間区間を算出し、**元の input.wav**（`.sc.json` の `source_wav`）から切り出して再構成する
-- `-o` 省略時の出力は `input.edited.wav`
-- 出力は元 wav と同一のサンプルレート・ビット深度
-- 単語削除・行並べ替えで生じる接合部は等パワークロスフェードでクリックノイズを防ぐ
-- セグメント間の無音ポーズは保持される。`--gap-threshold`（既定 1.5秒）以下のポーズはそのまま残し、超える長い無音は `--gap-max`（既定 1.0秒）に切り詰める（間が詰まりすぎるのを防ぐ）。この切り詰め境界は無音同士の結合のため単純結合とし、クロスフェードは行わない（発話音声を混ぜないため）
-- 非破壊。何度でも再実行できる
+Produces `input.edited.wav` (or the path given by `-o`). Cuts are made from the **original WAV** — no quality degradation from multiple re-renders.
 
-## 編集ルール（input.sc.txt）
+## Filler Dictionary
 
-```
-[0001 0:00] 結局面倒くさい作業があるなら／ツールを作ればいい
-[0002 0:12] 〔まあ〕とか／そういう言葉を消して
-[0003 0:25] 私ですね〔あのー〕／動画で喋りたいことは◆いくらでもある
-```
+Filler words are detected by **exact match** against a dictionary file (one word per line):
 
-- **1行 = 1セグメント**。行頭 `[ID 開始時刻]` の ID 部分が対応表（.sc.json）へのキー（時刻は参照用・編集不要）
-- **行削除** → そのセグメント全体が音声から消える
-- **行の並べ替え** → その順で音声が再構成される（並べ替えは行単位のみ。行内の語順入れ替えは非対応）
-- **`／`（ポーズ区切り）** → 音が実際に途切れている「安全なカット点」。`／` で挟まれた範囲（または行端まで）が1つのカット単位（ブロック）。**ブロック内を1文字でも消すと、そのブロック全体が消える**（音のつながった箇所で切って結合が不自然になるのを構造的に防ぐ）。巻き込み削除が起きた場合は render が警告で列挙する。`／` 自体は残しても消しても結果に影響しない
-- **行内の文字削除** → 上記ブロック単位で対応する単語の音声が消える。通常はブロックスナップでカットが検出済み無音に揃うが、旧 `.sc.json`（ブロック情報なし）や `--pause-threshold 0` では保証されないため、削除境界が前後の発話音声と連続していると render が警告を出す。フィラー削除と違い**カットは実行される**（意図した削除を勝手に復活させない）ので、必要なら聞き直す
-- **`〔...〕`（フィラー提案）** → **括弧ごと残す＝削除指定**。render が該当フィラーの音声を消す。音声に残したい場合は括弧だけ消す（`〔まあ〕` → `まあ`）。提案は**前後にポーズのある単独ブロックのフィラーだけ**に付与される（他の語と音がつながったフィラーは巻き込み削除を避けるため `〔〕` を付けずプレーンテキスト表示）。さらに削除実行時にカット境界が前後の音声と連続調音していて不自然になるフィラーは**自動で残して警告**する（自然さ優先）。削除後は前後の無音から合計約0.25秒の間を残して結合する。`〔〕` を使わず手動でフィラーの文字だけを消した場合も、同ブロックに他の語が残っていれば巻き込まず精密カットする
-- **`◆`（低信頼マーカー）** → 信頼度が低い単語の直前に付与される聞き直し用の印。render は無視するので消さなくてよい
-- **追加・書き換えは不可** → 元音声が存在しないため、文字の追加・書き換えは反映されず警告のみ表示される（削除のみ有効）
-- **ID のない行・不明な ID** → render がエラーで報告して停止する（黙って無視しない）
+- Japanese: `stefnceorf/fillers_ja.txt` (default: あのー, そのー, えー, えっと, えと, まあ, まー, うーん)
+- English: `stefnceorf/fillers_en.txt` (default: um, uh, uhm, er, ah)
 
-## フィラー辞書のカスタマイズ
+Edit these files to customize filler detection for your vocabulary.
 
-フィラー候補は辞書との**完全一致**で `〔〕` に包まれる（部分一致はしない）。辞書はパッケージ同梱の以下のファイル（1行1語）で編集できる。
+## Frequently Asked Questions
 
-- 日本語: `stefnceorf/fillers_ja.txt`（既定: あのー, そのー, えー, えっと, えと, まあ, まー, うーん）
-- 英語: `stefnceorf/fillers_en.txt`（既定: um, uh, uhm, er, ah）
+### Is Stefnceorf really free?
 
-既定辞書は間投詞（言い淀み・つなぎ語）のみを収録している。あくまで提案であり、括弧を外せば却下できる。フィラー提案は既定で有効。無効化するには `--no-filler-suggest` を指定する。
+Yes. It is MIT licensed. All processing runs on your local machine. There are no cloud services, API keys, or usage fees.
 
-## 制約と注意
+### How does Stefnceorf compare to Descript?
 
-- 日本語の文字起こし精度は 93–95% 程度が相場。固有名詞・専門用語はブレやすい
-- 単語タイムスタンプの誤差で語尾欠け・隣音混入が起こりうる。前後 20ms のマージンと境界クロスフェードで大半を緩和するが、**最終的に通しで1回聞くことを前提**とする
-- フィラー誤検出はレビューで却下する運用
-- `--verbatim` で生じる繰り返し幻覚セグメントは自動検出され、その区間は安全設定で自動再認識して復旧する。復旧できた区間は通常表示（フィラーなしの転写）、復旧できなかった区間のみ警告表示される。**復旧できなかった区間は render で音声も削除されるため、警告された区間は聞き直すこと**
-- turbo モデルが気になる場合は `--model mlx-community/whisper-large-v3-mlx` に切り替え可能
-- 対象は音声のみ。動画・テロップ出力、加筆・言い換え、ノイズ除去は対象外（ノイズ除去は Audacity 等で済ませておく。無音の切り詰めは sc が対応）
+Stefnceorf is free and fully local — your audio never leaves your machine. The trade-off is that it's a CLI tool (no GUI) and requires an Apple Silicon Mac. Descript offers a GUI, video editing, and cross-platform support, but costs $24+/month and processes audio in the cloud. See the [comparison table](#stefnceorf-vs-descript) above.
 
-## 開発・テスト
+### Does Stefnceorf work with English audio?
+
+Yes. Use `--lang en` when transcribing. English filler dictionaries are included.
+
+### How accurate is the transcription?
+
+Japanese transcription accuracy is approximately 93–95%. English accuracy is comparable or better. Proper nouns and technical terms are the main sources of error. Low-confidence words are marked with `◆` for easy review.
+
+### Can I use Stefnceorf on Windows or Linux?
+
+Not directly — it requires Apple Silicon for mlx-whisper GPU acceleration. However, you can fork the repository and ask an AI coding agent to replace mlx-whisper with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) or [whisper.cpp](https://github.com/ggerganov/whisper.cpp) for cross-platform support.
+
+### Can I remove filler words automatically?
+
+Filler removal is semi-automatic by design. The tool suggests filler words by wrapping them in `〔brackets〕`. You review each suggestion and decide whether to keep or remove it. This prevents accidental deletion of words like "that" or "so" that can be both filler and meaningful.
+
+### What audio formats are supported?
+
+Input must be WAV. Apply noise reduction beforehand (e.g., with Audacity). Stefnceorf handles silence trimming.
+
+### Can AI coding agents modify this codebase?
+
+Yes. The repository includes `CLAUDE.md` and `AGENTS.md` with project context and workflow instructions. The codebase is intentionally simple (~2,500 lines of Python) with comprehensive tests, making it well-suited for AI-assisted modification.
+
+## Accuracy & Limitations
+
+- Transcription accuracy is ~93–95% for Japanese. Proper nouns and jargon may vary.
+- Word timestamp margins of ±20ms are compensated by crossfade, but **a final listen-through is always recommended**.
+- `--verbatim` mode may trigger Whisper hallucinations in long silent sections. These are automatically detected and rescued, but check any warnings.
+- Audio only — no video, captions, or noise reduction (preprocess with Audacity etc.).
+
+## Development & Testing
 
 ```sh
 .venv/bin/python -m pytest -q
 ```
 
-- 実モデル（mlx-whisper）や `say` コマンドを使う重いテストは `slow` マーカーが付き既定でスキップされる。実行する場合は `.venv/bin/python -m pytest -m slow`
+Tests using real Whisper models or macOS `say` are marked `slow` and skipped by default. Run them with `.venv/bin/python -m pytest -m slow`.
 
-## ライセンス
+## Roadmap
+
+- [ ] SRT / FCPX XML subtitle export
+- [ ] Custom proper-noun dictionary (initial_prompt / replacement rules)
+- [ ] Speaker diarization
+- [ ] Video support
+
+## Name
+
+*Stefnceorf* — from Old English *stefn* (voice) + *ceorfan* (to cut).
+
+## License
 
 [MIT License](LICENSE)
+
+---
+
+📖 [日本語ドキュメント / Japanese documentation](README_ja.md)
