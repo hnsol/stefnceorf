@@ -667,6 +667,12 @@ def _rescue_transcribe(
             (seg_start, seg_end, {**seg, "words": words})
         )
     normalized.sort(key=lambda item: (item[0], item[1]))
+    last_end: float | None = None
+    for _, _, seg in normalized:
+        for word in seg["words"]:
+            if last_end is not None and word["start"] < last_end:
+                return []
+            last_end = word["end"]
     return [seg for _, _, seg in normalized]
 
 

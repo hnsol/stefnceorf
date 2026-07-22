@@ -1411,6 +1411,61 @@ def test_transcribe_rescue_normalizes_bounds_and_segment_order(
     ] == [[(10.0, 20.0)], [(0.5, 1.0), (-2.0, 0.5)]]
 
 
+@pytest.mark.parametrize(
+    "rescue_segments",
+    [
+        [
+            {
+                "text": "長い短い",
+                "words": [
+                    {"word": "長い", "start": 0.0, "end": 5.0,
+                     "probability": 0.9},
+                    {"word": "短い", "start": 1.0, "end": 2.0,
+                     "probability": 0.9},
+                ],
+            },
+        ],
+        [
+            {
+                "text": "前半救出",
+                "words": [
+                    {"word": "前半", "start": 0.0, "end": 5.0,
+                     "probability": 0.9},
+                ],
+            },
+            {
+                "text": "後半救出",
+                "words": [
+                    {"word": "後半", "start": 4.0, "end": 6.0,
+                     "probability": 0.9},
+                ],
+            },
+        ],
+    ],
+    ids=["nested_words", "overlapping_segments"],
+)
+def test_transcribe_rescue_with_overlapping_words_falls_back_to_full_gap(
+    tmp_path, monkeypatch, rescue_segments
+):
+    """重複wordを含むレスキューは窓全体を未認識として保持する。"""
+    rescue_result = {"language": "ja", "segments": rescue_segments}
+    _setup_rescue(monkeypatch, _rescue_main_result(), rescue_result)
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja")
+    segments = res["data"]["segments"]
+
+    assert [s.get("kind", "speech") for s in segments] == [
+        "speech", "unrecognized", "speech"
+    ]
+    assert (
+        segments[1]["source_start"], segments[1]["source_end"]
+    ) == pytest.approx((1.0, 13.0))
+    assert segments[1]["words"] == []
+    assert res["hallucination_ranges"][0]["rescued"] is False
+    assert res["hallucination_ranges"][0]["rescued_segments"] == 0
+
+
 def test_transcribe_rescue_with_untimed_segment_falls_back_to_full_gap(
     tmp_path, monkeypatch
 ):
