@@ -301,6 +301,25 @@ def clamp_words_to_silences(
     return out
 
 
+def _finalize_segment_words(
+    seg: dict,
+    cuts: list[tuple[float, float]],
+    silences: list[tuple[float, float]],
+) -> list[dict]:
+    """segmentのwordを最終JSONへ出力する元音源時刻へ変換する。"""
+    words = [
+        {
+            "word": word.get("word", ""),
+            "start": word.get("start"),
+            "end": word.get("end"),
+            "probability": word.get("probability"),
+        }
+        for word in seg.get("words", []) or []
+    ]
+    words = remap_words(words, cuts)
+    return clamp_words_to_silences(words, silences)
+
+
 def assign_blocks(
     words: list[dict],
     silences: list[tuple[float, float]],
@@ -911,6 +930,7 @@ def transcribe(
         if dropped_segments:
             dropped_ids = {id(s) for s in dropped_segments}
             wav_dur = _wav_duration(recog_wav)
+            source_wav_end = rec_to_src(wav_dur, cuts)
             final_segments: list[dict] = []
             group: list[dict] = []
             last_kept: dict | None = None
@@ -932,10 +952,31 @@ def transcribe(
                 next_start = (
                     _seg_first_start(next_kept) if next_kept else None
                 )
-                gap_start, gap_end = audio_gap_window(
-                    prev_end, next_start, wav_dur
-                )
                 win = rescue_window(prev_end, next_start, wav_dur)
+
+                prev_words = (
+                    _finalize_segment_words(prev_kept, cuts, periods)
+                    if prev_kept else []
+                )
+                next_words = (
+                    _finalize_segment_words(next_kept, cuts, periods)
+                    if next_kept else []
+                )
+                coverage_start = (
+                    _seg_last_end({"words": prev_words})
+                    if prev_words else None
+                )
+                coverage_end = (
+                    _seg_first_start({"words": next_words})
+                    if next_words else None
+                )
+                coverage_start = (
+                    0.0 if coverage_start is None else coverage_start
+                )
+                coverage_end = (
+                    source_wav_end if coverage_end is None else coverage_end
+                )
+                coverage_end = max(coverage_start, coverage_end)
 
                 rescued_segs: list[dict] = []
                 if win is not None:
@@ -944,23 +985,19 @@ def transcribe(
                     )
 
                 # 診断範囲は、JSONで音声を保持する窓境界と一致させる。
-                rng_start = rec_to_src(gap_start, cuts)
-                rng_end = rec_to_src(gap_end, cuts)
-
                 halluc_ranges.append(
                     {
-                        "start": rng_start,
-                        "end": rng_end,
+                        "start": coverage_start,
+                        "end": coverage_end,
                         "sample": sample,
                         "rescued": bool(rescued_segs),
                         "rescued_segments": len(rescued_segs),
                     }
                 )
-                def _unrecognized(start: float, end: float) -> dict | None:
-                    if end <= start:
-                        return None
-                    source_start = rec_to_src(start, cuts)
-                    source_end = rec_to_src(end, cuts)
+
+                def _unrecognized(
+                    source_start: float, source_end: float
+                ) -> dict | None:
                     if source_end <= source_start:
                         return None
                     return {
@@ -972,25 +1009,29 @@ def transcribe(
                     }
 
                 if not rescued_segs:
-                    unrecognized = _unrecognized(gap_start, gap_end)
+                    unrecognized = _unrecognized(
+                        coverage_start, coverage_end
+                    )
                     return [unrecognized] if unrecognized else []
 
                 covered: list[dict] = []
-                cursor = gap_start
+                cursor = coverage_start
                 for rescued in rescued_segs:
-                    words = rescued["words"]
+                    words = _finalize_segment_words(rescued, cuts, periods)
                     seg_start = min(word["start"] for word in words)
                     seg_end = max(word["end"] for word in words)
-                    seg_start = min(max(seg_start, gap_start), gap_end)
-                    seg_end = min(max(seg_end, seg_start), gap_end)
+                    seg_start = min(
+                        max(seg_start, coverage_start), coverage_end
+                    )
+                    seg_end = min(max(seg_end, seg_start), coverage_end)
                     if seg_start > cursor:
                         unrecognized = _unrecognized(cursor, seg_start)
                         if unrecognized:
                             covered.append(unrecognized)
                     covered.append(rescued)
                     cursor = max(cursor, seg_end)
-                if gap_end > cursor:
-                    unrecognized = _unrecognized(cursor, gap_end)
+                if coverage_end > cursor:
+                    unrecognized = _unrecognized(cursor, coverage_end)
                     if unrecognized:
                         covered.append(unrecognized)
                 return covered
@@ -1042,20 +1083,7 @@ def transcribe(
                 f"⚠ 未認識区間 {duration:.1f}秒（音声保持）"
             )
             continue
-        words = []
-        for w in seg.get("words", []) or []:
-            words.append(
-                {
-                    "word": w.get("word", ""),
-                    "start": w.get("start"),
-                    "end": w.get("end"),
-                    "probability": w.get("probability"),
-                }
-            )
-        # 認識用wavの時刻を元音源の時刻へ逆写像（cuts が空なら恒等）
-        words = remap_words(words, cuts)
-        # 単語境界を無音区間へ縮めて補正（フィラー等の時刻ズレ対策）
-        words = clamp_words_to_silences(words, periods)
+        words = _finalize_segment_words(seg, cuts, periods)
         # ポーズベースのブロック割当（各 word に "block" を付与）
         blocks = assign_blocks(words, block_silences, pause_threshold)
         for wi, w in enumerate(words):

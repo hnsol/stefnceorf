@@ -1292,6 +1292,80 @@ def test_transcribe_rescue_success_inserts_and_offsets(tmp_path, monkeypatch):
     assert rng["rescued_segments"] == 1
 
 
+def test_transcribe_rescue_gaps_follow_final_clamped_word_bounds(
+    tmp_path, monkeypatch
+):
+    """未被覆gapを、最終JSONへ出るclamp後word包絡から補完する。"""
+    main_result = _rescue_main_result()
+    main_result["segments"][2]["words"][0].update(start=6.0, end=7.0)
+    rescue_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "救出テキスト",
+                "words": [
+                    {
+                        "word": "救出",
+                        "start": 1.5,
+                        "end": 3.5,
+                        "probability": 0.9,
+                    },
+                ],
+            },
+        ],
+    }
+    _setup_rescue(monkeypatch, main_result, rescue_result)
+    monkeypatch.setattr(
+        transcribe,
+        "_detect_silence",
+        lambda p, **k: (
+            "silence_start: 2.0\nsilence_end: 3.0\n"
+            "silence_start: 4.0\nsilence_end: 5.0\n"
+        ),
+    )
+
+    wav = _make_input(tmp_path)
+    segments = transcribe.transcribe(str(wav), lang="ja")["data"]["segments"]
+
+    assert [s.get("kind", "speech") for s in segments] == [
+        "speech", "unrecognized", "speech", "unrecognized", "speech"
+    ]
+    assert (segments[1]["source_start"], segments[1]["source_end"]) == (1.0, 3.0)
+    assert [
+        (word["start"], word["end"])
+        for word in segments[2]["words"]
+    ] == [(3.0, 4.0)]
+    assert (segments[3]["source_start"], segments[3]["source_end"]) == (4.0, 6.0)
+
+
+def test_transcribe_rescue_coverage_uses_final_clamped_kept_bounds(
+    tmp_path, monkeypatch
+):
+    """保持窓を前後keptのclamp後境界まで広げ、隙間を残さない。"""
+    main_result = _rescue_main_result()
+    main_result["segments"][0]["words"][0].update(start=0.0, end=2.5)
+    main_result["segments"][2]["words"][0].update(start=4.5, end=6.0)
+    _setup_rescue(monkeypatch, main_result, {"segments": []})
+    monkeypatch.setattr(
+        transcribe,
+        "_detect_silence",
+        lambda p, **k: (
+            "silence_start: 2.0\nsilence_end: 3.0\n"
+            "silence_start: 4.0\nsilence_end: 5.0\n"
+        ),
+    )
+
+    wav = _make_input(tmp_path)
+    segments = transcribe.transcribe(str(wav), lang="ja")["data"]["segments"]
+
+    assert [s.get("kind", "speech") for s in segments] == [
+        "speech", "unrecognized", "speech"
+    ]
+    assert segments[0]["words"][0]["end"] == 2.0
+    assert (segments[1]["source_start"], segments[1]["source_end"]) == (2.0, 5.0)
+    assert segments[2]["words"][0]["start"] == 5.0
+
+
 def test_transcribe_short_untimed_gap_is_preserved_and_reported(
     tmp_path, monkeypatch
 ):
