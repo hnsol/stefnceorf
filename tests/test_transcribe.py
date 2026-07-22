@@ -1327,6 +1327,163 @@ def test_transcribe_short_untimed_gap_is_preserved_and_reported(
     assert res["hallucination_ranges"][0]["end"] == pytest.approx(5.3)
 
 
+def test_transcribe_zero_length_gap_does_not_emit_unrecognized(
+    tmp_path, monkeypatch
+):
+    """隣接speechの境界が同時刻なら、長さ0の未認識区間を出力しない。"""
+    main_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "前",
+                "words": [
+                    {"word": "前", "start": 4.0, "end": 5.0, "probability": 0.9},
+                ],
+            },
+            {"text": "", "words": []},
+            {
+                "text": "後",
+                "words": [
+                    {"word": "後", "start": 5.0, "end": 6.0, "probability": 0.9},
+                ],
+            },
+        ],
+    }
+    calls = _setup_rescue(monkeypatch, main_result, {"segments": []})
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja")
+
+    assert len(calls) == 1
+    assert [s.get("kind", "speech") for s in res["data"]["segments"]] == [
+        "speech", "speech"
+    ]
+    assert "未認識区間" not in (tmp_path / "input.sc.txt").read_text()
+
+
+def test_transcribe_rescue_normalizes_bounds_and_segment_order(
+    tmp_path, monkeypatch
+):
+    """窓外wordをクランプし、逆順のrescue segmentを時系列化する。"""
+    rescue_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "後半救出",
+                "words": [
+                    {"word": "後半", "start": 10.0, "end": 20.0, "probability": 0.9},
+                ],
+            },
+            {
+                "text": "前半救出",
+                "words": [
+                    {"word": "半", "start": 0.5, "end": 1.0, "probability": 0.9},
+                    {"word": "前", "start": -2.0, "end": 0.5, "probability": 0.9},
+                ],
+            },
+        ],
+    }
+    _setup_rescue(monkeypatch, _rescue_main_result(), rescue_result)
+
+    wav = _make_input(tmp_path)
+    segments = transcribe.transcribe(str(wav), lang="ja")["data"]["segments"]
+
+    assert [s.get("kind", "speech") for s in segments] == [
+        "speech", "speech", "unrecognized", "speech", "speech"
+    ]
+    assert [s["text"] for s in segments if s.get("kind") != "unrecognized"] == [
+        "前", "前半救出", "後半救出", "後"
+    ]
+    assert [
+        (word["start"], word["end"])
+        for word in segments[1]["words"]
+    ] == pytest.approx([(1.0, 1.5), (1.5, 2.0)])
+    assert (
+        segments[2]["source_start"], segments[2]["source_end"]
+    ) == pytest.approx((2.0, 11.0))
+    assert (
+        segments[3]["words"][0]["start"],
+        segments[3]["words"][0]["end"],
+    ) == pytest.approx((11.0, 13.0))
+    assert [
+        [(word["start"], word["end"]) for word in seg["words"]]
+        for seg in rescue_result["segments"]
+    ] == [[(10.0, 20.0)], [(0.5, 1.0), (-2.0, 0.5)]]
+
+
+def test_transcribe_rescue_with_untimed_segment_falls_back_to_full_gap(
+    tmp_path, monkeypatch
+):
+    """時刻なしsegmentを含むレスキューは成功扱いせず窓全体を保持する。"""
+    rescue_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "救出テキスト",
+                "words": [
+                    {"word": "救出", "start": 0.5, "end": 1.5, "probability": 0.9},
+                ],
+            },
+            {
+                "text": "時刻なし",
+                "words": [
+                    {"word": "時刻なし", "start": None, "end": None,
+                     "probability": 0.9},
+                ],
+            },
+        ],
+    }
+    _setup_rescue(monkeypatch, _rescue_main_result(), rescue_result)
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja")
+    segments = res["data"]["segments"]
+
+    assert [s.get("kind", "speech") for s in segments] == [
+        "speech", "unrecognized", "speech"
+    ]
+    assert (
+        segments[1]["source_start"], segments[1]["source_end"]
+    ) == pytest.approx((1.0, 13.0))
+    assert res["hallucination_ranges"][0]["rescued"] is False
+    assert res["hallucination_ranges"][0]["rescued_segments"] == 0
+
+
+def test_transcribe_rescue_with_invalid_times_falls_back_to_full_gap(
+    tmp_path, monkeypatch
+):
+    """正規化不能な時刻を含むレスキューは例外化せず窓全体を保持する。"""
+    rescue_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "異常時刻のレスキュー結果です",
+                "words": [
+                    {
+                        "word": f"語{i}",
+                        "start": "invalid" if i == 0 else i * 0.1,
+                        "end": i * 0.1 + 0.05,
+                        "probability": 0.9,
+                    }
+                    for i in range(10)
+                ],
+            },
+        ],
+    }
+    _setup_rescue(monkeypatch, _rescue_main_result(), rescue_result)
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja")
+    segments = res["data"]["segments"]
+
+    assert [s.get("kind", "speech") for s in segments] == [
+        "speech", "unrecognized", "speech"
+    ]
+    assert (
+        segments[1]["source_start"], segments[1]["source_end"]
+    ) == pytest.approx((1.0, 13.0))
+
+
 def test_transcribe_leading_and_trailing_gaps_cover_file_edges(
     tmp_path, monkeypatch
 ):

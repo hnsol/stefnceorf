@@ -597,9 +597,10 @@ def _rescue_transcribe(
 ) -> list[dict]:
     """レスキュー窓を安全設定で再認識し、全件正常ならセグメント列を返す。
 
-    単語時刻には窓開始時刻を加算し認識用wav時刻へ戻す。得られたセグメントにも
-    drop_hallucinations を1回だけ適用する。1件でも除外対象があれば、部分的な
-    復旧で音声を失わないよう全体を失敗とする（再帰レスキューはしない）。
+    単語時刻は入力を変更せず、窓開始時刻を加算して認識用wav時刻へ戻す。窓内へ
+    クランプ後も全segmentが正長包絡を持つ場合だけ時系列順で返す。得られた
+    segmentにもdrop_hallucinationsを1回だけ適用し、除外・時刻異常が1件でも
+    あれば部分的な復旧で音声を失わないよう全体を失敗とする。
     """
     import mlx_whisper
 
@@ -613,15 +614,60 @@ def _rescue_transcribe(
             pass
 
     rsegs = result.get("segments", []) or []
-    # 窓内の相対時刻を認識用wav時刻へ戻す（窓開始を加算）
+    if not isinstance(rsegs, list):
+        return []
+    validated: list[dict] = []
     for seg in rsegs:
-        for w in seg.get("words") or []:
-            if w.get("start") is not None:
-                w["start"] = float(w["start"]) + win_start
-            if w.get("end") is not None:
-                w["end"] = float(w["end"]) + win_start
-    kept, dropped = drop_hallucinations(rsegs)
-    return [] if dropped else kept
+        if not isinstance(seg, dict):
+            return []
+        raw_words = seg.get("words") or []
+        if not isinstance(raw_words, list) or not raw_words:
+            return []
+        words: list[dict] = []
+        for word in raw_words:
+            if not isinstance(word, dict):
+                return []
+            start = word.get("start")
+            end = word.get("end")
+            if start is None or end is None:
+                return []
+            try:
+                start = float(start)
+                end = float(end)
+            except (TypeError, ValueError):
+                return []
+            if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+                return []
+            words.append({**word, "start": start, "end": end})
+        validated.append({**seg, "words": words})
+
+    kept, dropped = drop_hallucinations(validated)
+    if dropped:
+        return []
+
+    normalized: list[tuple[float, float, dict]] = []
+    for seg in kept:
+        words: list[dict] = []
+        for word in seg.get("words") or []:
+            start = word["start"] + win_start
+            end = word["end"] + win_start
+            start = min(max(start, win_start), win_end)
+            end = min(max(end, win_start), win_end)
+            if end <= start:
+                return []
+            words.append({**word, "start": start, "end": end})
+        if not words:
+            return []
+        words.sort(key=lambda word: (word["start"], word["end"]))
+        seg_start = min(word["start"] for word in words)
+        seg_end = max(word["end"] for word in words)
+        if seg_end <= seg_start:
+            return []
+        normalized.append(
+            (seg_start, seg_end, {**seg, "words": words})
+        )
+    normalized.sort(key=lambda item: (item[0], item[1]))
+    return [seg for _, _, seg in normalized]
 
 
 def _detect_silence(wav_path: str, d: float = SILENCE_MIN_S) -> str:
@@ -904,34 +950,43 @@ def transcribe(
                         "rescued_segments": len(rescued_segs),
                     }
                 )
-                def _unrecognized(start: float, end: float) -> dict:
+                def _unrecognized(start: float, end: float) -> dict | None:
+                    if end <= start:
+                        return None
+                    source_start = rec_to_src(start, cuts)
+                    source_end = rec_to_src(end, cuts)
+                    if source_end <= source_start:
+                        return None
                     return {
                         "kind": "unrecognized",
-                        "source_start": rec_to_src(start, cuts),
-                        "source_end": rec_to_src(end, cuts),
+                        "source_start": source_start,
+                        "source_end": source_end,
                         "text": sample,
                         "words": [],
                     }
 
                 if not rescued_segs:
-                    return [_unrecognized(gap_start, gap_end)]
+                    unrecognized = _unrecognized(gap_start, gap_end)
+                    return [unrecognized] if unrecognized else []
 
                 covered: list[dict] = []
                 cursor = gap_start
                 for rescued in rescued_segs:
-                    seg_start = _seg_first_start(rescued)
-                    seg_end = _seg_last_end(rescued)
-                    if seg_start is None or seg_end is None:
-                        covered.append(rescued)
-                        continue
+                    words = rescued["words"]
+                    seg_start = min(word["start"] for word in words)
+                    seg_end = max(word["end"] for word in words)
                     seg_start = min(max(seg_start, gap_start), gap_end)
                     seg_end = min(max(seg_end, seg_start), gap_end)
                     if seg_start > cursor:
-                        covered.append(_unrecognized(cursor, seg_start))
+                        unrecognized = _unrecognized(cursor, seg_start)
+                        if unrecognized:
+                            covered.append(unrecognized)
                     covered.append(rescued)
                     cursor = max(cursor, seg_end)
                 if gap_end > cursor:
-                    covered.append(_unrecognized(cursor, gap_end))
+                    unrecognized = _unrecognized(cursor, gap_end)
+                    if unrecognized:
+                        covered.append(unrecognized)
                 return covered
 
             for seg in raw_segments:
