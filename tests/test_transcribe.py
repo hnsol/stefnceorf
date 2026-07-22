@@ -1276,6 +1276,56 @@ def test_transcribe_rescue_success_inserts_and_offsets(tmp_path, monkeypatch):
     assert rng["rescued_segments"] == 1
 
 
+def test_transcribe_rescue_fallback_when_partly_hallucinated(
+    tmp_path, monkeypatch
+):
+    """レスキュー結果の一部が幻覚なら窓全体を未認識として保持する。"""
+    rescue_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "救出テキスト",
+                "words": [
+                    {
+                        "word": "救出",
+                        "start": 0.5,
+                        "end": 1.5,
+                        "probability": 0.9,
+                    },
+                ],
+            },
+            {
+                "text": "今、" * 10,
+                "words": [
+                    {
+                        "word": "今、",
+                        "start": 2.0 + i * 0.1,
+                        "end": 2.05 + i * 0.1,
+                        "probability": 0.9,
+                    }
+                    for i in range(10)
+                ],
+            },
+        ],
+    }
+    _setup_rescue(monkeypatch, _rescue_main_result(), rescue_result)
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja")
+    data = res["data"]
+
+    assert [s.get("kind", "speech") for s in data["segments"]] == [
+        "speech", "unrecognized", "speech"
+    ]
+    u = data["segments"][1]
+    assert u["source_start"] == pytest.approx(1.0)
+    assert u["source_end"] == pytest.approx(13.0)
+    assert u["words"] == []
+    rng = res["hallucination_ranges"][0]
+    assert rng["rescued"] is False
+    assert rng["rescued_segments"] == 0
+
+
 def test_transcribe_rescue_fallback_when_hallucination(tmp_path, monkeypatch):
     """レスキュー結果も幻覚なら未認識区間として保持する。"""
     rescue_result = {

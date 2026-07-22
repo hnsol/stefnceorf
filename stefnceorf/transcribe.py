@@ -595,10 +595,11 @@ def _rescue_transcribe(
     model: str,
     lang: str | None,
 ) -> list[dict]:
-    """レスキュー窓を安全設定で再認識し、幻覚ガード後の生存セグメント列を返す。
+    """レスキュー窓を安全設定で再認識し、全件正常ならセグメント列を返す。
 
     単語時刻には窓開始時刻を加算し認識用wav時刻へ戻す。得られたセグメントにも
-    drop_hallucinations を1回だけ適用する（再帰レスキューはしない）。
+    drop_hallucinations を1回だけ適用する。1件でも除外対象があれば、部分的な
+    復旧で音声を失わないよう全体を失敗とする（再帰レスキューはしない）。
     """
     import mlx_whisper
 
@@ -619,8 +620,8 @@ def _rescue_transcribe(
                 w["start"] = float(w["start"]) + win_start
             if w.get("end") is not None:
                 w["end"] = float(w["end"]) + win_start
-    kept, _dropped = drop_hallucinations(rsegs)
-    return kept
+    kept, dropped = drop_hallucinations(rsegs)
+    return [] if dropped else kept
 
 
 def _detect_silence(wav_path: str, d: float = SILENCE_MIN_S) -> str:
