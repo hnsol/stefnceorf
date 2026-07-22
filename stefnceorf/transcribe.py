@@ -48,6 +48,14 @@ HALLUC_DENSITY_CHARS_S = 25.0
 HALLUC_ECHO_PREFIX = 15          # 直前との共通接頭辞の閾値文字数
 HALLUC_ECHO_DENSITY_CHARS_S = 12.0  # エコー判定に用いる文字密度しきい値
 
+# デコード温度のフォールバック列（whisper 既定と同じ）。正常窓は先頭 0.0 の
+# 1回デコードで済み追加コストなし。compression_ratio / logprob 異常の窓のみ
+# 高温で再試行される。mlx-whisper は結果温度が 0.5 超のとき直前文脈プロンプトを
+# リセットするため、condition_on_previous_text=True の誤認識自己増幅
+# （幻覚ループの根本原因）が異常窓で切断される。temperature=0 固定だと
+# 異常検出しても再試行先がなく破綻結果をそのまま採用してしまう。
+TEMPERATURE_FALLBACK = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+
 # 幻覚区間の再認識レスキュー窓の最小長（秒）。これ未満の窓は内容なしとみなし
 # レスキューを省略する（従来通り除去扱い）。
 RESCUE_MIN_WINDOW_S = 0.5
@@ -537,7 +545,7 @@ def _rescue_kwargs(model: str, lang: str | None) -> dict:
         path_or_hf_repo=model,
         word_timestamps=True,
         language=lang,
-        temperature=0,
+        temperature=TEMPERATURE_FALLBACK,
         condition_on_previous_text=False,
         no_speech_threshold=0.8,
         compression_ratio_threshold=2.0,
@@ -800,7 +808,7 @@ def transcribe(
         path_or_hf_repo=model,
         word_timestamps=True,
         language=lang,
-        temperature=0,
+        temperature=TEMPERATURE_FALLBACK,
         condition_on_previous_text=verbatim,
         no_speech_threshold=0.8,
         compression_ratio_threshold=2.0,

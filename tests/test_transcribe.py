@@ -787,7 +787,7 @@ def test_transcribe_passes_whisper_kwargs(tmp_path, fake_whisper):
     assert kw["path_or_hf_repo"] == "custom-model"
     assert kw["word_timestamps"] is True
     assert kw["language"] == "ja"
-    assert kw["temperature"] == 0
+    assert kw["temperature"] == transcribe.TEMPERATURE_FALLBACK
     assert kw["condition_on_previous_text"] is False
     assert kw["no_speech_threshold"] == 0.8
     assert kw["compression_ratio_threshold"] == 2.0
