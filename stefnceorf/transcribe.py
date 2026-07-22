@@ -740,6 +740,7 @@ def _rescue_transcribe(
         chunks.append((start + pos, end))
 
     for chunk_start, chunk_end in chunks:
+        chunk_duration = chunk_end - chunk_start
         clip = _slice_wav(src_wav, chunk_start, chunk_end)
         try:
             result = mlx_whisper.transcribe(
@@ -757,6 +758,7 @@ def _rescue_transcribe(
         if not isinstance(rsegs, list):
             return []
         local_validated: list[dict] = []
+        local_last_end: float | None = None
         for seg in rsegs:
             if not isinstance(seg, dict):
                 return []
@@ -783,9 +785,19 @@ def _rescue_transcribe(
                 if (
                     not math.isfinite(word_start)
                     or not math.isfinite(word_end)
-                    or word_end <= word_start
                 ):
                     return []
+                word_start = min(max(word_start, 0.0), chunk_duration)
+                word_end = min(max(word_end, 0.0), chunk_duration)
+                if (
+                    word_end <= word_start
+                    or (
+                        local_last_end is not None
+                        and word_start < local_last_end
+                    )
+                ):
+                    return []
+                local_last_end = word_end
                 words.append(
                     {**word, "start": word_start, "end": word_end}
                 )
@@ -811,8 +823,8 @@ def _rescue_transcribe(
     for seg in validated:
         words: list[dict] = []
         for word in seg.get("words") or []:
-            word_start = min(max(word["start"], start), end)
-            word_end = min(max(word["end"], start), end)
+            word_start = word["start"]
+            word_end = word["end"]
             if word_end <= word_start:
                 return []
             words.append(
@@ -828,7 +840,6 @@ def _rescue_transcribe(
         normalized.append(
             (seg_start, seg_end, {**seg, "words": words})
         )
-    normalized.sort(key=lambda item: (item[0], item[1]))
     last_end: float | None = None
     for _, _, seg in normalized:
         for word in seg["words"]:

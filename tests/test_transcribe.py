@@ -1728,6 +1728,60 @@ def test_long_rescue_window_is_split_into_90_second_chunks(
     assert all(not clip.exists() for clip in clips)
 
 
+def test_verbatim_rescue_falls_back_when_word_is_outside_subchunk(
+    tmp_path, monkeypatch
+):
+    main_result = _rescue_main_result()
+    main_result["segments"][2]["words"][0].update(start=201.0, end=202.0)
+    outside_chunk = _clean_rescue_result("範囲外", start=100.0, end=101.0)
+    calls = _setup_rescue(
+        monkeypatch,
+        main_result,
+        [
+            outside_chunk,
+            _clean_rescue_result("使われない二番目"),
+            _clean_rescue_result("使われない三番目"),
+            _clean_rescue_result("安全復旧"),
+        ],
+    )
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 220.0)
+
+    result = transcribe.transcribe(str(_make_input(tmp_path)), lang="ja")
+
+    assert len(calls) == 3
+    assert calls[1]["kwargs"]["condition_on_previous_text"] is True
+    assert calls[2]["kwargs"]["condition_on_previous_text"] is False
+    rescue_range = result["hallucination_ranges"][0]
+    assert rescue_range["attempts"] == ["verbatim", "safe"]
+    assert rescue_range["status"] == "rescued"
+
+
+def test_verbatim_rescue_clamps_partial_word_to_subchunk_bounds(
+    tmp_path, monkeypatch
+):
+    results = [
+        _clean_rescue_result("境界", start=89.0, end=100.0),
+        _clean_rescue_result("中間"),
+        _clean_rescue_result("末尾"),
+    ]
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda path, **kwargs: results.pop(0)
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(
+        transcribe,
+        "_slice_wav",
+        lambda src, start, end: str(tmp_path / "missing-clip.wav"),
+    )
+
+    segments = transcribe._rescue_transcribe(
+        "source.wav", 0.0, 200.0, "model", "ja", verbatim=True
+    )
+
+    assert segments[0]["words"][0]["start"] == pytest.approx(89.0)
+    assert segments[0]["words"][0]["end"] == pytest.approx(90.0)
+
+
 def test_long_rescue_prefers_valid_silence_before_90_second_limit(
     tmp_path, monkeypatch
 ):
@@ -2016,10 +2070,10 @@ def test_transcribe_zero_length_gap_does_not_emit_unrecognized(
     assert "未認識区間" not in (tmp_path / "input.sc.txt").read_text()
 
 
-def test_transcribe_rescue_normalizes_bounds_and_segment_order(
+def test_transcribe_rescue_rejects_nonmonotonic_words_after_clamping(
     tmp_path, monkeypatch
 ):
-    """窓外wordをクランプし、逆順のrescue segmentを時系列化する。"""
+    """clamp後に逆順となるwordは段階レスキューを不合格にする。"""
     rescue_result = {
         "language": "ja",
         "segments": [
@@ -2038,32 +2092,22 @@ def test_transcribe_rescue_normalizes_bounds_and_segment_order(
             },
         ],
     }
-    _setup_rescue(monkeypatch, _rescue_main_result(), rescue_result)
+    calls = _setup_rescue(monkeypatch, _rescue_main_result(), rescue_result)
 
     wav = _make_input(tmp_path)
-    segments = transcribe.transcribe(str(wav), lang="ja")["data"]["segments"]
+    result = transcribe.transcribe(str(wav), lang="ja")
+    segments = result["data"]["segments"]
 
     assert [s.get("kind", "speech") for s in segments] == [
-        "speech", "speech", "unrecognized", "speech", "speech"
+        "speech", "unrecognized", "speech"
     ]
-    assert [s["text"] for s in segments if s.get("kind") != "unrecognized"] == [
-        "前", "前半救出", "後半救出", "後"
+    assert (
+        segments[1]["source_start"], segments[1]["source_end"]
+    ) == pytest.approx((1.0, 13.0))
+    assert len(calls) == 3
+    assert result["hallucination_ranges"][0]["attempts"] == [
+        "verbatim", "safe"
     ]
-    assert [
-        (word["start"], word["end"])
-        for word in segments[1]["words"]
-    ] == pytest.approx([(1.0, 1.5), (1.5, 2.0)])
-    assert (
-        segments[2]["source_start"], segments[2]["source_end"]
-    ) == pytest.approx((2.0, 11.0))
-    assert (
-        segments[3]["words"][0]["start"],
-        segments[3]["words"][0]["end"],
-    ) == pytest.approx((11.0, 13.0))
-    assert [
-        [(word["start"], word["end"]) for word in seg["words"]]
-        for seg in rescue_result["segments"]
-    ] == [[(10.0, 20.0)], [(0.5, 1.0), (-2.0, 0.5)]]
 
 
 @pytest.mark.parametrize(
