@@ -68,6 +68,9 @@ TEMPERATURE_FALLBACK = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 # レスキューを省略する（従来通り除去扱い）。
 RESCUE_MIN_WINDOW_S = 0.5
 
+# fresh-context verbatimレスキューの最大チャンク長（秒）。
+RESCUE_VERBATIM_CHUNK_S = 90.0
+
 _SILENCE_RE = re.compile(r"silence_(start|end):\s*(-?\d+(?:\.\d+)?)")
 
 # 表示用マーカー（render 側で除去する前提）
@@ -637,18 +640,32 @@ def _seg_last_end(seg: dict) -> float | None:
     return None
 
 
-def _rescue_kwargs(model: str, lang: str | None) -> dict:
-    """レスキュー再認識用の安全設定 whisper kwargs（プロンプトなし・condT False）。"""
-    return dict(
+def _rescue_kwargs(
+    model: str, lang: str | None, verbatim: bool = False
+) -> dict:
+    """レスキュー再認識用whisper kwargsを返す。"""
+    kwargs = dict(
         path_or_hf_repo=model,
         word_timestamps=True,
         language=lang,
-        temperature=TEMPERATURE_FALLBACK,
-        condition_on_previous_text=False,
+        temperature=0 if verbatim else TEMPERATURE_FALLBACK,
+        condition_on_previous_text=verbatim,
         no_speech_threshold=0.8,
         compression_ratio_threshold=2.0,
-        hallucination_silence_threshold=HALLUC_SILENCE_SKIP_S,
     )
+    if verbatim:
+        kwargs["initial_prompt"] = (
+            FILLER_PROMPT_EN if lang == "en" else FILLER_PROMPT
+        )
+    else:
+        kwargs["hallucination_silence_threshold"] = HALLUC_SILENCE_SKIP_S
+    return kwargs
+
+
+def _valid_rescue(segments: list[dict]) -> bool:
+    """レスキュー結果が全件採用可能かを返す。"""
+    kept, dropped = drop_hallucinations(segments)
+    return bool(kept) and not dropped and any(s.get("words") for s in kept)
 
 
 def _wav_duration(path: str) -> float:
@@ -674,73 +691,127 @@ def _slice_wav(src_wav: str, start: float, end: float) -> str:
 
 
 def _rescue_transcribe(
-    recog_wav: str,
-    win_start: float,
-    win_end: float,
+    src_wav: str,
+    start: float,
+    end: float,
     model: str,
     lang: str | None,
+    verbatim: bool,
 ) -> list[dict]:
-    """レスキュー窓を安全設定で再認識し、全件正常ならセグメント列を返す。
+    """レスキュー窓を指定モードで再認識し、全件正常なら返す。
 
-    単語時刻は入力を変更せず、窓開始時刻を加算して認識用wav時刻へ戻す。窓内へ
-    クランプ後も全segmentが正長包絡を持つ場合だけ時系列順で返す。得られた
-    segmentにもdrop_hallucinationsを1回だけ適用し、除外・時刻異常が1件でも
-    あれば部分的な復旧で音声を失わないよう全体を失敗とする。
+    verbatimは90秒以下のfresh contextへ分割し、各チャンクでプロンプトを再投入
+    する。単語時刻はチャンク開始を1回だけ加算して元の認識用wav時刻へ戻す。
+    いずれかのチャンクに幻覚・空結果・時刻異常があれば全体を失敗とする。
     """
     import mlx_whisper
 
-    clip = _slice_wav(recog_wav, win_start, win_end)
-    try:
-        result = mlx_whisper.transcribe(clip, **_rescue_kwargs(model, lang))
-    finally:
-        try:
-            os.unlink(clip)
-        except OSError:
-            pass
-
-    rsegs = result.get("segments", []) or []
-    if not isinstance(rsegs, list):
-        return []
     validated: list[dict] = []
-    for seg in rsegs:
-        if not isinstance(seg, dict):
-            return []
-        raw_words = seg.get("words") or []
-        if not isinstance(raw_words, list) or not raw_words:
-            return []
-        words: list[dict] = []
-        for word in raw_words:
-            if not isinstance(word, dict):
-                return []
-            start = word.get("start")
-            end = word.get("end")
-            if start is None or end is None:
-                return []
-            try:
-                start = float(start)
-                end = float(end)
-            except (TypeError, ValueError):
-                return []
-            if not math.isfinite(start) or not math.isfinite(end) or end <= start:
-                return []
-            words.append({**word, "start": start, "end": end})
-        validated.append({**seg, "words": words})
+    chunks = [(start, end)]
+    if verbatim and end - start > RESCUE_VERBATIM_CHUNK_S:
+        duration = end - start
+        absolute_silences = parse_silence_periods(
+            _detect_silence(src_wav, d=0.5)
+        )
+        relative_silences = [
+            (max(0.0, silence_start - start), min(duration, silence_end - start))
+            for silence_start, silence_end in absolute_silences
+            if silence_end > start and silence_start < end
+        ]
+        chunks = []
+        pos = 0.0
+        while duration - pos > RESCUE_VERBATIM_CHUNK_S:
+            remaining_silences = [
+                (silence_start - pos, silence_end - pos)
+                for silence_start, silence_end in relative_silences
+                if silence_end > pos
+                and (silence_start + silence_end) / 2.0
+                <= pos + RESCUE_VERBATIM_CHUNK_S
+            ]
+            planned = plan_chunks(
+                duration - pos,
+                remaining_silences,
+                target=RESCUE_VERBATIM_CHUNK_S,
+                tol=15.0,
+            )
+            chunk_len = min(RESCUE_VERBATIM_CHUNK_S, planned[0][1])
+            chunks.append((start + pos, start + pos + chunk_len))
+            pos += chunk_len
+        chunks.append((start + pos, end))
 
-    kept, dropped = drop_hallucinations(validated)
-    if dropped:
-        return []
+    for chunk_start, chunk_end in chunks:
+        clip = _slice_wav(src_wav, chunk_start, chunk_end)
+        try:
+            result = mlx_whisper.transcribe(
+                clip, **_rescue_kwargs(model, lang, verbatim)
+            )
+        finally:
+            try:
+                os.unlink(clip)
+            except OSError:
+                pass
+
+        rsegs = result.get("segments", []) or []
+        if not isinstance(rsegs, list):
+            return []
+        local_validated: list[dict] = []
+        for seg in rsegs:
+            if not isinstance(seg, dict):
+                return []
+            raw_words = seg.get("words") or []
+            if not isinstance(raw_words, list) or not raw_words:
+                return []
+            words: list[dict] = []
+            for word in raw_words:
+                if not isinstance(word, dict):
+                    return []
+                word_start = word.get("start")
+                word_end = word.get("end")
+                if word_start is None or word_end is None:
+                    return []
+                try:
+                    word_start = float(word_start)
+                    word_end = float(word_end)
+                except (TypeError, ValueError):
+                    return []
+                if (
+                    not math.isfinite(word_start)
+                    or not math.isfinite(word_end)
+                    or word_end <= word_start
+                ):
+                    return []
+                words.append(
+                    {**word, "start": word_start, "end": word_end}
+                )
+            local_validated.append({**seg, "words": words})
+        if not _valid_rescue(local_validated):
+            return []
+        validated.extend(
+            {
+                **seg,
+                "words": [
+                    {
+                        **word,
+                        "start": word["start"] + chunk_start,
+                        "end": word["end"] + chunk_start,
+                    }
+                    for word in seg["words"]
+                ],
+            }
+            for seg in local_validated
+        )
 
     normalized: list[tuple[float, float, dict]] = []
-    for seg in kept:
+    for seg in validated:
         words: list[dict] = []
         for word in seg.get("words") or []:
-            start = word["start"] + win_start
-            end = word["end"] + win_start
-            start = min(max(start, win_start), win_end)
-            end = min(max(end, win_start), win_end)
-            if end <= start:
+            word_start = min(max(word["start"], start), end)
+            word_end = min(max(word["end"], start), end)
+            if word_end <= word_start:
                 return []
-            words.append({**word, "start": start, "end": end})
+            words.append(
+                {**word, "start": word_start, "end": word_end}
+            )
         if not words:
             return []
         words.sort(key=lambda word: (word["start"], word["end"]))
@@ -1080,10 +1151,17 @@ def transcribe(
                 coverage_end = max(coverage_start, coverage_end)
 
                 rescued_segs: list[dict] = []
+                attempts: list[str] = []
                 if win is not None:
+                    attempts.append("verbatim")
                     rescued_segs = _rescue_transcribe(
-                        recog_wav, win[0], win[1], model, lang
+                        recog_wav, win[0], win[1], model, lang, True
                     )
+                    if not rescued_segs:
+                        attempts.append("safe")
+                        rescued_segs = _rescue_transcribe(
+                            recog_wav, win[0], win[1], model, lang, False
+                        )
 
                 # 診断範囲は、JSONで音声を保持する窓境界と一致させる。
                 halluc_ranges.append(
@@ -1093,6 +1171,10 @@ def transcribe(
                         "sample": sample,
                         "rescued": bool(rescued_segs),
                         "rescued_segments": len(rescued_segs),
+                        "attempts": attempts,
+                        "status": (
+                            "rescued" if rescued_segs else "unrecognized"
+                        ),
                     }
                 )
 

@@ -1437,12 +1437,17 @@ def _rescue_main_result():
 def _setup_rescue(monkeypatch, main_result, rescue_result):
     """本認識と rescue で別結果を返す fake を仕込み、呼び出し記録を返す。"""
     calls = []
+    rescue_results = (
+        list(rescue_result) if isinstance(rescue_result, list) else None
+    )
 
     def fake_transcribe(path, **kwargs):
         calls.append({"path": path, "kwargs": kwargs})
-        if path == "rescue_clip.wav":
+        if len(calls) == 1:
+            return main_result
+        if rescue_results is None:
             return rescue_result
-        return main_result
+        return rescue_results.pop(0)
 
     fake_mod = types.ModuleType("mlx_whisper")
     fake_mod.transcribe = fake_transcribe
@@ -1454,6 +1459,251 @@ def _setup_rescue(monkeypatch, main_result, rescue_result):
         transcribe, "_slice_wav", lambda src, s, e: "rescue_clip.wav"
     )
     return calls
+
+
+def _clean_rescue_result(text="救出", start=0.5, end=1.5):
+    return {
+        "language": "ja",
+        "segments": [
+            {
+                "text": text,
+                "words": [
+                    {
+                        "word": text,
+                        "start": start,
+                        "end": end,
+                        "probability": 0.9,
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _anomalous_rescue_result():
+    return {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "今、" * 10,
+                "words": [
+                    {
+                        "word": "今、",
+                        "start": i * 0.1,
+                        "end": i * 0.1 + 0.05,
+                        "probability": 0.9,
+                    }
+                    for i in range(10)
+                ],
+            }
+        ],
+    }
+
+
+def test_rescue_uses_verbatim_first_and_accepts_clean_result(
+    tmp_path, monkeypatch
+):
+    calls = _setup_rescue(
+        monkeypatch, _rescue_main_result(), _clean_rescue_result()
+    )
+
+    result = transcribe.transcribe(str(_make_input(tmp_path)), lang="ja")
+
+    assert len(calls) == 2
+    kwargs = calls[1]["kwargs"]
+    assert kwargs["initial_prompt"] == transcribe.FILLER_PROMPT
+    assert kwargs["condition_on_previous_text"] is True
+    assert kwargs["temperature"] == 0
+    assert "hallucination_silence_threshold" not in kwargs
+    rescue_range = result["hallucination_ranges"][0]
+    assert rescue_range["attempts"] == ["verbatim"]
+    assert rescue_range["status"] == "rescued"
+
+
+def test_rescue_falls_back_to_safe_mode_after_verbatim_anomaly(
+    tmp_path, monkeypatch
+):
+    calls = _setup_rescue(
+        monkeypatch,
+        _rescue_main_result(),
+        [_anomalous_rescue_result(), _clean_rescue_result()],
+    )
+
+    result = transcribe.transcribe(str(_make_input(tmp_path)), lang="ja")
+
+    assert len(calls) == 3
+    safe_kwargs = calls[2]["kwargs"]
+    assert safe_kwargs["condition_on_previous_text"] is False
+    assert "initial_prompt" not in safe_kwargs
+    assert safe_kwargs["temperature"] == transcribe.TEMPERATURE_FALLBACK
+    assert (
+        safe_kwargs["hallucination_silence_threshold"]
+        == transcribe.HALLUC_SILENCE_SKIP_S
+    )
+    rescue_range = result["hallucination_ranges"][0]
+    assert rescue_range["attempts"] == ["verbatim", "safe"]
+    assert rescue_range["status"] == "rescued"
+
+
+def test_rescue_failure_returns_unrecognized_segment(tmp_path, monkeypatch):
+    calls = _setup_rescue(
+        monkeypatch,
+        _rescue_main_result(),
+        [_anomalous_rescue_result(), _anomalous_rescue_result()],
+    )
+
+    result = transcribe.transcribe(str(_make_input(tmp_path)), lang="ja")
+
+    assert len(calls) == 3
+    unrecognized = result["data"]["segments"][1]
+    assert unrecognized["kind"] == "unrecognized"
+    assert (unrecognized["source_start"], unrecognized["source_end"]) == (
+        1.0,
+        13.0,
+    )
+    rescue_range = result["hallucination_ranges"][0]
+    assert rescue_range["attempts"] == ["verbatim", "safe"]
+    assert rescue_range["status"] == "unrecognized"
+
+
+def test_long_rescue_window_is_split_into_90_second_chunks(
+    tmp_path, monkeypatch
+):
+    calls = []
+    slices = []
+    clips = []
+
+    def fake_transcribe(path, **kwargs):
+        calls.append(kwargs)
+        return _clean_rescue_result(text=f"救出{len(calls)}", start=1.0, end=2.0)
+
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = fake_transcribe
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    plan_calls = []
+    real_plan_chunks = transcribe.plan_chunks
+
+    def spy_plan_chunks(duration, silences, target, tol):
+        plan_calls.append((duration, silences, target, tol))
+        return real_plan_chunks(duration, silences, target=target, tol=tol)
+
+    monkeypatch.setattr(transcribe, "plan_chunks", spy_plan_chunks)
+
+    def fake_slice(src, start, end):
+        slices.append((start, end))
+        clip = tmp_path / f"rescue-{len(slices)}.wav"
+        clip.write_bytes(b"clip")
+        clips.append(clip)
+        return str(clip)
+
+    monkeypatch.setattr(transcribe, "_slice_wav", fake_slice)
+
+    segments = transcribe._rescue_transcribe(
+        "source.wav", 0.0, 200.0, "model", "ja", verbatim=True
+    )
+
+    assert len(calls) == 3
+    assert slices == [(0.0, 90.0), (90.0, 180.0), (180.0, 200.0)]
+    assert all(end - start <= 90.0 for start, end in slices)
+    assert plan_calls
+    assert all(call[2:] == (90.0, 15.0) for call in plan_calls)
+    starts = [seg["words"][0]["start"] for seg in segments]
+    assert starts == [1.0, 91.0, 181.0]
+    assert all(a < b for a, b in zip(starts, starts[1:]))
+    assert all(
+        kwargs["initial_prompt"] == transcribe.FILLER_PROMPT
+        for kwargs in calls
+    )
+    assert all(not clip.exists() for clip in clips)
+
+
+def test_long_rescue_prefers_valid_silence_before_90_second_limit(
+    tmp_path, monkeypatch
+):
+    slices = []
+
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda path, **kwargs: _clean_rescue_result()
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(
+        transcribe,
+        "_detect_silence",
+        lambda p, **k: (
+            "silence_start: 84.5\nsilence_end: 85.5\n"
+            "silence_start: 97.0\nsilence_end: 101.0\n"
+        ),
+    )
+
+    def fake_slice(src, start, end):
+        slices.append((start, end))
+        return str(tmp_path / "missing-clip.wav")
+
+    monkeypatch.setattr(transcribe, "_slice_wav", fake_slice)
+
+    transcribe._rescue_transcribe(
+        "source.wav", 0.0, 200.0, "model", "ja", verbatim=True
+    )
+
+    assert slices[0] == (0.0, 85.0)
+
+
+def test_verbatim_rescue_rejects_all_subchunks_when_one_is_anomalous(
+    tmp_path, monkeypatch
+):
+    results = [
+        _clean_rescue_result("前救出"),
+        _anomalous_rescue_result(),
+        _clean_rescue_result("後救出"),
+    ]
+
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda path, **kwargs: results.pop(0)
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(
+        transcribe,
+        "_slice_wav",
+        lambda src, start, end: str(tmp_path / "missing-clip.wav"),
+    )
+
+    assert transcribe._rescue_transcribe(
+        "source.wav", 0.0, 200.0, "model", "ja", verbatim=True
+    ) == []
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_rescue_clip_is_deleted_on_success_and_exception(
+    tmp_path, monkeypatch, raises
+):
+    clip = tmp_path / "rescue-clip.wav"
+
+    def fake_transcribe(path, **kwargs):
+        if raises:
+            raise RuntimeError("decode failed")
+        return _clean_rescue_result()
+
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = fake_transcribe
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+
+    def fake_slice(src, start, end):
+        clip.write_bytes(b"clip")
+        return str(clip)
+
+    monkeypatch.setattr(transcribe, "_slice_wav", fake_slice)
+
+    if raises:
+        with pytest.raises(RuntimeError, match="decode failed"):
+            transcribe._rescue_transcribe(
+                "source.wav", 0.0, 20.0, "model", "ja", verbatim=True
+            )
+    else:
+        transcribe._rescue_transcribe(
+            "source.wav", 0.0, 20.0, "model", "ja", verbatim=True
+        )
+    assert not clip.exists()
 
 
 def test_transcribe_rescue_success_inserts_and_offsets(tmp_path, monkeypatch):
@@ -1502,10 +1752,10 @@ def test_transcribe_rescue_success_inserts_and_offsets(tmp_path, monkeypatch):
 
     # whisper は本認識＋レスキューで2回呼ばれる
     assert len(calls) == 2
-    # レスキュー呼び出しは安全設定（condT False・プロンプトなし）
+    # 1段目のレスキューはfresh-context verbatim設定
     rescue_kw = calls[1]["kwargs"]
-    assert rescue_kw["condition_on_previous_text"] is False
-    assert "initial_prompt" not in rescue_kw
+    assert rescue_kw["condition_on_previous_text"] is True
+    assert rescue_kw["initial_prompt"] == transcribe.FILLER_PROMPT
 
     # メタ: rescued=True・セグメント数
     rng = res["hallucination_ranges"][0]
