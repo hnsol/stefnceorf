@@ -722,17 +722,27 @@ def render(
     file_length_s = total_samples / samplerate if samplerate else 0.0
 
     # 各セグメントのマージンクランプ境界を、ソース時間軸（json の並び順）で
-    # 隣接する前後セグメントの単語境界から算出する。これにより、あるセグメント
+    # 隣接する前後セグメントの音声境界から算出する。これにより、あるセグメント
     # 先頭/末尾のマージンが、ソース上で隣り合う別セグメントの単語音声へ食い込む
     # のを防ぐ（設計§8「隣接カット区間に食い込まない範囲で」）。
-    # words が空のセグメントは隣接判定から除外する。
-    ordered = [s for s in segments if (s.get("words") or [])]
+    # 未認識セグメントは words が空でも source_start/source_end を境界に使い、
+    # 前後 speech のマージンが未認識音声へ重ならないようにする。
+    ordered: list[tuple[dict, float, float]] = []
+    for seg in segments:
+        words = seg.get("words", []) or []
+        if seg.get("kind") == "unrecognized":
+            start = float(seg["source_start"])
+            end = float(seg["source_end"])
+        elif words:
+            start = float(words[0]["start"])
+            end = float(words[-1]["end"])
+        else:
+            continue
+        ordered.append((seg, start, end))
     seg_bounds: dict[str, tuple[float, float]] = {}
-    for k, seg in enumerate(ordered):
-        prev_words = ordered[k - 1].get("words") if k > 0 else None
-        next_words = ordered[k + 1].get("words") if k + 1 < len(ordered) else None
-        lo_b = float(prev_words[-1]["end"]) if prev_words else 0.0
-        hi_b = float(next_words[0]["start"]) if next_words else file_length_s
+    for k, (seg, _start, _end) in enumerate(ordered):
+        lo_b = ordered[k - 1][2] if k > 0 else 0.0
+        hi_b = ordered[k + 1][1] if k + 1 < len(ordered) else file_length_s
         seg_bounds[seg["id"]] = (lo_b, hi_b)
 
     # 発話レベル（全単語中央時刻 RMS の中央値）から相対 RMS 閾値を決める。
@@ -762,6 +772,12 @@ def render(
         seg = seg_map.get(seg_id)
         if seg is None:
             raise ValueError(f"json に存在しない ID です: [{seg_id}]")
+        if seg.get("kind") == "unrecognized":
+            start = float(seg["source_start"])
+            end = float(seg["source_end"])
+            if end > start:
+                plan_intervals.append((start, end))
+            continue
         # words は json 由来の共有 dict。谷スナップで start/end を書き換えるため
         # 要素ごとにコピーして他所（後段の word_spans 構築等）への副作用を防ぐ。
         words = [dict(w) for w in (seg.get("words", []) or [])]
@@ -839,22 +855,28 @@ def render(
         )
         plan_intervals.extend(intervals)
 
-    # 全セグメントの単語区間（ソース時刻・生値）。ギャップに削除単語が挟まるかの
-    # 判定に使う。安全カットしたフィラーは除外する（さもないと分岐2が先に発火して
-    # フィラーポーズ分岐に到達しない）。除外はスナップで値が変わるため (seg_id, wi)
-    # キーで行う。
-    word_spans: list[tuple[float, float]] = []
+    # 全セグメントのコンテンツ区間（ソース時刻・生値）。未認識行が削除された場合も
+    # source span を含め、純無音ギャップとして音声が復活しないようにする。安全カット
+    # したフィラーは除外する（さもないと分岐2が先に発火してフィラーポーズ分岐に
+    # 到達しない）。除外はスナップで値が変わるため (seg_id, wi) キーで行う。
+    content_spans: list[tuple[float, float]] = []
     for seg in segments:
+        if seg.get("kind") == "unrecognized":
+            start = float(seg["source_start"])
+            end = float(seg["source_end"])
+            if end > start:
+                content_spans.append((start, end))
+            continue
         sid = seg.get("id")
         for wi, w in enumerate(seg.get("words", []) or []):
             if (sid, wi) in safe_filler_keys:
                 continue
             s, e = w.get("start"), w.get("end")
             if s is not None and e is not None:
-                word_spans.append((float(s), float(e)))
+                content_spans.append((float(s), float(e)))
 
     out_intervals, cf_flags = plan_output_intervals(
-        plan_intervals, word_spans, gap_threshold=gap_threshold, gap_max=gap_max,
+        plan_intervals, content_spans, gap_threshold=gap_threshold, gap_max=gap_max,
         filler_spans=filler_cut_spans,
     )
 

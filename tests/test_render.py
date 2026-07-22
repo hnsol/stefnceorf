@@ -805,6 +805,103 @@ def _make_project(tmp_path, sr=16000):
     return wav
 
 
+def _render_freq_sequence(audio, sr, known, win=0.05, tol=40.0, amp=1e-3):
+    """FFT窓で支配周波数を求め、連続重複を畳んだ出現順を返す。"""
+    if audio.ndim == 2:
+        audio = audio.mean(axis=1)
+    n = int(win * sr)
+    seq = []
+    for i in range(0, len(audio) - n + 1, n):
+        chunk = audio[i:i + n]
+        if np.max(np.abs(chunk)) < amp:
+            continue
+        spec = np.abs(np.fft.rfft(chunk))
+        freqs = np.fft.rfftfreq(len(chunk), 1.0 / sr)
+        spec[0] = 0.0
+        freq = freqs[int(np.argmax(spec))]
+        snapped = min(known, key=lambda k: abs(k - freq))
+        if abs(snapped - freq) > tol:
+            continue
+        if not seq or seq[-1] != snapped:
+            seq.append(snapped)
+    return seq
+
+
+def _render_unrecognized_freqs(tmp_path, txt_body, sr=16000):
+    import soundfile as sf
+
+    tones = []
+    for freq in (200, 400, 600):
+        t = np.arange(sr) / sr
+        tones.append(0.3 * np.sin(2 * np.pi * freq * t))
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), np.concatenate(tones), sr, subtype="PCM_16")
+    data = {
+        "source_wav": str(wav.resolve()),
+        "language": "ja",
+        "model": "test",
+        "segments": [
+            {
+                "id": "0001",
+                "text": "前",
+                "words": [
+                    {"word": "前", "start": 0.0, "end": 1.0,
+                     "probability": 0.9},
+                ],
+            },
+            {
+                "id": "0002",
+                "text": "⚠ 未認識区間",
+                "words": [],
+                "kind": "unrecognized",
+                "source_start": 1.0,
+                "source_end": 2.0,
+            },
+            {
+                "id": "0003",
+                "text": "後",
+                "words": [
+                    {"word": "後", "start": 2.0, "end": 3.0,
+                     "probability": 0.9},
+                ],
+            },
+        ],
+    }
+    (tmp_path / "input.sc.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text(txt_body, encoding="utf-8")
+
+    out = render.render(str(txt))
+    audio, out_sr = sf.read(out)
+    return _render_freq_sequence(audio, out_sr, [200, 400, 600])
+
+
+def test_render_unrecognized_line_present_keeps_audio(tmp_path):
+    assert _render_unrecognized_freqs(
+        tmp_path, "[0001] 前\n[0002] ⚠ 未認識区間\n[0003] 後\n"
+    ) == [200, 400, 600]
+
+
+def test_render_unrecognized_line_deleted_removes_audio(tmp_path):
+    assert _render_unrecognized_freqs(
+        tmp_path, "[0001] 前\n[0003] 後\n"
+    ) == [200, 600]
+
+
+def test_render_unrecognized_line_reordered_moves_audio(tmp_path):
+    assert _render_unrecognized_freqs(
+        tmp_path, "[0002] ⚠ 未認識区間\n[0001] 前\n[0003] 後\n"
+    ) == [400, 200, 600]
+
+
+def test_render_unrecognized_edited_label_still_keeps_audio(tmp_path):
+    assert _render_unrecognized_freqs(
+        tmp_path, "[0001] 前\n[0002] 聞き直し済み\n[0003] 後\n"
+    ) == [200, 400, 600]
+
+
 def test_render_end_to_end_no_edit(tmp_path):
     import soundfile as sf
 

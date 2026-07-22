@@ -117,9 +117,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
             if failed:
                 print(
-                    "警告: 幻覚疑いのセグメントを除去しました。以下の区間は"
-                    "再認識でも復旧できず render で音声が削除されるため、必要なら"
-                    "聞き直してください:",
+                    "警告: 再認識できない区間を「未認識区間」として保持しました。"
+                    "聞き直し、不要ならTXTの該当行を削除してください:",
                     file=sys.stderr,
                 )
                 for r in failed:

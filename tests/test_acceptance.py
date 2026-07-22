@@ -94,6 +94,56 @@ def _build_project(tmp_path, segments, sr=SR, subtype="PCM_16", blocks=None,
     return wav, "\n".join(default_lines) + "\n"
 
 
+def _build_unrecognized_project(tmp_path, unrecognized_dur=2.0):
+    """前後speech間に長尺の未認識有声音を持つ合成projectを作る。"""
+    durations = (1.0, unrecognized_dur, 1.0)
+    freqs = (200.0, 400.0, 600.0)
+    parts = []
+    for duration, freq in zip(durations, freqs):
+        t = np.arange(int(round(duration * SR))) / SR
+        parts.append(0.3 * np.sin(2 * np.pi * freq * t))
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), np.concatenate(parts), SR, subtype="PCM_16")
+
+    unrecognized_end = 1.0 + unrecognized_dur
+    data = {
+        "source_wav": str(wav.resolve()),
+        "language": "ja",
+        "model": "test",
+        "segments": [
+            {
+                "id": "0001",
+                "text": "前",
+                "words": [
+                    {"word": "前", "start": 0.0, "end": 1.0,
+                     "probability": 0.9},
+                ],
+            },
+            {
+                "id": "0002",
+                "text": "⚠ 未認識区間",
+                "words": [],
+                "kind": "unrecognized",
+                "source_start": 1.0,
+                "source_end": unrecognized_end,
+            },
+            {
+                "id": "0003",
+                "text": "後",
+                "words": [
+                    {"word": "後", "start": unrecognized_end,
+                     "end": unrecognized_end + 1.0, "probability": 0.9},
+                ],
+            },
+        ],
+    }
+    (tmp_path / "input.sc.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+    txt = tmp_path / "input.sc.txt"
+    return wav, txt
+
+
 # ---- 周波数解析ヘルパ -----------------------------------------------------
 
 def _dominant_freq(chunk, sr):
@@ -127,6 +177,62 @@ def _freq_sequence(audio, sr, known, win=0.05, tol=40.0, amp=1e-3):
 
 def _present_freqs(audio, sr, known):
     return set(_freq_sequence(audio, sr, known))
+
+
+# ==========================================================================
+# 未認識区間: 明示行で元サンプル全体を保持し、削除行では復活させない
+# ==========================================================================
+
+def test_unrecognized_roundtrip_preserves_long_source_samples_without_overlap(tmp_path):
+    wav, txt = _build_unrecognized_project(tmp_path, unrecognized_dur=2.0)
+    txt.write_text(
+        "[0001] 前\n[0002] ⚠ 未認識区間\n[0003] 後\n", encoding="utf-8"
+    )
+    source, source_sr = sf.read(wav)
+
+    out = render.render(str(txt), gap_threshold=1.5, gap_max=0.3)
+    audio, out_sr = sf.read(out)
+
+    assert out_sr == source_sr
+    assert len(audio) == len(source)
+    assert np.array_equal(audio, source)
+    assert _freq_sequence(audio, out_sr, [200, 400, 600]) == [200, 400, 600]
+
+
+def test_unrecognized_deleted_line_is_not_restored_as_pure_silence(tmp_path):
+    _, txt = _build_unrecognized_project(tmp_path, unrecognized_dur=2.0)
+    txt.write_text("[0001] 前\n[0003] 後\n", encoding="utf-8")
+
+    out = render.render(str(txt), gap_threshold=1.5, gap_max=0.3)
+    audio, sr = sf.read(out)
+
+    assert _freq_sequence(audio, sr, [200, 400, 600]) == [200, 600]
+    assert len(audio) <= 2 * sr
+
+
+def test_unrecognized_cli_warning_explains_explicit_txt_deletion(monkeypatch, capsys):
+    from stefnceorf import cli, transcribe
+
+    monkeypatch.setattr(
+        transcribe,
+        "transcribe",
+        lambda *args, **kwargs: {
+            "txt_path": "input.sc.txt",
+            "json_path": "input.sc.json",
+            "hallucination_ranges": [
+                {"start": 1.0, "end": 3.0, "rescued": False, "sample": "?"},
+            ],
+            "silence_cut_count": 0,
+            "filler_count": 0,
+        },
+    )
+
+    assert cli.main(["transcribe", "input.wav"]) == 0
+    err = capsys.readouterr().err
+    assert (
+        "警告: 再認識できない区間を「未認識区間」として保持しました。"
+        "聞き直し、不要ならTXTの該当行を削除してください:"
+    ) in err
 
 
 # ==========================================================================
