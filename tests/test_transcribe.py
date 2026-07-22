@@ -1500,6 +1500,28 @@ def _anomalous_rescue_result():
     }
 
 
+def _echo_rescue_result(suffix):
+    common = ["共甲", "共乙", "共丙", "共丁", "共戊", "共己", "共庚", "共辛"]
+    tokens = common + [f"末{suffix}", f"尾{suffix}"]
+    return {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "".join(tokens),
+                "words": [
+                    {
+                        "word": token,
+                        "start": i * 0.1,
+                        "end": i * 0.1 + 0.09,
+                        "probability": 0.9,
+                    }
+                    for i, token in enumerate(tokens)
+                ],
+            }
+        ],
+    }
+
+
 def test_rescue_uses_verbatim_first_and_accepts_clean_result(
     tmp_path, monkeypatch
 ):
@@ -1543,6 +1565,94 @@ def test_rescue_falls_back_to_safe_mode_after_verbatim_anomaly(
     rescue_range = result["hallucination_ranges"][0]
     assert rescue_range["attempts"] == ["verbatim", "safe"]
     assert rescue_range["status"] == "rescued"
+
+
+@pytest.mark.parametrize(
+    "verbatim_results",
+    [
+        [_clean_rescue_result("境界反復") for _ in range(3)],
+        [
+            _echo_rescue_result("一"),
+            _echo_rescue_result("二"),
+            _clean_rescue_result("別内容"),
+        ],
+    ],
+    ids=["three-identical-segments", "cross-chunk-echo"],
+)
+def test_rescue_falls_back_when_combined_verbatim_chunks_are_anomalous(
+    tmp_path, monkeypatch, verbatim_results
+):
+    main_result = _rescue_main_result()
+    main_result["segments"][2]["words"][0].update(start=201.0, end=202.0)
+    assert all(
+        transcribe._valid_rescue(result["segments"])
+        for result in verbatim_results
+    )
+    calls = _setup_rescue(
+        monkeypatch,
+        main_result,
+        [*verbatim_results, _clean_rescue_result("安全復旧")],
+    )
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 220.0)
+
+    result = transcribe.transcribe(str(_make_input(tmp_path)), lang="ja")
+
+    assert len(calls) == 5
+    assert all(
+        call["kwargs"]["condition_on_previous_text"] is True
+        for call in calls[1:4]
+    )
+    assert calls[4]["kwargs"]["condition_on_previous_text"] is False
+    rescue_range = result["hallucination_ranges"][0]
+    assert rescue_range["attempts"] == ["verbatim", "safe"]
+    assert rescue_range["status"] == "rescued"
+
+
+@pytest.mark.parametrize(
+    "invalid_result",
+    [
+        None,
+        ["not-a-result-dict"],
+        {
+            "segments": [
+                {
+                    "text": 123,
+                    "words": [
+                        {"word": "救出", "start": 0.5, "end": 1.5}
+                    ],
+                }
+            ]
+        },
+        {
+            "segments": [
+                {
+                    "text": "救出",
+                    "words": [
+                        {"word": 123, "start": 0.5, "end": 1.5}
+                    ],
+                }
+            ]
+        },
+    ],
+    ids=["result-none", "result-list", "text-non-string", "word-non-string"],
+)
+def test_invalid_rescue_result_shape_falls_back_then_stays_unrecognized(
+    tmp_path, monkeypatch, invalid_result
+):
+    calls = _setup_rescue(
+        monkeypatch,
+        _rescue_main_result(),
+        [invalid_result, invalid_result],
+    )
+
+    result = transcribe.transcribe(str(_make_input(tmp_path)), lang="ja")
+
+    assert len(calls) == 3
+    unrecognized = result["data"]["segments"][1]
+    assert unrecognized["kind"] == "unrecognized"
+    rescue_range = result["hallucination_ranges"][0]
+    assert rescue_range["attempts"] == ["verbatim", "safe"]
+    assert rescue_range["status"] == "unrecognized"
 
 
 def test_rescue_failure_returns_unrecognized_segment(tmp_path, monkeypatch):

@@ -751,12 +751,16 @@ def _rescue_transcribe(
             except OSError:
                 pass
 
-        rsegs = result.get("segments", []) or []
+        if not isinstance(result, dict):
+            return []
+        rsegs = result.get("segments")
         if not isinstance(rsegs, list):
             return []
         local_validated: list[dict] = []
         for seg in rsegs:
             if not isinstance(seg, dict):
+                return []
+            if not isinstance(seg.get("text"), str):
                 return []
             raw_words = seg.get("words") or []
             if not isinstance(raw_words, list) or not raw_words:
@@ -764,6 +768,8 @@ def _rescue_transcribe(
             words: list[dict] = []
             for word in raw_words:
                 if not isinstance(word, dict):
+                    return []
+                if not isinstance(word.get("word"), str):
                     return []
                 word_start = word.get("start")
                 word_end = word.get("end")
@@ -829,7 +835,10 @@ def _rescue_transcribe(
             if last_end is not None and word["start"] < last_end:
                 return []
             last_end = word["end"]
-    return [seg for _, _, seg in normalized]
+    combined = [seg for _, _, seg in normalized]
+    if not _valid_rescue(combined):
+        return []
+    return combined
 
 
 def _detect_silence(wav_path: str, d: float = SILENCE_MIN_S) -> str:
