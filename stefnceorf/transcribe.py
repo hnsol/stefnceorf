@@ -870,16 +870,9 @@ def transcribe(
             ) -> list[dict]:
                 if not group:
                     return []
-                # 除去単語時刻（元音源時刻）と先頭サンプルを収集
-                starts: list[float] = []
-                ends: list[float] = []
+                # 表示用の先頭サンプルを収集
                 sample = ""
                 for gseg in group:
-                    for w in gseg.get("words") or []:
-                        if w.get("start") is not None:
-                            starts.append(rec_to_src(float(w["start"]), cuts))
-                        if w.get("end") is not None:
-                            ends.append(rec_to_src(float(w["end"]), cuts))
                     if not sample:
                         sample = (gseg.get("text") or "").strip()[:20]
 
@@ -898,19 +891,9 @@ def transcribe(
                         recog_wav, win[0], win[1], model, lang
                     )
 
-                # 報告時刻: 除去単語時刻を優先し、無ければ窓境界を逆写像する
-                if starts:
-                    rng_start: float | None = min(starts)
-                elif win is not None:
-                    rng_start = rec_to_src(win[0], cuts)
-                else:
-                    rng_start = None
-                if ends:
-                    rng_end: float | None = max(ends)
-                elif win is not None:
-                    rng_end = rec_to_src(win[1], cuts)
-                else:
-                    rng_end = None
+                # 診断範囲は、JSONで音声を保持する窓境界と一致させる。
+                rng_start = rec_to_src(gap_start, cuts)
+                rng_end = rec_to_src(gap_end, cuts)
 
                 halluc_ranges.append(
                     {
@@ -921,17 +904,35 @@ def transcribe(
                         "rescued_segments": len(rescued_segs),
                     }
                 )
-                if rescued_segs:
-                    return rescued_segs
-                return [
-                    {
+                def _unrecognized(start: float, end: float) -> dict:
+                    return {
                         "kind": "unrecognized",
-                        "source_start": rec_to_src(gap_start, cuts),
-                        "source_end": rec_to_src(gap_end, cuts),
+                        "source_start": rec_to_src(start, cuts),
+                        "source_end": rec_to_src(end, cuts),
                         "text": sample,
                         "words": [],
                     }
-                ]
+
+                if not rescued_segs:
+                    return [_unrecognized(gap_start, gap_end)]
+
+                covered: list[dict] = []
+                cursor = gap_start
+                for rescued in rescued_segs:
+                    seg_start = _seg_first_start(rescued)
+                    seg_end = _seg_last_end(rescued)
+                    if seg_start is None or seg_end is None:
+                        covered.append(rescued)
+                        continue
+                    seg_start = min(max(seg_start, gap_start), gap_end)
+                    seg_end = min(max(seg_end, seg_start), gap_end)
+                    if seg_start > cursor:
+                        covered.append(_unrecognized(cursor, seg_start))
+                    covered.append(rescued)
+                    cursor = max(cursor, seg_end)
+                if gap_end > cursor:
+                    covered.append(_unrecognized(cursor, gap_end))
+                return covered
 
             for seg in raw_segments:
                 if id(seg) in dropped_ids:

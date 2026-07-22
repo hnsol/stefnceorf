@@ -1236,7 +1236,7 @@ def _setup_rescue(monkeypatch, main_result, rescue_result):
 
 
 def test_transcribe_rescue_success_inserts_and_offsets(tmp_path, monkeypatch):
-    """幻覚区間を再認識で復旧し、正しい位置に挿入・窓オフセット加算する。"""
+    """疎な正常レスキューを残し、前後の未被覆音声も保持する。"""
     rescue_result = {
         "language": "ja",
         "segments": [
@@ -1254,14 +1254,30 @@ def test_transcribe_rescue_success_inserts_and_offsets(tmp_path, monkeypatch):
     res = transcribe.transcribe(str(wav), lang="ja")
     data = res["data"]
 
-    # 前 / 救出 / 後 の3セグメントに復旧
-    assert [s["text"] for s in data["segments"]] == ["前", "救出テキスト", "後"]
-    assert [s["id"] for s in data["segments"]] == ["0001", "0002", "0003"]
+    assert [s.get("kind", "speech") for s in data["segments"]] == [
+        "speech", "unrecognized", "speech", "unrecognized", "speech"
+    ]
+    assert [s["id"] for s in data["segments"]] == [
+        "0001", "0002", "0003", "0004", "0005"
+    ]
+    assert data["segments"][1]["source_start"] == pytest.approx(1.0)
+    assert data["segments"][1]["source_end"] == pytest.approx(1.5)
+    assert data["segments"][1]["words"] == []
+    assert data["segments"][3]["source_start"] == pytest.approx(2.5)
+    assert data["segments"][3]["source_end"] == pytest.approx(13.0)
+    assert data["segments"][3]["words"] == []
 
     # 窓 = 前末尾 end 1.0 〜 後先頭 start 13.0。救出単語 start0.5 に +1.0
-    resc = data["segments"][1]["words"][0]
+    resc = data["segments"][2]["words"][0]
     assert resc["start"] == pytest.approx(1.5)
     assert resc["end"] == pytest.approx(2.5)
+    assert (tmp_path / "input.sc.txt").read_text().splitlines() == [
+        "[0001 0:00] 前",
+        "[0002 0:01] ⚠ 未認識区間 0.5秒（音声保持）",
+        "[0003 0:01] 救出",
+        "[0004 0:02] ⚠ 未認識区間 10.5秒（音声保持）",
+        "[0005 0:13] 後",
+    ]
 
     # whisper は本認識＋レスキューで2回呼ばれる
     assert len(calls) == 2
@@ -1274,6 +1290,134 @@ def test_transcribe_rescue_success_inserts_and_offsets(tmp_path, monkeypatch):
     rng = res["hallucination_ranges"][0]
     assert rng["rescued"] is True
     assert rng["rescued_segments"] == 1
+
+
+def test_transcribe_short_untimed_gap_is_preserved_and_reported(
+    tmp_path, monkeypatch
+):
+    """短窓で再認識しなくても、時刻なし除去segmentの保持範囲を記録する。"""
+    main_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "前",
+                "words": [
+                    {"word": "前", "start": 4.0, "end": 5.0, "probability": 0.9},
+                ],
+            },
+            {"text": "", "words": []},
+            {
+                "text": "後",
+                "words": [
+                    {"word": "後", "start": 5.3, "end": 6.0, "probability": 0.9},
+                ],
+            },
+        ],
+    }
+    calls = _setup_rescue(monkeypatch, main_result, {"segments": []})
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja")
+    u = res["data"]["segments"][1]
+
+    assert len(calls) == 1
+    assert u["kind"] == "unrecognized"
+    assert (u["source_start"], u["source_end"]) == pytest.approx((5.0, 5.3))
+    assert res["hallucination_ranges"][0]["start"] == pytest.approx(5.0)
+    assert res["hallucination_ranges"][0]["end"] == pytest.approx(5.3)
+
+
+def test_transcribe_leading_and_trailing_gaps_cover_file_edges(
+    tmp_path, monkeypatch
+):
+    """先頭・末尾のレスキュー失敗は保持窓をファイル端まで広げる。"""
+    hallucination = {
+        "text": "今、" * 10,
+        "words": [
+            {
+                "word": "今、",
+                "start": 1.0 + i * 0.1,
+                "end": 1.05 + i * 0.1,
+                "probability": 0.9,
+            }
+            for i in range(10)
+        ],
+    }
+    main_result = {
+        "language": "ja",
+        "segments": [
+            hallucination,
+            {
+                "text": "中",
+                "words": [
+                    {"word": "中", "start": 8.0, "end": 9.0, "probability": 0.9},
+                ],
+            },
+            {
+                **hallucination,
+                "words": [
+                    {**word, "start": word["start"] + 9.0, "end": word["end"] + 9.0}
+                    for word in hallucination["words"]
+                ],
+            },
+        ],
+    }
+    _setup_rescue(monkeypatch, main_result, {"segments": []})
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja")
+    segments = res["data"]["segments"]
+
+    assert [s.get("kind", "speech") for s in segments] == [
+        "unrecognized", "speech", "unrecognized"
+    ]
+    assert (segments[0]["source_start"], segments[0]["source_end"]) == (0.0, 8.0)
+    assert (segments[2]["source_start"], segments[2]["source_end"]) == (9.0, 20.0)
+    assert [
+        (r["start"], r["end"]) for r in res["hallucination_ranges"]
+    ] == [(0.0, 8.0), (9.0, 20.0)]
+
+
+def test_transcribe_sparse_rescue_gaps_are_remapped_once_with_cuts(
+    tmp_path, monkeypatch
+):
+    """未被覆gapは元音源時刻へ1回だけ変換し、最終出力で再変換しない。"""
+    main_result = _rescue_main_result()
+    main_result["segments"][2]["words"][0].update(start=7.0, end=8.0)
+    rescue_result = {
+        "language": "ja",
+        "segments": [
+            {
+                "text": "救出テキスト",
+                "words": [
+                    {"word": "救出", "start": 2.0, "end": 3.0, "probability": 0.9},
+                ],
+            },
+        ],
+    }
+    _setup_rescue(monkeypatch, main_result, rescue_result)
+    monkeypatch.setattr(
+        transcribe,
+        "_detect_silence",
+        lambda p, **k: "silence_start: 2.0\nsilence_end: 5.0\n",
+    )
+    monkeypatch.setattr(
+        transcribe, "_write_trimmed_wav", lambda path, cuts: (path, 2.3)
+    )
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 10.0)
+
+    wav = _make_input(tmp_path)
+    segments = transcribe.transcribe(str(wav), lang="ja")["data"]["segments"]
+
+    assert (segments[1]["source_start"], segments[1]["source_end"]) == pytest.approx(
+        (1.0, 5.3)
+    )
+    assert (segments[2]["words"][0]["start"], segments[2]["words"][0]["end"]) == pytest.approx(
+        (5.3, 6.3)
+    )
+    assert (segments[3]["source_start"], segments[3]["source_end"]) == pytest.approx(
+        (6.3, 9.3)
+    )
 
 
 def test_transcribe_rescue_fallback_when_partly_hallucinated(
