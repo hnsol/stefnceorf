@@ -384,6 +384,116 @@ def _finalize_segment_words(
     return clamp_words_to_silences(words, silences)
 
 
+def _merge_time_spans(
+    spans: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """有効な時刻区間を和集合へ正規化する（純関数）。"""
+    merged: list[list[float]] = []
+    for start, end in sorted(
+        (float(start), float(end))
+        for start, end in spans
+        if float(end) > float(start)
+    ):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def _span_fully_covered(
+    start: float,
+    end: float,
+    spans: list[tuple[float, float]],
+) -> bool:
+    """[start, end] が区間和集合で完全被覆されるときだけ True。"""
+    if end <= start:
+        return True
+    cursor = start
+    for span_start, span_end in _merge_time_spans(spans):
+        if span_end <= cursor:
+            continue
+        if span_start > cursor:
+            return False
+        cursor = max(cursor, span_end)
+        if cursor >= end:
+            return True
+    return False
+
+
+def _preserve_unrecognized_gaps(
+    segments: list[dict],
+    cuts: list[tuple[float, float]],
+    silences: list[tuple[float, float]],
+    source_duration: float,
+    known_silences: list[tuple[float, float]] | None = None,
+) -> list[dict]:
+    """主認識に無い非無音区間を未認識行として保持する（純関数）。
+
+    speech は最終JSONと同じ元音源時刻へ変換した単語範囲、unrecognized は
+    source_start/source_end を被覆範囲とする。中間gapは SILENCE_MIN_S より長い
+    場合、先頭・末尾gapは長さを問わず、検出済み無音で完全被覆されない限り
+    全体を unrecognized として追加する。部分的な無音被覆は安全側で全体保持する。
+    """
+    duration = max(0.0, float(source_duration))
+    known = silences if known_silences is None else known_silences
+    coverage: list[tuple[float, float]] = []
+    positioned: list[tuple[float, int, dict]] = []
+
+    for index, seg in enumerate(segments):
+        if seg.get("kind") == "unrecognized":
+            start = float(seg.get("source_start", 0.0))
+            end = float(seg.get("source_end", start))
+        else:
+            words = _finalize_segment_words(seg, cuts, silences)
+            timed = [
+                (float(word["start"]), float(word["end"]))
+                for word in words
+                if word.get("start") is not None
+                and word.get("end") is not None
+            ]
+            if not timed:
+                positioned.append((float("inf"), index, seg))
+                continue
+            start = min(span[0] for span in timed)
+            end = max(span[1] for span in timed)
+
+        start = min(max(start, 0.0), duration)
+        end = min(max(end, start), duration)
+        positioned.append((start, index, seg))
+        if end > start:
+            coverage.append((start, end))
+
+    added: list[dict] = []
+    merged_coverage = _merge_time_spans(coverage)
+    cursor = 0.0
+
+    def _add_gap(start: float, end: float, edge: bool) -> None:
+        if end <= start or _span_fully_covered(start, end, known):
+            return
+        if not edge and end - start <= SILENCE_MIN_S:
+            return
+        added.append(
+            {
+                "kind": "unrecognized",
+                "source_start": start,
+                "source_end": end,
+                "text": "",
+                "words": [],
+            }
+        )
+
+    for start, end in merged_coverage:
+        _add_gap(cursor, start, edge=(cursor == 0.0))
+        cursor = max(cursor, end)
+    _add_gap(cursor, duration, edge=True)
+
+    for offset, seg in enumerate(added, start=len(segments)):
+        positioned.append((float(seg["source_start"]), offset, seg))
+    positioned.sort(key=lambda item: (item[0], item[1]))
+    return [seg for _, _, seg in positioned]
+
+
 def assign_blocks(
     words: list[dict],
     silences: list[tuple[float, float]],
@@ -787,8 +897,8 @@ def _rescue_transcribe(
                     or not math.isfinite(word_end)
                 ):
                     return []
-                word_start = min(max(word_start, 0.0), clip_duration)
-                word_end = min(max(word_end, 0.0), clip_duration)
+                if word_start < 0.0 or word_end > clip_duration:
+                    return []
                 if (
                     word_end <= word_start
                     or (
@@ -1075,8 +1185,10 @@ def transcribe(
     halluc_ranges: list[dict] = []
     dropped_count = 0
     try:
+        recog_wav_duration = _wav_duration(recog_wav)
+        source_wav_end = rec_to_src(recog_wav_duration, cuts)
         if verbatim:
-            wav_duration = _wav_duration(recog_wav)
+            wav_duration = recog_wav_duration
             chunk_silences = parse_silence_periods(
                 _detect_silence(recog_wav, d=0.5)
             )
@@ -1121,8 +1233,7 @@ def transcribe(
         # 差し替える。連続する除去を1範囲にまとめ、元音源時刻で報告する。
         if dropped_segments:
             dropped_ids = {id(s) for s in dropped_segments}
-            wav_dur = _wav_duration(recog_wav)
-            source_wav_end = rec_to_src(wav_dur, cuts)
+            wav_dur = recog_wav_duration
             final_segments: list[dict] = []
             group: list[dict] = []
             last_kept: dict | None = None
@@ -1261,6 +1372,16 @@ def transcribe(
     # --lang 未指定時は Whisper の自動判定言語で辞書を選択する
     fillers = fillers_mod.load_fillers(lang or result.get("language"))
 
+    # 主認識が発話を丸ごと落とした疎なgapも、削除候補にせず音声保持へ倒す。
+    # 検出済み無音で完全に説明できるgapだけは未認識行を追加しない。
+    kept_segments = _preserve_unrecognized_gaps(
+        kept_segments,
+        cuts,
+        periods,
+        source_wav_end,
+        known_silences=periods,
+    )
+
     segments_out = []
     lines: list[str] = []
     total_fillers = 0
@@ -1323,6 +1444,9 @@ def transcribe(
             "removed_s": round(removed_s, 3),
         },
         "silences": [[round(s, 3), round(e, 3)] for s, e in block_silences],
+        "trim_silences": [
+            [round(s, 3), round(e, 3)] for s, e in cut_periods
+        ],
         "segments": segments_out,
     }
     if dropped_count:

@@ -35,6 +35,137 @@ def test_plan_chunks_has_no_gap_or_overlap():
     assert all(a[1] == b[0] for a, b in zip(chunks, chunks[1:]))
 
 
+# ---- _preserve_unrecognized_gaps（主認識の疎な抜けを音声保持） ----
+
+def _speech_segment(start: float, end: float, text: str = "発話") -> dict:
+    return {
+        "text": text,
+        "words": [
+            {
+                "word": text,
+                "start": start,
+                "end": end,
+                "probability": 0.9,
+            }
+        ],
+    }
+
+
+def test_preserve_unrecognized_gap_without_known_silence():
+    segments = [_speech_segment(0.0, 1.0), _speech_segment(4.0, 5.0)]
+
+    out = transcribe._preserve_unrecognized_gaps(
+        segments, cuts=[], silences=[], source_duration=5.0
+    )
+
+    assert [seg.get("kind", "speech") for seg in out] == [
+        "speech", "unrecognized", "speech"
+    ]
+    assert (out[1]["source_start"], out[1]["source_end"]) == (1.0, 4.0)
+    assert segments == [_speech_segment(0.0, 1.0), _speech_segment(4.0, 5.0)]
+
+
+def test_preserve_gap_fully_covered_by_known_silence_does_not_add_marker():
+    segments = [_speech_segment(0.0, 1.0), _speech_segment(4.0, 5.0)]
+
+    out = transcribe._preserve_unrecognized_gaps(
+        segments, cuts=[], silences=[(1.0, 4.0)], source_duration=5.0
+    )
+
+    assert out == segments
+
+
+def test_preserve_gap_partly_covered_by_silence_keeps_whole_gap():
+    out = transcribe._preserve_unrecognized_gaps(
+        [_speech_segment(0.0, 1.0), _speech_segment(4.0, 5.0)],
+        cuts=[],
+        silences=[(1.0, 3.9)],
+        source_duration=5.0,
+    )
+
+    assert (out[1]["source_start"], out[1]["source_end"]) == (1.0, 4.0)
+
+
+def test_preserve_non_silence_file_edges_regardless_of_length():
+    out = transcribe._preserve_unrecognized_gaps(
+        [_speech_segment(0.2, 4.8)],
+        cuts=[],
+        silences=[],
+        source_duration=5.0,
+    )
+
+    assert [seg.get("kind", "speech") for seg in out] == [
+        "unrecognized", "speech", "unrecognized"
+    ]
+    assert (out[0]["source_start"], out[0]["source_end"]) == (0.0, 0.2)
+    assert (out[2]["source_start"], out[2]["source_end"]) == (4.8, 5.0)
+
+
+def test_preserve_gap_across_hard_chunk_boundary():
+    out = transcribe._preserve_unrecognized_gaps(
+        [_speech_segment(358.0, 359.0), _speech_segment(362.0, 363.0)],
+        cuts=[],
+        silences=[],
+        source_duration=363.0,
+    )
+
+    gaps = [seg for seg in out if seg.get("kind") == "unrecognized"]
+    assert [(seg["source_start"], seg["source_end"]) for seg in gaps] == [
+        (0.0, 358.0),
+        (359.0, 362.0),
+    ]
+
+
+def test_preserve_whole_source_when_recognition_is_empty():
+    out = transcribe._preserve_unrecognized_gaps(
+        [], cuts=[], silences=[], source_duration=10.0
+    )
+
+    assert out == [
+        {
+            "kind": "unrecognized",
+            "source_start": 0.0,
+            "source_end": 10.0,
+            "text": "",
+            "words": [],
+        }
+    ]
+
+
+def test_preserve_existing_unrecognized_coverage_without_overlap():
+    existing = {
+        "kind": "unrecognized",
+        "source_start": 1.0,
+        "source_end": 4.0,
+        "text": "既存",
+        "words": [],
+    }
+    segments = [_speech_segment(0.0, 1.0), existing, _speech_segment(4.0, 5.0)]
+
+    out = transcribe._preserve_unrecognized_gaps(
+        segments, cuts=[], silences=[], source_duration=5.0
+    )
+
+    assert out == segments
+
+
+def test_preserve_coverage_uses_final_short_silence_clamped_word_bounds():
+    segment = _speech_segment(0.0, 1.5)
+
+    out = transcribe._preserve_unrecognized_gaps(
+        [segment],
+        cuts=[],
+        silences=[(1.2, 1.8)],
+        known_silences=[],
+        source_duration=2.0,
+    )
+
+    assert [seg.get("kind", "speech") for seg in out] == [
+        "speech", "unrecognized"
+    ]
+    assert (out[1]["source_start"], out[1]["source_end"]) == (1.2, 2.0)
+
+
 # ---- build_segment_line 単体テスト（純関数） ----
 
 def _words(*items):
@@ -314,6 +445,7 @@ def test_transcribe_json_suggest_matches_txt(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
     monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
     monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 1.8)
 
     wav = _make_input(tmp_path)
     res = transcribe.transcribe(str(wav), lang="ja", filler_suggest=True,
@@ -347,11 +479,16 @@ def test_transcribe_no_suggest_key_when_disabled(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
     monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
     monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 1.0)
 
     wav = _make_input(tmp_path)
     res = transcribe.transcribe(str(wav), lang="ja", filler_suggest=False,
                                 pause_threshold=0.15)
-    ws = res["data"]["segments"][0]["words"]
+    speech = next(
+        seg for seg in res["data"]["segments"]
+        if seg.get("kind") != "unrecognized"
+    )
+    ws = speech["words"]
     assert "suggest" not in ws[0]
 
 
@@ -955,6 +1092,7 @@ def test_transcribe_passes_runtime_silence_keep_to_build_cuts(
         lambda p, **k: "silence_start: 1.0\nsilence_end: 3.0\n",
     )
     monkeypatch.setattr(transcribe, "_write_trimmed_wav", lambda p, cuts: (p, 0.0))
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 3.0)
     monkeypatch.setattr(transcribe, "SILENCE_KEEP_S", 0.25)
     calls = []
 
@@ -1035,11 +1173,15 @@ def test_transcribe_verbatim_chunks_and_offsets_words(tmp_path, monkeypatch):
         assert kwargs["condition_on_previous_text"] is True
         assert kwargs["temperature"] == 0
         assert kwargs["initial_prompt"] == transcribe.FILLER_PROMPT
-    assert [segment["id"] for segment in result["data"]["segments"]] == [
-        "0001", "0002"
+    assert [segment.get("kind", "speech") for segment in result["data"]["segments"]] == [
+        "unrecognized", "speech", "unrecognized", "speech", "unrecognized"
     ]
-    assert result["data"]["segments"][1]["words"][0]["start"] == 300.5
-    assert result["data"]["segments"][1]["words"][0]["end"] == 301.5
+    assert (
+        result["data"]["segments"][2]["source_start"],
+        result["data"]["segments"][2]["source_end"],
+    ) == (2.0, 300.5)
+    assert result["data"]["segments"][3]["words"][0]["start"] == 300.5
+    assert result["data"]["segments"][3]["words"][0]["end"] == 301.5
     assert result["data"]["language"] == "ja"
     assert all(not path.exists() for path in clip_paths)
 
@@ -1086,7 +1228,7 @@ def test_transcribe_non_verbatim_keeps_single_whisper_call(tmp_path, monkeypatch
     monkeypatch.setattr(
         transcribe,
         "_wav_duration",
-        lambda p: pytest.fail("non-verbatim must not plan chunks"),
+        lambda p: 10.0,
     )
     monkeypatch.setattr(
         transcribe,
@@ -1095,8 +1237,52 @@ def test_transcribe_non_verbatim_keeps_single_whisper_call(tmp_path, monkeypatch
     )
 
     wav = _make_input(tmp_path)
-    transcribe.transcribe(str(wav), lang="ja", verbatim=False)
+    result = transcribe.transcribe(str(wav), lang="ja", verbatim=False)
     assert len(calls) == 1
+    assert result["data"]["segments"] == [
+        {
+            "id": "0001",
+            "kind": "unrecognized",
+            "source_start": 0.0,
+            "source_end": 10.0,
+            "text": "",
+            "words": [],
+        }
+    ]
+
+
+def test_transcribe_cleans_temp_wavs_when_duration_probe_fails(
+    tmp_path, monkeypatch
+):
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda path, **kwargs: pytest.fail(
+        "duration failure must happen before ASR"
+    )
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    converted = tmp_path / "converted.wav"
+    trimmed = tmp_path / "trimmed.wav"
+    converted.write_bytes(b"converted")
+    trimmed.write_bytes(b"trimmed")
+    monkeypatch.setattr(
+        transcribe, "_convert_to_16k_mono", lambda p: str(converted)
+    )
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(
+        transcribe,
+        "_write_trimmed_wav",
+        lambda p, cuts: (str(trimmed), 0.0),
+    )
+    monkeypatch.setattr(
+        transcribe,
+        "_wav_duration",
+        lambda p: (_ for _ in ()).throw(RuntimeError("duration failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="duration failed"):
+        transcribe.transcribe(str(_make_input(tmp_path)), lang="ja")
+
+    assert not converted.exists()
+    assert not trimmed.exists()
 
 
 def test_transcribe_missing_input(tmp_path, fake_whisper):
@@ -1129,6 +1315,7 @@ def fake_whisper_en(monkeypatch):
     monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
     monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
     monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 0.9)
     return fake_result
 
 
@@ -1172,7 +1359,10 @@ def test_transcribe_silence_trim_remaps_and_meta(tmp_path, monkeypatch):
 
     res = transcribe.transcribe(str(wav), lang="ja")
     data = res["data"]
-    w = data["segments"][0]["words"]
+    speech = next(
+        seg for seg in data["segments"] if seg.get("kind") != "unrecognized"
+    )
+    w = speech["words"]
     # 「前」rec[1,2] は cut点2.35より前 → そのまま
     assert w[0]["start"] == pytest.approx(1.0)
     assert w[0]["end"] == pytest.approx(2.0)
@@ -1211,12 +1401,16 @@ def test_transcribe_clamps_word_times_and_saves_silences(tmp_path, monkeypatch):
         "silence_end: 3.05 | silence_duration: 0.05\n"
     )
     monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: stderr)
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 1.5)
 
     wav = _make_input(tmp_path)
     res = transcribe.transcribe(str(wav), lang="ja", pause_threshold=0.15)
     data = res["data"]
 
-    w = data["segments"][0]["words"][0]
+    speech = next(
+        seg for seg in data["segments"] if seg.get("kind") != "unrecognized"
+    )
+    w = speech["words"][0]
     assert w["start"] == pytest.approx(1.0)
     assert w["end"] == pytest.approx(1.20)  # 無音境界へクランプ
 
@@ -1242,10 +1436,68 @@ def test_transcribe_silences_empty_when_pause_threshold_zero(tmp_path, monkeypat
     monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
     monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
     monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 1.5)
 
     wav = _make_input(tmp_path)
     res = transcribe.transcribe(str(wav), lang="ja", pause_threshold=0)
     assert res["data"]["silences"] == []
+
+
+def test_transcribe_pause_threshold_zero_still_saves_trim_silences(
+    tmp_path, monkeypatch
+):
+    fake_result = {
+        "language": "ja",
+        "segments": [_speech_segment(0.0, 0.5)],
+    }
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda path, **kwargs: fake_result
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(
+        transcribe,
+        "_detect_silence",
+        lambda p, **k: "silence_start: 1.0\nsilence_end: 4.0\n",
+    )
+    monkeypatch.setattr(
+        transcribe, "_write_trimmed_wav", lambda p, cuts: (p, 2.3)
+    )
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 2.7)
+
+    data = transcribe.transcribe(
+        str(_make_input(tmp_path)), lang="ja", pause_threshold=0
+    )["data"]
+
+    assert data["silences"] == []
+    assert data["trim_silences"] == [[1.0, 4.0]]
+
+
+def test_transcribe_short_known_silence_at_file_edges_needs_no_warning(
+    tmp_path, monkeypatch
+):
+    fake_result = {
+        "language": "ja",
+        "segments": [_speech_segment(0.2, 0.8)],
+    }
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda path, **kwargs: fake_result
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(
+        transcribe,
+        "_detect_silence",
+        lambda p, **k: (
+            "silence_start: 0.0\nsilence_end: 0.2\n"
+            "silence_start: 0.8\nsilence_end: 1.0\n"
+        ),
+    )
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 1.0)
+
+    segments = transcribe.transcribe(
+        str(_make_input(tmp_path)), lang="ja"
+    )["data"]["segments"]
+
+    assert [seg.get("kind", "speech") for seg in segments] == ["speech"]
 
 
 def test_transcribe_blocks_and_pause_threshold(tmp_path, monkeypatch):
@@ -1269,6 +1521,7 @@ def test_transcribe_blocks_and_pause_threshold(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
     monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
     monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 1.2)
 
     wav = _make_input(tmp_path)
     res = transcribe.transcribe(str(wav), lang="ja", pause_threshold=0.15)
@@ -1300,6 +1553,7 @@ def test_transcribe_pause_threshold_zero_no_separator_dense(tmp_path, monkeypatc
     monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
     monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
     monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 1.0)
 
     wav = _make_input(tmp_path)
     res = transcribe.transcribe(str(wav), lang="ja", pause_threshold=0)
@@ -1373,14 +1627,20 @@ def test_transcribe_drops_hallucinations_and_renumbers(tmp_path, monkeypatch):
 
     # 幻覚2セグメント（反復＋空words）はレスキューに
     # 失敗しても、未認識区間として保持する
-    assert len(data["segments"]) == 3
+    assert len(data["segments"]) == 4
     assert data["segments"][0]["text"] == "結局"
     assert data["segments"][1]["kind"] == "unrecognized"
     assert data["segments"][2]["text"] == "面倒"
+    assert data["segments"][3]["kind"] == "unrecognized"
+    assert (
+        data["segments"][3]["source_start"],
+        data["segments"][3]["source_end"],
+    ) == (3.5, 10.0)
     # ID が連番で詰まる
     assert data["segments"][0]["id"] == "0001"
     assert data["segments"][1]["id"] == "0002"
     assert data["segments"][2]["id"] == "0003"
+    assert data["segments"][3]["id"] == "0004"
     # メタ記録
     assert res["hallucination_drop_count"] == 2
     assert data["hallucination_drop"]["count"] == 2
@@ -1460,7 +1720,7 @@ def _rescue_main_result():
     }
 
 
-def _setup_rescue(monkeypatch, main_result, rescue_result):
+def _setup_rescue(monkeypatch, main_result, rescue_result, wav_duration=14.0):
     """本認識と rescue で別結果を返す fake を仕込み、呼び出し記録を返す。"""
     calls = []
     rescue_results = (
@@ -1480,7 +1740,7 @@ def _setup_rescue(monkeypatch, main_result, rescue_result):
     monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
     monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
     monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
-    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 20.0)
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: wav_duration)
     monkeypatch.setattr(
         transcribe, "_slice_wav", lambda src, s, e: "rescue_clip.wav"
     )
@@ -1853,11 +2113,16 @@ def test_rescue_rejects_words_outside_actual_rounded_clip_duration(
     assert rescue_range["status"] == "unrecognized"
 
 
-def test_verbatim_rescue_clamps_partial_word_to_subchunk_bounds(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ("word_start", "word_end"),
+    [(-1.0, 1.0), (89.0, 100.0)],
+    ids=["before-clip-start", "after-clip-end"],
+)
+def test_verbatim_rescue_rejects_partial_word_outside_subchunk_bounds(
+    tmp_path, monkeypatch, word_start, word_end
 ):
     results = [
-        _clean_rescue_result("境界", start=89.0, end=100.0),
+        _clean_rescue_result("境界", start=word_start, end=word_end),
         _clean_rescue_result("中間"),
         _clean_rescue_result("末尾"),
     ]
@@ -1876,8 +2141,7 @@ def test_verbatim_rescue_clamps_partial_word_to_subchunk_bounds(
         "source.wav", 0.0, 200.0, "model", "ja", verbatim=True
     )
 
-    assert segments[0]["words"][0]["start"] == pytest.approx(89.0)
-    assert segments[0]["words"][0]["end"] == pytest.approx(90.0)
+    assert segments == []
 
 
 def test_long_rescue_prefers_valid_silence_before_90_second_limit(
@@ -2060,7 +2324,9 @@ def test_transcribe_rescue_gaps_follow_final_clamped_word_bounds(
             },
         ],
     }
-    _setup_rescue(monkeypatch, main_result, rescue_result)
+    _setup_rescue(
+        monkeypatch, main_result, rescue_result, wav_duration=7.0
+    )
     monkeypatch.setattr(
         transcribe,
         "_detect_silence",
@@ -2091,7 +2357,9 @@ def test_transcribe_rescue_coverage_uses_final_clamped_kept_bounds(
     main_result = _rescue_main_result()
     main_result["segments"][0]["words"][0].update(start=0.0, end=2.5)
     main_result["segments"][2]["words"][0].update(start=4.5, end=6.0)
-    _setup_rescue(monkeypatch, main_result, {"segments": []})
+    _setup_rescue(
+        monkeypatch, main_result, {"segments": []}, wav_duration=6.0
+    )
     monkeypatch.setattr(
         transcribe,
         "_detect_silence",
@@ -2134,11 +2402,17 @@ def test_transcribe_short_untimed_gap_is_preserved_and_reported(
             },
         ],
     }
-    calls = _setup_rescue(monkeypatch, main_result, {"segments": []})
+    calls = _setup_rescue(
+        monkeypatch, main_result, {"segments": []}, wav_duration=6.0
+    )
 
     wav = _make_input(tmp_path)
     res = transcribe.transcribe(str(wav), lang="ja")
-    u = res["data"]["segments"][1]
+    u = next(
+        seg for seg in res["data"]["segments"]
+        if seg.get("kind") == "unrecognized"
+        and seg["source_start"] == pytest.approx(5.0)
+    )
 
     assert len(calls) == 1
     assert u["kind"] == "unrecognized"
@@ -2169,16 +2443,23 @@ def test_transcribe_zero_length_gap_does_not_emit_unrecognized(
             },
         ],
     }
-    calls = _setup_rescue(monkeypatch, main_result, {"segments": []})
+    calls = _setup_rescue(
+        monkeypatch, main_result, {"segments": []}, wav_duration=6.0
+    )
 
     wav = _make_input(tmp_path)
     res = transcribe.transcribe(str(wav), lang="ja")
 
     assert len(calls) == 1
     assert [s.get("kind", "speech") for s in res["data"]["segments"]] == [
-        "speech", "speech"
+        "unrecognized", "speech", "speech"
     ]
-    assert "未認識区間" not in (tmp_path / "input.sc.txt").read_text()
+    gaps = [
+        (s["source_start"], s["source_end"])
+        for s in res["data"]["segments"]
+        if s.get("kind") == "unrecognized"
+    ]
+    assert gaps == [(0.0, 4.0)]
 
 
 def test_transcribe_rescue_rejects_nonmonotonic_words_after_clamping(
@@ -2384,7 +2665,9 @@ def test_transcribe_leading_and_trailing_gaps_cover_file_edges(
             },
         ],
     }
-    _setup_rescue(monkeypatch, main_result, {"segments": []})
+    _setup_rescue(
+        monkeypatch, main_result, {"segments": []}, wav_duration=20.0
+    )
 
     wav = _make_input(tmp_path)
     res = transcribe.transcribe(str(wav), lang="ja")

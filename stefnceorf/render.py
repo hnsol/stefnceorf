@@ -499,6 +499,7 @@ def plan_output_intervals(
     gap_max: float = GAP_MAX_S,
     filler_spans: list[tuple[float, float]] | None = None,
     filler_pause_keep: float = FILLER_PAUSE_KEEP_S,
+    silence_spans: list[tuple[float, float]] | None = None,
 ) -> tuple[list[tuple[float, float]], list[bool]]:
     """出力順のソース区間列から、ギャップ保持/切り詰めを適用した出力区間列を返す。
 
@@ -514,8 +515,10 @@ def plan_output_intervals(
        片側で余った分は他方の avail 範囲で再配分する（合計 =
        min(pre_avail + post_avail, filler_pause_keep)）。無音中のカットなので
        単純結合（cf_flags False）。
-    4. 純粋な無音ギャップ かつ g ≤ gap_threshold: ギャップ音声を保持（連続マージ）
-       g > gap_threshold: gap_max に切り詰め（前後 gap_max/2 を残し単純結合）
+    4. g ≤ gap_threshold: ギャップ音声を保持（連続マージ）
+       g > gap_threshold: silence_spans の和集合がギャップ全体を完全被覆する場合だけ
+       gap_max に切り詰める。旧JSON・未知区間・部分被覆は発話の可能性があるため
+       ギャップ全体を保持する。
 
     戻り値: (区間列, クロスフェードフラグ列)。フラグ列の長さは len(区間列)-1。
     True=クロスフェード結合、False=単純結合（ギャップ切り詰め・フィラーポーズ境界）。
@@ -524,6 +527,31 @@ def plan_output_intervals(
         return [], []
 
     fspans = filler_spans or []
+
+    def _known_silence_covers(start: float, end: float) -> bool:
+        if not silence_spans or end <= start:
+            return False
+        cursor = start
+        merged: list[list[float]] = []
+        for span_start, span_end in sorted(
+            (float(s), float(e))
+            for s, e in silence_spans
+            if float(e) > float(s)
+        ):
+            if merged and span_start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], span_end)
+            else:
+                merged.append([span_start, span_end])
+        for span_start, span_end in merged:
+            if span_end <= cursor:
+                continue
+            if span_start > cursor:
+                return False
+            cursor = max(cursor, span_end)
+            if cursor >= end:
+                return True
+        return False
+
     out: list[tuple[float, float]] = []
     cf_flags: list[bool] = []
     pending = [intervals[0][0], intervals[0][1]]
@@ -568,7 +596,11 @@ def plan_output_intervals(
             pending = [ns - post_keep, cur[1]]
             continue
         # 4. 純無音ギャップ
-        if g <= gap_threshold or g <= gap_max:
+        if (
+            g <= gap_threshold
+            or g <= gap_max
+            or not _known_silence_covers(pe, ns)
+        ):
             pending[1] = cur[1]
         else:
             pending[1] = pe + half
@@ -702,6 +734,11 @@ def render(
     segments = data.get("segments", [])
     # 音響安全判定用の無音区間（旧 json は None → RMS のみで判定）
     silences = data.get("silences")
+    # 出力の長無音短縮には認識用切り詰めと同じ元音源区間を使う。
+    # trim_silences 追加前の旧 json だけ block 用 silences へfallbackする。
+    trim_silences = (
+        data["trim_silences"] if "trim_silences" in data else silences
+    )
     seg_map: dict[str, dict] = {}
     for seg in segments:
         seg_map[seg["id"]] = seg
@@ -878,6 +915,7 @@ def render(
     out_intervals, cf_flags = plan_output_intervals(
         plan_intervals, content_spans, gap_threshold=gap_threshold, gap_max=gap_max,
         filler_spans=filler_cut_spans,
+        silence_spans=trim_silences,
     )
 
     # 通常削除（クロスフェード結合）境界が発話に食い込んでいないかを警告のみ出す

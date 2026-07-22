@@ -565,9 +565,12 @@ def test_plan_contiguous_merges():
 
 
 def test_plan_long_gap_trimmed():
-    # ギャップ 3.0s（>1.5）で純無音 → 0.7s に切り詰め、単純結合
+    # ギャップ 3.0s（>1.5）が既知の無音 → 0.7s に切り詰め、単純結合
     ivs = [(0.0, 1.0), (4.0, 5.0)]
-    out, flags = render.plan_output_intervals(ivs, [], gap_threshold=1.5, gap_max=0.7)
+    out, flags = render.plan_output_intervals(
+        ivs, [], gap_threshold=1.5, gap_max=0.7,
+        silence_spans=[(1.0, 2.5), (2.5, 4.0)],
+    )
     assert out == [
         (0.0, pytest.approx(1.35)),
         (pytest.approx(3.65), 5.0),
@@ -579,7 +582,8 @@ def test_plan_deleted_word_in_gap_not_merged():
     # ギャップ [1.0,4.0] に削除単語 [1.5,3.5] が挟まる → クロスフェード結合
     ivs = [(0.0, 1.0), (4.0, 5.0)]
     out, flags = render.plan_output_intervals(
-        ivs, [(1.5, 3.5)], gap_threshold=1.5, gap_max=0.7
+        ivs, [(1.5, 3.5)], gap_threshold=1.5, gap_max=0.7,
+        silence_spans=[(1.0, 4.0)],
     )
     assert out == [(0.0, 1.0), (4.0, 5.0)]
     assert flags == [True]
@@ -657,17 +661,27 @@ def test_plan_filler_with_normal_delete_prefers_crossfade():
     assert flags == [True]
 
 
-def test_plan_filler_none_matches_existing():
-    # filler_spans=None は既存挙動（純無音の長ギャップ切り詰め）
+def test_plan_missing_silence_metadata_preserves_unknown_gap():
+    # 旧JSON（silences欠落）では、長ギャップも発話かもしれないため全体保持
     ivs = [(0.0, 1.0), (4.0, 5.0)]
     out, flags = render.plan_output_intervals(
-        ivs, [], gap_threshold=1.5, gap_max=0.7, filler_spans=None
+        ivs, [], gap_threshold=0.1, gap_max=0.05,
+        filler_spans=None, silence_spans=None,
     )
-    assert out == [
-        (0.0, pytest.approx(1.35)),
-        (pytest.approx(3.65), 5.0),
-    ]
-    assert flags == [False]
+    assert out == [(0.0, 5.0)]
+    assert flags == []
+
+
+def test_plan_partly_known_silence_preserves_whole_gap():
+    ivs = [(0.0, 1.0), (4.0, 5.0)]
+
+    out, flags = render.plan_output_intervals(
+        ivs, [], gap_threshold=1.5, gap_max=0.7,
+        silence_spans=[(1.0, 3.9)],
+    )
+
+    assert out == [(0.0, 5.0)]
+    assert flags == []
 
 
 # ---- warn_hot_boundaries（通常削除の境界警告 純関数） ----
@@ -1424,6 +1438,8 @@ def _make_gap_project(tmp_path, sr=16000):
         "source_wav": str(wav.resolve()),
         "language": "ja",
         "model": "test",
+        "silences": [],
+        "trim_silences": [[1.0, 4.0]],
         "segments": [
             {"id": "0001", "text": "あ",
              "words": [{"word": "あ", "start": 0.0, "end": 1.0, "probability": 0.9}]},
@@ -1466,6 +1482,44 @@ def test_render_gap_threshold_keeps_all(tmp_path):
     out = render.render(str(txt), gap_threshold=100.0)
     o_audio, sr = sf.read(out)
     assert len(o_audio) / sr == pytest.approx(6.5, abs=0.05)
+
+
+def test_render_old_json_falls_back_to_silences_for_gap_trim(tmp_path):
+    """trim_silences追加前のJSONはsilencesを既知無音として利用する。"""
+    import soundfile as sf
+
+    _make_gap_project(tmp_path)
+    json_path = tmp_path / "input.sc.json"
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    data.pop("trim_silences")
+    data["silences"] = [[1.0, 4.0]]
+    json_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あ\n[0002] い\n[0003] う\n", encoding="utf-8")
+
+    out = render.render(str(txt))
+    audio, sr = sf.read(out)
+
+    assert len(audio) / sr == pytest.approx(4.72, abs=0.15)
+
+
+def test_render_present_empty_trim_silences_does_not_fallback(tmp_path):
+    """trim_silencesが存在する場合、空でもblock用silencesへfallbackしない。"""
+    import soundfile as sf
+
+    _make_gap_project(tmp_path)
+    json_path = tmp_path / "input.sc.json"
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    data["trim_silences"] = []
+    data["silences"] = [[1.0, 4.0]]
+    json_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あ\n[0002] い\n[0003] う\n", encoding="utf-8")
+
+    out = render.render(str(txt))
+    audio, sr = sf.read(out)
+
+    assert len(audio) / sr == pytest.approx(6.5, abs=0.05)
 
 
 def test_cli_render(tmp_path):
