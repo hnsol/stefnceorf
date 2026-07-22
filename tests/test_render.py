@@ -670,6 +670,49 @@ def test_plan_filler_none_matches_existing():
     assert flags == [False]
 
 
+# ---- warn_hot_boundaries（通常削除の境界警告 純関数） ----
+
+def _sine_audio(sr=16000, dur=1.0, freq=440.0, amp=0.5):
+    t = np.arange(int(dur * sr)) / sr
+    return amp * np.sin(2 * np.pi * freq * t), sr
+
+
+def test_warn_hot_boundaries_silence_no_warning():
+    """境界が無音（ゼロ振幅）→ 警告なし。"""
+    sr = 16000
+    audio = np.zeros(int(1.0 * sr))
+    out = render.warn_hot_boundaries(
+        audio, sr, [(0.0, 0.4), (0.6, 1.0)], [True], rms_threshold_db=-40.0
+    )
+    assert out == []
+
+
+def test_warn_hot_boundaries_hot_cf_true_warns():
+    """cf_flags True で境界が発話レベル（正弦波の途中）→ 警告1件・時刻含む。"""
+    audio, sr = _sine_audio()
+    out = render.warn_hot_boundaries(
+        audio, sr, [(0.0, 0.4), (0.6, 1.0)], [True], rms_threshold_db=-40.0
+    )
+    assert len(out) == 1
+    assert "0:00.4" in out[0]
+
+
+def test_warn_hot_boundaries_hot_cf_false_no_warning():
+    """cf_flags False の同条件 → 警告なし（無音切り詰め・フィラーポーズは対象外）。"""
+    audio, sr = _sine_audio()
+    out = render.warn_hot_boundaries(
+        audio, sr, [(0.0, 0.4), (0.6, 1.0)], [False], rms_threshold_db=-40.0
+    )
+    assert out == []
+
+
+def test_warn_hot_boundaries_single_interval_empty():
+    """out_intervals が1個以下 → 空リスト。"""
+    audio, sr = _sine_audio()
+    assert render.warn_hot_boundaries(audio, sr, [(0.0, 1.0)], [], -40.0) == []
+    assert render.warn_hot_boundaries(audio, sr, [], [], -40.0) == []
+
+
 def test_crossfade_concat_no_crossfade_flag():
     """crossfade_flags=False の境界では単純結合（長さ減少なし）"""
     a = np.ones(100)
@@ -1300,7 +1343,7 @@ def _make_gap_project(tmp_path, sr=16000):
 
 
 def test_render_gap_trim_and_keep(tmp_path):
-    """既定: 長無音は0.7sに切り詰め、短ポーズは保持される。"""
+    """既定: 長無音は1.0sに切り詰め、短ポーズは保持される。"""
     import soundfile as sf
 
     _make_gap_project(tmp_path)
@@ -1309,10 +1352,10 @@ def test_render_gap_trim_and_keep(tmp_path):
 
     out = render.render(str(txt))
     o_audio, sr = sf.read(out)
-    # 期待: seg1(≈1.22) + トリム無音(≈0.7) + seg2〜seg3を短ポーズ込みで連続(≈2.87)
-    # ≈ 4.42s。tail_margin=0.2 で後方マージンが拡張されている。
+    # 期待: seg1(≈1.22) + トリム無音(≈1.0) + seg2〜seg3を短ポーズ込みで連続(≈2.87)
+    # ≈ 4.72s。tail_margin=0.2 で後方マージンが拡張されている。
     dur = len(o_audio) / sr
-    assert dur == pytest.approx(4.42, abs=0.15)
+    assert dur == pytest.approx(4.72, abs=0.15)
 
 
 def test_render_gap_threshold_keeps_all(tmp_path):

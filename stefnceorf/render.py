@@ -35,7 +35,7 @@ FADE_S = 0.008
 # ギャップ（無音ポーズ）保持・切り詰めのしきい値と上限（秒）
 # g ≤ GAP_THRESHOLD_S: そのまま保持 / g > GAP_THRESHOLD_S: GAP_MAX_S に切り詰め
 GAP_THRESHOLD_S = 1.5
-GAP_MAX_S = 0.7
+GAP_MAX_S = 1.0
 
 # フィラー精密カットの定数群
 FILLER_PAUSE_KEEP_S = 0.25  # フィラー削除後に残す間の合計（日本語の句間ポーズ自然域 0.2〜0.35s の下限寄り）
@@ -579,6 +579,43 @@ def plan_output_intervals(
     return out, cf_flags
 
 
+def warn_hot_boundaries(
+    audio, samplerate,
+    out_intervals: list[tuple[float, float]],
+    cf_flags: list[bool],
+    rms_threshold_db: float,
+) -> list[str]:
+    """クロスフェード結合される通常削除境界のうち、両側が発話レベルの箇所を警告する（純関数）。
+
+    背景: フィラー削除には plan_filler_cut の音響安全ガード（unsafe なら残す）が
+    あるが、通常削除（ユーザーがテキストを直接消した削除）にはガードが無い。通常は
+    ブロックスナップでカットが検出済み無音へ揃うため安全だが、block を持たない旧
+    .sc.json や --pause-threshold 0 のときはその保証が無い。そこで**警告だけ**出す
+    （削除は原則どおり実行。ユーザーが意図した削除を勝手に復活させない）。
+
+    cf_flags[k] が True の境界（= クロスフェード結合 = 通常削除カットまたは並べ替え
+    境界）について、前区間終端 t1=out_intervals[k][1] と次区間始端
+    t2=out_intervals[k+1][0] の boundary_rms を計算し、どちらかが rms_threshold_db を
+    超えていたら警告を1つ追加する。False の境界（無音切り詰め・フィラーポーズ）は
+    無音中のカットなので対象外。out_intervals が1個以下なら境界が無いので空リスト。
+    """
+    warnings: list[str] = []
+    for k in range(len(out_intervals) - 1):
+        if k >= len(cf_flags) or not cf_flags[k]:
+            continue
+        t1 = out_intervals[k][1]
+        t2 = out_intervals[k + 1][0]
+        r1 = boundary_rms(audio, samplerate, t1)
+        r2 = boundary_rms(audio, samplerate, t2)
+        if r1 > rms_threshold_db or r2 > rms_threshold_db:
+            t = t1
+            warnings.append(
+                f"削除境界が音声と連続しています "
+                f"(源音声 {int(t // 60)}:{t % 60:04.1f} 付近)。カットは実行しました"
+            )
+    return warnings
+
+
 def _apply_weights(block, weights):
     """1次元(mono) / 2次元(multi-channel) 双方に weights を掛ける。"""
     if block.ndim == 2:
@@ -819,6 +856,12 @@ def render(
     out_intervals, cf_flags = plan_output_intervals(
         plan_intervals, word_spans, gap_threshold=gap_threshold, gap_max=gap_max,
         filler_spans=filler_cut_spans,
+    )
+
+    # 通常削除（クロスフェード結合）境界が発話に食い込んでいないかを警告のみ出す
+    # （カットは原則どおり実行）。rms_threshold は上で発話中央値から算出済みの値。
+    all_warnings.extend(
+        warn_hot_boundaries(audio, samplerate, out_intervals, cf_flags, rms_threshold)
     )
 
     chunks = []

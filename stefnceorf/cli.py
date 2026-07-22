@@ -37,15 +37,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_tr.add_argument(
         "--filler-suggest",
-        action="store_true",
-        help="フィラー候補の 〔〕 提案を有効化（既定: 無効）",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="フィラー候補の 〔〕 提案（既定: 有効。--no-filler-suggest で無効化）",
     )
     p_tr.add_argument(
         "--verbatim",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "フィラーや言い淀みも転写する（モデルは whisper-large-v3-mlx、"
-            "処理は約2倍遅い。--filler-suggest 併用推奨）"
+            "処理は約2倍遅い。既定: 有効。--no-verbatim で無効化）"
         ),
     )
     p_tr.add_argument(

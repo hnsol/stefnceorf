@@ -30,9 +30,25 @@ def test_parser_trans_alias_defaults():
     args = cli._build_parser().parse_args(["trans", "x.wav"])
     assert args.lang == "ja"
     assert args.model is None
-    assert args.filler_suggest is False
-    assert args.verbatim is False
+    assert args.filler_suggest is True
+    assert args.verbatim is True
     assert args.pause_threshold == pytest.approx(transcribe_mod.PAUSE_THRESHOLD_S)
+
+
+def test_parser_verbatim_filler_default_on():
+    """引数なしで verbatim / filler_suggest が既定 True になる。"""
+    args = cli._build_parser().parse_args(["transcribe", "x.wav"])
+    assert args.verbatim is True
+    assert args.filler_suggest is True
+
+
+def test_parser_no_verbatim_no_filler_disable():
+    """--no-verbatim / --no-filler-suggest で False になる。"""
+    args = cli._build_parser().parse_args(
+        ["transcribe", "x.wav", "--no-verbatim", "--no-filler-suggest"]
+    )
+    assert args.verbatim is False
+    assert args.filler_suggest is False
 
 
 def test_parser_transcribe_still_works():
