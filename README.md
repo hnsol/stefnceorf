@@ -150,7 +150,7 @@ Generates two files:
 Key options:
 
 - `--lang` — Language (default: `ja`). Use `--lang en` for English.
-- `--verbatim` — **Enabled by default.** Transcribes filler words that Whisper normally absorbs, using a slower but more accurate model. Disable with `--no-verbatim`.
+- `--verbatim` — **Enabled by default.** Transcribes filler words that Whisper normally absorbs, using a slower but more accurate model. Its transcription history is reset about every 3–5 minutes to contain long-context hallucinations. Disable with `--no-verbatim`.
 - `--no-filler-suggest` — Disables filler word detection.
 - `--pause-threshold` — Minimum pause duration (seconds) for block boundaries (default: `0.15`). Set to `0` for word-level editing (legacy behavior).
 
@@ -162,6 +162,9 @@ Key points:
 
 - Only **deletion** is supported. Adding or rewriting text has no effect (the original audio for new words doesn't exist).
 - Rearrangement is **line-level only** (reordering words within a line is not supported).
+- A `⚠ 未認識区間 X.X秒（音声保持）` line represents original audio that could not be transcribed safely. Keep the line to keep that audio, delete the line to delete it, or move the line to move the audio.
+- Suspected hallucinations are retried in this order: verbatim first, then safe mode. Safe mode may lose filler words, so an unrecognized warning is kept when neither retry is trustworthy.
+- Filler audio is removed only when both cut boundaries pass the acoustic safety checks. Otherwise, the filler is left in place: natural audio continuity takes priority over the number of fillers removed.
 - Unknown IDs or malformed lines cause an error — the tool never silently ignores problems.
 
 ### Render
