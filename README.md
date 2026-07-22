@@ -59,7 +59,7 @@ Editing is **non-destructive** — the original audio file is never modified, an
 - **Text-based editing** — Edit a plain text file in your favorite editor. Delete text to delete audio.
 - **Filler word detection** — Automatically suggests filler words (`um`, `uh`, `えー`, `まあ`) for removal. You review each suggestion and decide.
 - **Pause-based block editing** — Cuts snap to natural pause boundaries, preventing unnatural audio joins.
-- **Long silence trimming** — Silences over 1.5 seconds are automatically shortened, both for Whisper hallucination prevention and tighter output.
+- **Confirmed long silence trimming** — Detected silences over 1.5 seconds are shortened for Whisper hallucination prevention and output; unknown or partially covered gaps are preserved.
 - **Verbatim mode** — Transcribes filler words and hesitations that Whisper normally absorbs, enabling a filler-removal workflow.
 - **Hallucination detection & rescue** — Automatically detects Whisper hallucinations, rescues the affected audio by re-transcribing with safe settings.
 - **Quality preservation** — Output matches original sample rate and bit depth. Equal-power crossfade at cut boundaries prevents click noise.
@@ -150,7 +150,7 @@ Generates two files:
 Key options:
 
 - `--lang` — Language (default: `ja`). Use `--lang en` for English.
-- `--verbatim` — **Enabled by default.** Transcribes filler words that Whisper normally absorbs, using a slower but more accurate model. Its transcription history is reset about every 3–5 minutes to contain long-context hallucinations. Disable with `--no-verbatim`.
+- `--verbatim` — **Enabled by default.** Transcribes filler words that Whisper normally absorbs, using a slower but more accurate model. Its transcription history is reset about every 4–6 minutes to contain long-context hallucinations. Disable with `--no-verbatim`.
 - `--no-filler-suggest` — Disables filler word detection.
 - `--pause-threshold` — Minimum pause duration (seconds) for block boundaries (default: `0.15`). Set to `0` for word-level editing (legacy behavior).
 
