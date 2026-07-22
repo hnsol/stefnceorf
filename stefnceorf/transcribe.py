@@ -22,6 +22,10 @@ SILENCE_DB = -50  # 発話レベルが低い音源で静かな発話を無音と
 SILENCE_MIN_S = 1.5
 SILENCE_KEEP_S = 0.7
 
+# verbatim認識チャンクの目標長と許容幅（秒）
+CHUNK_TARGET_S = 300.0
+CHUNK_TOL_S = 60.0
+
 # ポーズベース区切り（ブロック単位削除）設定
 # この秒数以上の無音を「カット可能なポーズ区切り」としてブロック境界にする
 PAUSE_THRESHOLD_S = 0.15
@@ -136,6 +140,62 @@ def parse_silence_periods(stderr: str) -> list[tuple[float, float]]:
                 periods.append((pending, val))
                 pending = None
     return periods
+
+
+def plan_chunks(
+    duration: float,
+    silences: list[tuple[float, float]],
+    target: float = CHUNK_TARGET_S,
+    tol: float = CHUNK_TOL_S,
+) -> list[tuple[float, float]]:
+    """認識用wavを無音境界優先で連続チャンクへ分割する。"""
+    chunks: list[tuple[float, float]] = []
+    pos = 0.0
+    upper = target + tol
+    lower = target - tol
+
+    while duration - pos > upper:
+        candidates = []
+        for start, end in silences:
+            midpoint = (start + end) / 2.0
+            if pos + lower <= midpoint <= pos + upper:
+                candidates.append((start, end, midpoint))
+        if candidates:
+            _, _, boundary = min(
+                candidates,
+                key=lambda item: (
+                    -(item[1] - item[0]),
+                    abs(item[2] - (pos + target)),
+                    item[2],
+                ),
+            )
+        else:
+            boundary = pos + upper
+        chunks.append((pos, boundary))
+        pos = boundary
+
+    chunks.append((pos, duration))
+    return chunks
+
+
+def _offset_segments(segments: list[dict], offset: float) -> list[dict]:
+    """segmentとwordの時刻へoffsetを加えた非破壊コピーを返す。"""
+    out: list[dict] = []
+    for segment in segments:
+        shifted = dict(segment)
+        for key in ("start", "end"):
+            if shifted.get(key) is not None:
+                shifted[key] = float(shifted[key]) + offset
+        words = []
+        for word in segment.get("words", []) or []:
+            shifted_word = dict(word)
+            for key in ("start", "end"):
+                if shifted_word.get(key) is not None:
+                    shifted_word[key] = float(shifted_word[key]) + offset
+            words.append(shifted_word)
+        shifted["words"] = words
+        out.append(shifted)
+    return out
 
 
 def build_cuts(
@@ -924,7 +984,42 @@ def transcribe(
     halluc_ranges: list[dict] = []
     dropped_count = 0
     try:
-        result = mlx_whisper.transcribe(recog_wav, **whisper_kwargs)
+        if verbatim:
+            wav_duration = _wav_duration(recog_wav)
+            chunk_silences = parse_silence_periods(
+                _detect_silence(recog_wav, d=0.5)
+            )
+            chunks = plan_chunks(
+                wav_duration,
+                chunk_silences,
+                target=CHUNK_TARGET_S,
+                tol=CHUNK_TOL_S,
+            )
+            result = None
+            combined_segments: list[dict] = []
+            for chunk_start, chunk_end in chunks:
+                chunk_wav = _slice_wav(recog_wav, chunk_start, chunk_end)
+                try:
+                    chunk_result = mlx_whisper.transcribe(
+                        chunk_wav, **whisper_kwargs
+                    )
+                finally:
+                    try:
+                        os.unlink(chunk_wav)
+                    except OSError:
+                        pass
+                if result is None:
+                    result = dict(chunk_result)
+                combined_segments.extend(
+                    _offset_segments(
+                        chunk_result.get("segments", []) or [], chunk_start
+                    )
+                )
+            if result is None:
+                result = {"language": lang, "segments": []}
+            result["segments"] = combined_segments
+        else:
+            result = mlx_whisper.transcribe(recog_wav, **whisper_kwargs)
 
         # 繰り返し幻覚とみられるセグメントをループ前に除去する。
         raw_segments = result.get("segments", []) or []

@@ -8,6 +8,33 @@ from stefnceorf import transcribe
 from stefnceorf import fillers as fillers_mod
 
 
+# ---- plan_chunks（純関数） ----
+
+def test_plan_chunks_chooses_longest_silence_near_target():
+    assert transcribe.plan_chunks(
+        550.0, [(260.0, 262.0), (320.0, 330.0)]
+    ) == [(0.0, 325.0), (325.0, 550.0)]
+
+
+def test_plan_chunks_short_audio_is_single_chunk():
+    assert transcribe.plan_chunks(350.0, []) == [(0.0, 350.0)]
+
+
+def test_plan_chunks_without_silence_uses_upper_boundary():
+    assert transcribe.plan_chunks(700.0, []) == [
+        (0.0, 360.0), (360.0, 700.0)
+    ]
+
+
+def test_plan_chunks_has_no_gap_or_overlap():
+    chunks = transcribe.plan_chunks(
+        1200.0, [(295.0, 305.0), (600.0, 610.0)]
+    )
+    assert chunks[0][0] == 0.0
+    assert chunks[-1][1] == 1200.0
+    assert all(a[1] == b[0] for a, b in zip(chunks, chunks[1:]))
+
+
 # ---- build_segment_line 単体テスト（純関数） ----
 
 def _words(*items):
@@ -786,6 +813,8 @@ def fake_whisper(monkeypatch):
     # ffmpeg変換・無音検出は行わない（無音なし＝逆写像は恒等）
     monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
     monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 1.8)
+    monkeypatch.setattr(transcribe, "_slice_wav", lambda p, start, end: p)
     return captured
 
 
@@ -910,6 +939,138 @@ def test_transcribe_verbatim_en_prompt(tmp_path, fake_whisper):
     wav = _make_input(tmp_path)
     transcribe.transcribe(str(wav), lang="en", verbatim=True)
     assert fake_whisper["kwargs"]["initial_prompt"] == transcribe.FILLER_PROMPT_EN
+
+
+def test_transcribe_verbatim_chunks_and_offsets_words(tmp_path, monkeypatch):
+    calls = []
+    clip_paths = []
+    slices = []
+    silence_calls = []
+    planned = {}
+
+    def fake_transcribe(path, **kwargs):
+        index = len(calls)
+        calls.append((path, kwargs))
+        word = (
+            {"word": "前", "start": 1.0, "end": 2.0, "probability": 0.9}
+            if index == 0
+            else {"word": "後", "start": 0.5, "end": 1.5, "probability": 0.9}
+        )
+        return {
+            "language": "ja",
+            "segments": [{"text": word["word"], "words": [word]}],
+        }
+
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = fake_transcribe
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 600.0)
+
+    def fake_detect(path, d):
+        silence_calls.append((path, d))
+        if d == 0.5:
+            return "silence_start: 299.0\nsilence_end: 301.0\n"
+        return ""
+
+    monkeypatch.setattr(transcribe, "_detect_silence", fake_detect)
+
+    def fake_slice(path, start, end):
+        slices.append((start, end))
+        clip = tmp_path / f"chunk-{len(slices)}.wav"
+        clip.write_bytes(b"chunk")
+        clip_paths.append(clip)
+        return str(clip)
+
+    monkeypatch.setattr(transcribe, "_slice_wav", fake_slice)
+    real_plan_chunks = transcribe.plan_chunks
+
+    def spy_plan_chunks(duration, silences, target, tol):
+        planned.update(
+            duration=duration, silences=silences, target=target, tol=tol
+        )
+        return real_plan_chunks(duration, silences, target=target, tol=tol)
+
+    monkeypatch.setattr(transcribe, "plan_chunks", spy_plan_chunks)
+
+    wav = _make_input(tmp_path)
+    result = transcribe.transcribe(str(wav), lang="ja", verbatim=True)
+
+    assert slices == [(0.0, 300.0), (300.0, 600.0)]
+    assert len(calls) == 2
+    assert silence_calls[-1][1] == 0.5
+    assert planned == {
+        "duration": 600.0,
+        "silences": [(299.0, 301.0)],
+        "target": transcribe.CHUNK_TARGET_S,
+        "tol": transcribe.CHUNK_TOL_S,
+    }
+    for _, kwargs in calls:
+        assert kwargs["condition_on_previous_text"] is True
+        assert kwargs["temperature"] == 0
+        assert kwargs["initial_prompt"] == transcribe.FILLER_PROMPT
+    assert [segment["id"] for segment in result["data"]["segments"]] == [
+        "0001", "0002"
+    ]
+    assert result["data"]["segments"][1]["words"][0]["start"] == 300.5
+    assert result["data"]["segments"][1]["words"][0]["end"] == 301.5
+    assert result["data"]["language"] == "ja"
+    assert all(not path.exists() for path in clip_paths)
+
+
+def test_transcribe_verbatim_deletes_chunk_when_whisper_raises(
+    tmp_path, monkeypatch
+):
+    clip = tmp_path / "failed-chunk.wav"
+
+    def fail_transcribe(path, **kwargs):
+        raise RuntimeError("decode failed")
+
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = fail_transcribe
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 600.0)
+
+    def fake_slice(path, start, end):
+        clip.write_bytes(b"chunk")
+        return str(clip)
+
+    monkeypatch.setattr(transcribe, "_slice_wav", fake_slice)
+
+    wav = _make_input(tmp_path)
+    with pytest.raises(RuntimeError, match="decode failed"):
+        transcribe.transcribe(str(wav), lang="ja", verbatim=True)
+    assert not clip.exists()
+
+
+def test_transcribe_non_verbatim_keeps_single_whisper_call(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_transcribe(path, **kwargs):
+        calls.append((path, kwargs))
+        return {"language": "ja", "segments": []}
+
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = fake_transcribe
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(
+        transcribe,
+        "_wav_duration",
+        lambda p: pytest.fail("non-verbatim must not plan chunks"),
+    )
+    monkeypatch.setattr(
+        transcribe,
+        "_slice_wav",
+        lambda *args: pytest.fail("non-verbatim must not slice wav"),
+    )
+
+    wav = _make_input(tmp_path)
+    transcribe.transcribe(str(wav), lang="ja", verbatim=False)
+    assert len(calls) == 1
 
 
 def test_transcribe_missing_input(tmp_path, fake_whisper):
