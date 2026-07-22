@@ -12,8 +12,10 @@ from __future__ import annotations
 import json
 import re
 import sys
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import Any
 
 from . import fillers as fillers_mod
 
@@ -36,6 +38,22 @@ FADE_S = 0.008
 # g ≤ GAP_THRESHOLD_S: そのまま保持 / g > GAP_THRESHOLD_S: GAP_MAX_S に切り詰め
 GAP_THRESHOLD_S = 1.5
 GAP_MAX_S = 1.0
+
+
+@dataclass(frozen=True)
+class EditPlan:
+    """レンダーと外部編集形式出力で共有する編集計画。"""
+
+    txt_path: Path
+    base_name: str
+    source_wav: Path
+    audio: Any
+    audio_info: Any
+    samplerate: int
+    total_samples: int
+    output_intervals: list[tuple[float, float]]
+    crossfade_flags: list[bool]
+    warnings: list[str]
 
 # フィラー精密カットの定数群
 FILLER_PAUSE_KEEP_S = 0.25  # フィラー削除後に残す間の合計（日本語の句間ポーズ自然域 0.2〜0.35s の下限寄り）
@@ -709,14 +727,12 @@ def _base_name(txt_path: Path) -> str:
     return name
 
 
-def render(
+def build_edit_plan(
     txt_path: str,
-    output: str | None = None,
     gap_threshold: float = GAP_THRESHOLD_S,
     gap_max: float = GAP_MAX_S,
-) -> str:
-    """編集後 txt と json を突き合わせて音声を再構成し、出力パスを返す。"""
-    import numpy as np
+) -> EditPlan:
+    """編集後 txt と json から共有編集計画を構築する。"""
     import soundfile as sf
 
     txt = Path(txt_path)
@@ -924,35 +940,66 @@ def render(
         warn_hot_boundaries(audio, samplerate, out_intervals, cf_flags, rms_threshold)
     )
 
+    return EditPlan(
+        txt_path=txt,
+        base_name=base,
+        source_wav=Path(source_wav),
+        audio=audio,
+        audio_info=info,
+        samplerate=samplerate,
+        total_samples=total_samples,
+        output_intervals=out_intervals,
+        crossfade_flags=cf_flags,
+        warnings=all_warnings,
+    )
+
+
+def render(
+    txt_path: str,
+    output: str | None = None,
+    gap_threshold: float = GAP_THRESHOLD_S,
+    gap_max: float = GAP_MAX_S,
+) -> str:
+    """編集後 txt と json を突き合わせて音声を再構成し、出力パスを返す。"""
+    import numpy as np
+    import soundfile as sf
+
+    plan = build_edit_plan(txt_path, gap_threshold=gap_threshold, gap_max=gap_max)
+
     chunks = []
     kept_indices = []
-    for i, (start, end) in enumerate(out_intervals):
-        s0 = max(0, int(round(start * samplerate)))
-        s1 = min(total_samples, int(round(end * samplerate)))
+    for i, (start, end) in enumerate(plan.output_intervals):
+        s0 = max(0, int(round(start * plan.samplerate)))
+        s1 = min(plan.total_samples, int(round(end * plan.samplerate)))
         if s1 > s0:
-            chunks.append(audio[s0:s1])
+            chunks.append(plan.audio[s0:s1])
             kept_indices.append(i)
 
     valid_flags = []
     for j in range(1, len(kept_indices)):
         idx = kept_indices[j] - 1
-        valid_flags.append(cf_flags[idx] if idx < len(cf_flags) else True)
+        valid_flags.append(
+            plan.crossfade_flags[idx]
+            if idx < len(plan.crossfade_flags) else True
+        )
 
-    fade_samples = int(round(FADE_S * samplerate))
+    fade_samples = int(round(FADE_S * plan.samplerate))
     result = crossfade_concat(chunks, fade_samples, valid_flags if valid_flags else None)
 
     # 出力形状を元音声のチャンネル構成へ合わせる
-    if len(result) == 0 and audio.ndim == 2:
-        result = np.zeros((0, audio.shape[1]), dtype=np.float64)
+    if len(result) == 0 and plan.audio.ndim == 2:
+        result = np.zeros((0, plan.audio.shape[1]), dtype=np.float64)
 
     if output is None:
-        out_path = txt.parent / f"{base}.edited.wav"
+        out_path = plan.txt_path.parent / f"{plan.base_name}.edited.wav"
     else:
         out_path = Path(output)
 
-    sf.write(str(out_path), result, samplerate, subtype=info.subtype)
+    sf.write(
+        str(out_path), result, plan.samplerate, subtype=plan.audio_info.subtype
+    )
 
-    for w in all_warnings:
+    for w in plan.warnings:
         print(f"警告: {w}", file=sys.stderr)
 
     return str(out_path)

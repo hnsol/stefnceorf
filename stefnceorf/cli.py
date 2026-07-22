@@ -76,6 +76,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"しきい値超の無音ポーズを切り詰める秒数 (既定: {GAP_MAX_S})",
     )
 
+    p_logic = sub.add_parser("logic", help="編集後テキストから Logic Pro 用FCPXMLを生成")
+    p_logic.add_argument("input", help="編集後の .sc.txt ファイル")
+    p_logic.add_argument("-o", "--output", default=None, help="出力fcpxmlファイル")
+    p_logic.add_argument(
+        "--gap-threshold",
+        type=float,
+        default=GAP_THRESHOLD_S,
+        help=f"この秒数以下の無音ポーズはそのまま保持 (既定: {GAP_THRESHOLD_S})",
+    )
+    p_logic.add_argument(
+        "--gap-max",
+        type=float,
+        default=GAP_MAX_S,
+        help=f"しきい値超の無音ポーズを切り詰める秒数 (既定: {GAP_MAX_S})",
+    )
+
     return parser
 
 
@@ -156,6 +172,22 @@ def main(argv: list[str] | None = None) -> int:
             print(f"エラー: {exc}", file=sys.stderr)
             return 1
         except (RuntimeError, FileNotFoundError, ValueError) as exc:
+            print(f"エラー: {exc}", file=sys.stderr)
+            return 1
+        print(f"生成: {out}")
+        return 0
+
+    if args.command == "logic":
+        from .fcpxml import export_fcpxml
+
+        try:
+            out = export_fcpxml(
+                args.input,
+                output=args.output,
+                gap_threshold=args.gap_threshold,
+                gap_max=args.gap_max,
+            )
+        except (RuntimeError, OSError, ValueError) as exc:
             print(f"エラー: {exc}", file=sys.stderr)
             return 1
         print(f"生成: {out}")

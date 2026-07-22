@@ -9,6 +9,7 @@ import pytest
 
 from stefnceorf import cli
 from stefnceorf import transcribe as transcribe_mod
+from stefnceorf.render import GAP_MAX_S, GAP_THRESHOLD_S
 
 
 # ---- _build_parser ----
@@ -58,6 +59,33 @@ def test_parser_transcribe_still_works():
     assert args.input == "y.wav"
 
 
+def test_parser_logic_defaults():
+    args = cli._build_parser().parse_args(["logic", "input.sc.txt"])
+    assert args.command == "logic"
+    assert args.input == "input.sc.txt"
+    assert args.output is None
+    assert args.gap_threshold == GAP_THRESHOLD_S
+    assert args.gap_max == GAP_MAX_S
+
+
+def test_parser_logic_options():
+    args = cli._build_parser().parse_args(
+        [
+            "logic",
+            "input.sc.txt",
+            "-o",
+            "output.fcpxml",
+            "--gap-threshold",
+            "2.5",
+            "--gap-max",
+            "0.75",
+        ]
+    )
+    assert args.output == "output.fcpxml"
+    assert args.gap_threshold == pytest.approx(2.5)
+    assert args.gap_max == pytest.approx(0.75)
+
+
 # ---- main() のディスパッチ ----
 
 @pytest.fixture
@@ -98,3 +126,52 @@ def test_main_trans_passes_lang(fake_transcribe, tmp_path):
     calls, wav = fake_transcribe
     cli.main(["trans", str(wav), "--lang", "en"])
     assert calls[0]["kwargs"]["lang"] == "en"
+
+
+def test_main_logic_dispatches_and_prints_generated(monkeypatch, capsys):
+    calls = []
+
+    def _fake(input_path, **kwargs):
+        calls.append((input_path, kwargs))
+        return "custom.fcpxml"
+
+    monkeypatch.setattr("stefnceorf.fcpxml.export_fcpxml", _fake)
+    rc = cli.main(
+        [
+            "logic",
+            "input.sc.txt",
+            "-o",
+            "custom.fcpxml",
+            "--gap-threshold",
+            "2.0",
+            "--gap-max",
+            "0.5",
+        ]
+    )
+
+    assert rc == 0
+    assert calls == [
+        (
+            "input.sc.txt",
+            {"output": "custom.fcpxml", "gap_threshold": 2.0, "gap_max": 0.5},
+        )
+    ]
+    assert capsys.readouterr().out == "生成: custom.fcpxml\n"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        FileNotFoundError("missing"),
+        RuntimeError("runtime"),
+        ValueError("bad value"),
+        OSError("cannot write"),
+    ],
+)
+def test_main_logic_expected_errors_return_one(monkeypatch, capsys, error):
+    def _fake(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr("stefnceorf.fcpxml.export_fcpxml", _fake)
+    assert cli.main(["logic", "input.sc.txt"]) == 1
+    assert capsys.readouterr().err == f"エラー: {error}\n"

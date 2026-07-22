@@ -931,6 +931,25 @@ def test_render_end_to_end_no_edit(tmp_path):
     assert abs(len(o_audio) - 48000) < 2000
 
 
+def test_build_edit_plan_contains_shared_render_inputs(tmp_path):
+    _make_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あう\n", encoding="utf-8")
+
+    plan = render.build_edit_plan(str(txt))
+
+    assert plan.source_wav == (tmp_path / "input.wav")
+    assert plan.samplerate == 16000
+    assert plan.total_samples == 48000
+    assert plan.audio_info.channels == 1
+    assert plan.output_intervals == [
+        (0.0, pytest.approx(1.0)),
+        (pytest.approx(2.0), 3.0),
+    ]
+    assert plan.crossfade_flags == [True]
+    assert isinstance(plan.warnings, list)
+
+
 def test_render_end_to_end_delete_word(tmp_path):
     import soundfile as sf
 
