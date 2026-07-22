@@ -824,6 +824,20 @@ def test_transcribe_verbatim_uses_verbatim_model_and_prompt(tmp_path, fake_whisp
     assert data["model"] == transcribe.VERBATIM_MODEL
 
 
+def test_transcribe_verbatim_disables_fallback_and_silence_skip(tmp_path, fake_whisper):
+    """verbatim では温度フォールバックと無音スキップを使わない。
+
+    A/B実測でフィラー候補が67→3〜4に激減する破壊的相互作用があったため
+    （温度フォールバック: プロンプトリセットで initial_prompt が消える /
+    無音スキップ: 単語異常ヒューリスティクスがフィラーを幻覚と誤判定）。
+    """
+    wav = _make_input(tmp_path)
+    transcribe.transcribe(str(wav), lang="ja", verbatim=True)
+    kw = fake_whisper["kwargs"]
+    assert kw["temperature"] == 0
+    assert "hallucination_silence_threshold" not in kw
+
+
 def test_transcribe_verbatim_respects_explicit_model(tmp_path, fake_whisper):
     """verbatimでも明示モデルは尊重する。"""
     wav = _make_input(tmp_path)

@@ -36,8 +36,10 @@ HALLUC_TOP_RATIO = 0.7   # 最頻トークンの占有率閾値
 HALLUC_RUN = 3           # 同一テキストセグメントの連続数閾値
 
 # 幻覚疑い時に無音をスキップする本家 whisper 由来の抑止しきい値（秒）。
-# word_timestamps=True が必要（当ツールは常に満たす）。本家 whisper 推奨域で
-# あり、ポーズ区切り 0.3s より十分長いため発話間の自然なポーズを誤スキップしない。
+# word_timestamps=True が必要（当ツールは常に満たす）。非verbatim とレスキュー
+# 再認識でのみ使う。verbatim 本認識では使わない: whisper の単語異常
+# ヒューリスティクスがフィラーを幻覚と誤判定して弾くため（A/B実測で
+# フィラー候補 67→4）。
 HALLUC_SILENCE_SKIP_S = 2.0
 
 # 時間密度異常による幻覚除去（条件d）。実発話は 5〜7 文字/秒だが幻覚は
@@ -50,10 +52,11 @@ HALLUC_ECHO_DENSITY_CHARS_S = 12.0  # エコー判定に用いる文字密度し
 
 # デコード温度のフォールバック列（whisper 既定と同じ）。正常窓は先頭 0.0 の
 # 1回デコードで済み追加コストなし。compression_ratio / logprob 異常の窓のみ
-# 高温で再試行される。mlx-whisper は結果温度が 0.5 超のとき直前文脈プロンプトを
-# リセットするため、condition_on_previous_text=True の誤認識自己増幅
-# （幻覚ループの根本原因）が異常窓で切断される。temperature=0 固定だと
-# 異常検出しても再試行先がなく破綻結果をそのまま採用してしまう。
+# 高温で再試行される。非verbatim とレスキュー再認識でのみ使う。verbatim 本認識
+# では使わない: 結果温度>0.5 でプロンプトがリセットされ initial_prompt
+# （フィラー誘導文）ごと以降の全窓から消えるため（A/B実測でフィラー候補
+# 67→4）。verbatim は temperature=0 固定とし、幻覚は後処理検出＋レスキューで
+# 対処する。
 TEMPERATURE_FALLBACK = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 
 # 幻覚区間の再認識レスキュー窓の最小長（秒）。これ未満の窓は内容なしとみなし
@@ -804,22 +807,30 @@ def transcribe(
     cuts = build_cuts(cut_periods)
     trimmed_wav, removed_s = _write_trimmed_wav(tmp_wav, cuts)
     recog_wav = trimmed_wav
+    # verbatim では温度フォールバックと無音スキップを無効にする（A/B実測:
+    # ep22-1 でフィラー候補 67→3〜4 に激減する破壊的相互作用があった）。
+    # - 温度フォールバック: 結果温度>0.5 でプロンプトがリセットされ、
+    #   initial_prompt（フィラー誘導文）ごと以降の全窓から消える
+    # - hallucination_silence_threshold: whisper の単語異常ヒューリスティクス
+    #   （低確率・不自然な長さの語）がフィラーそのものを幻覚と誤判定して弾く
+    # verbatim の幻覚対策は後処理（drop_hallucinations 条件a〜e＋レスキュー）に
+    # 委ねる。非verbatim とレスキュー再認識はフィラーを転写しないため両方有効。
     whisper_kwargs = dict(
         path_or_hf_repo=model,
         word_timestamps=True,
         language=lang,
-        temperature=TEMPERATURE_FALLBACK,
+        temperature=0 if verbatim else TEMPERATURE_FALLBACK,
         condition_on_previous_text=verbatim,
         no_speech_threshold=0.8,
         compression_ratio_threshold=2.0,
-        # 非verbatimでも condT=False で幻覚は起き得るため常時付与する。
-        hallucination_silence_threshold=HALLUC_SILENCE_SKIP_S,
         verbose=False,  # mlx-whisper 組み込みの進捗バー(tqdm)を有効化
     )
     if verbatim:
         whisper_kwargs["initial_prompt"] = (
             FILLER_PROMPT_EN if lang == "en" else FILLER_PROMPT
         )
+    else:
+        whisper_kwargs["hallucination_silence_threshold"] = HALLUC_SILENCE_SKIP_S
     # 幻覚除去グループを再認識レスキューする間、認識用wav（trimmed_wav）を
     # 生存させる必要があるため、本認識からレスキュー完了までを1つの try で囲う。
     halluc_ranges: list[dict] = []
