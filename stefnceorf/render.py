@@ -41,6 +41,22 @@ GAP_MAX_S = 0.7
 
 
 @dataclass(frozen=True)
+class EditStats:
+    """編集結果の定量サマリー（render / logic 実行後に表示する）。"""
+
+    source_duration_s: float       # 元音声の長さ（秒）
+    output_duration_s: float       # 出力音声の長さ（秒）
+    filler_requested: int          # 削除指定された（〔〕残し＋手動削除）フィラー数
+    filler_cut: int                # 安全と判定し削除した数
+    filler_skipped_unsafe: int     # 音響的に不安全で残置した数
+    silence_trim_count: int        # 無音ギャップ切り詰め箇所数
+    silence_trim_removed_s: float  # 無音切り詰めの合計秒
+    lines_total: int               # json のセグメント（行）総数
+    lines_deleted: int             # 編集で丸ごと削除された行数
+    lines_moved: int               # 並べ替えられた行数
+
+
+@dataclass(frozen=True)
 class EditPlan:
     """レンダーと外部編集形式出力で共有する編集計画。"""
 
@@ -54,6 +70,7 @@ class EditPlan:
     output_intervals: list[tuple[float, float]]
     crossfade_flags: list[bool]
     warnings: list[str]
+    stats: EditStats
 
 # フィラー精密カットの定数群
 FILLER_PAUSE_KEEP_S = 0.25  # フィラー削除後に残す間の合計（日本語の句間ポーズ自然域 0.2〜0.35s の下限寄り）
@@ -727,6 +744,84 @@ def _base_name(txt_path: Path) -> str:
     return name
 
 
+def _count_moved_lines(indices: list[int]) -> int:
+    """json 順 index 列から「並べ替えで動かした行数」を返す（純関数）。
+
+    最長増加部分列（LIS）は「動かさずに済む行」の最大集合なので、
+    全体長 - LIS 長 が最小の並べ替え行数になる。indices は distinct なので
+    狭義増加の LIS を bisect で O(n log n) で求める。
+    """
+    import bisect
+
+    tails: list[int] = []
+    for x in indices:
+        pos = bisect.bisect_left(tails, x)
+        if pos == len(tails):
+            tails.append(x)
+        else:
+            tails[pos] = x
+    return len(indices) - len(tails)
+
+
+def _format_mmss(seconds: float) -> str:
+    """秒数を M:SS または H:MM:SS 形式に変換する（秒は floor・ゼロ埋め2桁）。
+
+    循環 import 回避のため transcribe._format_time と同仕様で複製している。
+    """
+    import math
+
+    total_sec = int(math.floor(seconds))
+    h = total_sec // 3600
+    m = (total_sec % 3600) // 60
+    s = total_sec % 60
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def format_stats(stats: EditStats) -> list[str]:
+    """編集結果統計を表示行リストに整形する（純関数、シンプルな英語）。
+
+    出し分け:
+    - Lines 行は削除/移動が1件以上のとき（括弧内は該当項目のみ）
+    - Fillers 行は filler_requested > 0 のとき（残置0なら括弧省略）
+    - Silence 行は切り詰めが1箇所以上のとき（1箇所は "1 gap"）
+    - Duration 行は常時
+    """
+    lines: list[str] = []
+
+    kept = stats.lines_total - stats.lines_deleted
+    if stats.lines_deleted + stats.lines_moved >= 1:
+        parts: list[str] = []
+        if stats.lines_deleted:
+            parts.append(f"{stats.lines_deleted} deleted")
+        if stats.lines_moved:
+            parts.append(f"{stats.lines_moved} moved")
+        lines.append(
+            f"Lines: {kept} of {stats.lines_total} kept ({', '.join(parts)})"
+        )
+
+    if stats.filler_requested > 0:
+        line = f"Fillers: removed {stats.filler_cut} of {stats.filler_requested}"
+        if stats.filler_skipped_unsafe > 0:
+            line += f" ({stats.filler_skipped_unsafe} kept: too close to speech)"
+        lines.append(line)
+
+    if stats.silence_trim_count > 0:
+        gap_word = "gap" if stats.silence_trim_count == 1 else "gaps"
+        lines.append(
+            f"Silence: trimmed {stats.silence_trim_count} {gap_word}, "
+            f"-{stats.silence_trim_removed_s:.1f}s"
+        )
+
+    delta = stats.output_duration_s - stats.source_duration_s
+    lines.append(
+        f"Duration: {_format_mmss(stats.source_duration_s)} -> "
+        f"{_format_mmss(stats.output_duration_s)} ({delta:+.1f}s)"
+    )
+    return lines
+
+
 def build_edit_plan(
     txt_path: str,
     gap_threshold: float = GAP_THRESHOLD_S,
@@ -821,6 +916,8 @@ def build_edit_plan(
     # キーで行う（スナップで元 span と一致しなくなるため）。
     filler_cut_spans: list[tuple[float, float]] = []
     safe_filler_keys: set[tuple[str, int]] = set()
+    filler_requested = 0        # 削除指定されたフィラー総数（統計用）
+    filler_skipped_unsafe = 0   # 音響的に不安全で残置した数（統計用）
     for seg_id, edited, brackets in parsed:
         seg = seg_map.get(seg_id)
         if seg is None:
@@ -876,6 +973,7 @@ def build_edit_plan(
         # 食い込まないよう lo=前語 end / hi=次語 start（無ければセグメント境界）で
         # クランプする。
         lo_seg, hi_seg = seg_bounds.get(seg_id, (0.0, file_length_s))
+        filler_requested += len(filler_del)
         for wi in sorted(filler_del):
             lo_s = float(words[wi - 1]["end"]) if wi > 0 else lo_seg
             hi_s = float(words[wi + 1]["start"]) if wi + 1 < len(words) else hi_seg
@@ -891,6 +989,7 @@ def build_edit_plan(
             else:
                 filler_del.discard(wi)
                 keep.add(wi)
+                filler_skipped_unsafe += 1
                 all_warnings.append(
                     f"[{seg_id}] フィラー〔{word_strs[wi]}〕は前後の音声と連続しているため残しました"
                 )
@@ -934,6 +1033,33 @@ def build_edit_plan(
         silence_spans=trim_silences,
     )
 
+    # 無音切り詰めの集計。単純結合（cf_flags False）境界の区間間ギャップが削除秒。
+    # ただしフィラーポーズ境界（filler_cut_spans と重なる）は無音切り詰めでないため除外。
+    silence_trim_count = 0
+    silence_trim_removed_s = 0.0
+    for k in range(len(out_intervals) - 1):
+        if k < len(cf_flags) and not cf_flags[k]:
+            pe, ns = out_intervals[k][1], out_intervals[k + 1][0]
+            if not any(s < ns and e > pe for s, e in filler_cut_spans):
+                silence_trim_count += 1
+                silence_trim_removed_s += ns - pe
+
+    # 行削除・並べ替えの集計。編集順の seg_id を json 順 index に写像して LIS で算出。
+    json_index = {seg["id"]: i for i, seg in enumerate(segments)}
+    edited_indices = [json_index[seg_id] for seg_id, _, _ in parsed]
+    stats = EditStats(
+        source_duration_s=file_length_s,
+        output_duration_s=sum(e - s for s, e in out_intervals),
+        filler_requested=filler_requested,
+        filler_cut=len(safe_filler_keys),
+        filler_skipped_unsafe=filler_skipped_unsafe,
+        silence_trim_count=silence_trim_count,
+        silence_trim_removed_s=silence_trim_removed_s,
+        lines_total=len(segments),
+        lines_deleted=len(segments) - len(parsed),
+        lines_moved=_count_moved_lines(edited_indices),
+    )
+
     # 通常削除（クロスフェード結合）境界が発話に食い込んでいないかを警告のみ出す
     # （カットは原則どおり実行）。rms_threshold は上で発話中央値から算出済みの値。
     all_warnings.extend(
@@ -951,6 +1077,7 @@ def build_edit_plan(
         output_intervals=out_intervals,
         crossfade_flags=cf_flags,
         warnings=all_warnings,
+        stats=stats,
     )
 
 
@@ -959,8 +1086,14 @@ def render(
     output: str | None = None,
     gap_threshold: float = GAP_THRESHOLD_S,
     gap_max: float = GAP_MAX_S,
+    stats_out: list[str] | None = None,
 ) -> str:
-    """編集後 txt と json を突き合わせて音声を再構成し、出力パスを返す。"""
+    """編集後 txt と json を突き合わせて音声を再構成し、出力パスを返す。
+
+    stats_out が渡された場合は format_stats の行をそこへ append するだけで
+    print しない（呼び出し元が任意の位置で出力できる）。
+    None の場合は警告出力の後に print する（後方互換）。
+    """
     import numpy as np
     import soundfile as sf
 
@@ -1001,5 +1134,11 @@ def render(
 
     for w in plan.warnings:
         print(f"警告: {w}", file=sys.stderr)
+
+    if stats_out is not None:
+        stats_out.extend(format_stats(plan.stats))
+    else:
+        for line in format_stats(plan.stats):
+            print(line)
 
     return str(out_path)

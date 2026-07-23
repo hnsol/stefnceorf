@@ -11,6 +11,15 @@ from .render import GAP_MAX_S, GAP_THRESHOLD_S
 from .transcribe import DEFAULT_MODEL, PAUSE_THRESHOLD_S
 
 
+# 各コマンド開始時に「これから何をするか」を1行宣言する文言（シンプルな英語）。
+_ANNOUNCEMENTS = {
+    "transcribe": "transcribing audio",
+    "render": "rendering edited audio",
+    "logic": "exporting FCPXML for Logic Pro",
+    "auto": "full pipeline: transcribe -> FCPXML",
+}
+
+
 def _add_transcription_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--lang",
@@ -176,9 +185,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(_normalize_argv(raw_args))
 
     if args.command in ("transcribe", "trans"):
+        print(f"transcribe: {_ANNOUNCEMENTS['transcribe']}: {args.input}")
         return _run_transcription(args)[0]
 
     if args.command == "auto":
+        print(f"auto: {_ANNOUNCEMENTS['auto']}: {args.input}")
         return_code, res = _run_transcription(args)
         if return_code:
             return return_code
@@ -186,28 +197,35 @@ def main(argv: list[str] | None = None) -> int:
 
         from .fcpxml import export_fcpxml
 
+        stats_lines: list[str] = []
         try:
             out = export_fcpxml(
                 res["txt_path"],
                 output=args.output,
                 gap_threshold=args.gap_threshold,
                 gap_max=args.gap_max,
+                stats_out=stats_lines,
             )
         except (RuntimeError, OSError, ValueError) as exc:
             print(f"エラー: {exc}", file=sys.stderr)
             return 1
         print(f"生成: {out}")
+        for line in stats_lines:
+            print(line)
         return 0
 
     if args.command == "render":
         from .render import render
 
+        print(f"render: {_ANNOUNCEMENTS['render']}: {args.input}")
+        stats_lines: list[str] = []
         try:
             out = render(
                 args.input,
                 output=args.output,
                 gap_threshold=args.gap_threshold,
                 gap_max=args.gap_max,
+                stats_out=stats_lines,
             )
         except NotImplementedError as exc:
             print(f"エラー: {exc}", file=sys.stderr)
@@ -216,22 +234,29 @@ def main(argv: list[str] | None = None) -> int:
             print(f"エラー: {exc}", file=sys.stderr)
             return 1
         print(f"生成: {out}")
+        for line in stats_lines:
+            print(line)
         return 0
 
     if args.command == "logic":
         from .fcpxml import export_fcpxml
 
+        print(f"logic: {_ANNOUNCEMENTS['logic']}: {args.input}")
+        stats_lines: list[str] = []
         try:
             out = export_fcpxml(
                 args.input,
                 output=args.output,
                 gap_threshold=args.gap_threshold,
                 gap_max=args.gap_max,
+                stats_out=stats_lines,
             )
         except (RuntimeError, OSError, ValueError) as exc:
             print(f"エラー: {exc}", file=sys.stderr)
             return 1
         print(f"生成: {out}")
+        for line in stats_lines:
+            print(line)
         return 0
 
     parser.error("不明なコマンドです")

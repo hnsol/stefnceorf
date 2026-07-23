@@ -170,10 +170,14 @@ def test_main_logic_dispatches_and_prints_generated(monkeypatch, capsys):
     assert calls == [
         (
             "input.sc.txt",
-            {"output": "custom.fcpxml", "gap_threshold": 2.0, "gap_max": 0.5},
+            {"output": "custom.fcpxml", "gap_threshold": 2.0, "gap_max": 0.5,
+             "stats_out": []},
         )
     ]
-    assert capsys.readouterr().out == "生成: custom.fcpxml\n"
+    assert capsys.readouterr().out == (
+        "logic: exporting FCPXML for Logic Pro: input.sc.txt\n"
+        "生成: custom.fcpxml\n"
+    )
 
 
 @pytest.mark.parametrize(
@@ -225,6 +229,7 @@ def test_main_direct_wav_transcribes_then_exports_logic(monkeypatch, tmp_path, c
             "output": str(fcpxml),
             "gap_threshold": 2.0,
             "gap_max": 0.5,
+            "stats_out": [],
         }
         return str(fcpxml)
 
@@ -257,6 +262,7 @@ def test_main_direct_wav_transcribes_then_exports_logic(monkeypatch, tmp_path, c
         ("logic", str(txt)),
     ]
     assert capsys.readouterr().out == (
+        f"auto: full pipeline: transcribe -> FCPXML: {wav}\n"
         f"生成: {txt}\n生成: {json_path}\n生成: {fcpxml}\n"
     )
 
@@ -300,10 +306,97 @@ def test_main_auto_exporter_error_returns_one(monkeypatch, tmp_path, capsys):
     assert cli.main(["auto", "x.wav"]) == 1
     captured = capsys.readouterr()
     assert captured.out == (
+        "auto: full pipeline: transcribe -> FCPXML: x.wav\n"
         f"生成: {tmp_path / 'x.sc.txt'}\n生成: {tmp_path / 'x.sc.json'}\n"
         "フィラー候補: 0箇所\n"
     )
     assert captured.err == "エラー: cannot write\n"
+
+
+# ---- 開始宣言行・統計行（Duration）の表示 ----
+
+def _make_real_project(tmp_path, sr=16000):
+    """実 render/logic を通す最小プロジェクト（wav+json+txt）を作る。"""
+    import json
+
+    import numpy as np
+    import soundfile as sf
+
+    seg = []
+    for fr in (220.0, 440.0, 660.0):
+        t = np.arange(sr) / sr
+        seg.append(0.3 * np.sin(2 * np.pi * fr * t))
+    wav = tmp_path / "x.wav"
+    sf.write(str(wav), np.concatenate(seg), sr, subtype="PCM_16")
+    data = {
+        "source_wav": str(wav.resolve()),
+        "language": "ja",
+        "model": "test",
+        "segments": [
+            {"id": "0001", "text": "あ",
+             "words": [{"word": "あ", "start": 0.0, "end": 1.0, "probability": 0.9}]},
+            {"id": "0002", "text": "い",
+             "words": [{"word": "い", "start": 1.0, "end": 2.0, "probability": 0.9}]},
+            {"id": "0003", "text": "う",
+             "words": [{"word": "う", "start": 2.0, "end": 3.0, "probability": 0.9}]},
+        ],
+    }
+    json_path = tmp_path / "x.sc.json"
+    json_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    txt = tmp_path / "x.sc.txt"
+    txt.write_text("[0001] あ\n[0002] い\n[0003] う\n", encoding="utf-8")
+    return wav, txt, json_path
+
+
+def test_main_render_announces_and_prints_duration(tmp_path, capsys):
+    _, txt, _ = _make_real_project(tmp_path)
+    assert cli.main(["render", str(txt)]) == 0
+    out = capsys.readouterr().out
+    assert f"render: rendering edited audio: {txt}\n" in out
+    lines = out.splitlines()
+    assert any(line.startswith("Duration: ") for line in lines)
+    # 統計行は「生成:」行より後に出力される
+    generated_idx = next(i for i, l in enumerate(lines) if l.startswith("生成:"))
+    duration_idx = next(i for i, l in enumerate(lines) if l.startswith("Duration:"))
+    assert duration_idx > generated_idx
+
+
+def test_main_logic_announces_and_prints_duration(tmp_path, capsys):
+    _, txt, _ = _make_real_project(tmp_path)
+    assert cli.main(["logic", str(txt)]) == 0
+    out = capsys.readouterr().out
+    assert f"logic: exporting FCPXML for Logic Pro: {txt}\n" in out
+    lines = out.splitlines()
+    assert any(line.startswith("Duration: ") for line in lines)
+    # 統計行は「生成:」行より後に出力される
+    generated_idx = next(i for i, l in enumerate(lines) if l.startswith("生成:"))
+    duration_idx = next(i for i, l in enumerate(lines) if l.startswith("Duration:"))
+    assert duration_idx > generated_idx
+
+
+def test_main_auto_announces_and_prints_duration(monkeypatch, tmp_path, capsys):
+    wav, txt, json_path = _make_real_project(tmp_path)
+
+    def _transcribe(input_wav, **kwargs):
+        return {
+            "txt_path": str(txt),
+            "json_path": str(json_path),
+            "filler_count": 0,
+            "silence_cut_count": 0,
+            "silence_removed_s": 0.0,
+            "hallucination_ranges": [],
+        }
+
+    monkeypatch.setattr("stefnceorf.transcribe.transcribe", _transcribe)
+    assert cli.main([str(wav)]) == 0
+    out = capsys.readouterr().out
+    assert f"auto: full pipeline: transcribe -> FCPXML: {wav}\n" in out
+    lines = out.splitlines()
+    assert any(line.startswith("Duration: ") for line in lines)
+    # 統計行は「生成:」行より後に出力される
+    generated_idx = max(i for i, l in enumerate(lines) if l.startswith("生成:"))
+    duration_idx = next(i for i, l in enumerate(lines) if l.startswith("Duration:"))
+    assert duration_idx > generated_idx
 
 
 def test_main_no_args_prints_help_without_running_stages(monkeypatch, capsys):

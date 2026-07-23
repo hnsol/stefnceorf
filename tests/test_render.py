@@ -1565,3 +1565,168 @@ def test_cli_render_error(tmp_path):
     txt.write_text("[9999] x\n", encoding="utf-8")
     rc = cli.main(["render", str(txt)])
     assert rc == 1
+
+
+# ---- format_stats（純関数の出し分け・単複・時間表記） ----
+
+def _stats(**over):
+    base = dict(
+        source_duration_s=0.0,
+        output_duration_s=0.0,
+        filler_requested=0,
+        filler_cut=0,
+        filler_skipped_unsafe=0,
+        silence_trim_count=0,
+        silence_trim_removed_s=0.0,
+        lines_total=0,
+        lines_deleted=0,
+        lines_moved=0,
+    )
+    base.update(over)
+    return render.EditStats(**base)
+
+
+def test_format_stats_duration_always_present():
+    # 変化ゼロでも Duration 行のみ常に出る
+    lines = render.format_stats(_stats(source_duration_s=342.0, output_duration_s=298.2))
+    assert lines == ["Duration: 5:42 -> 4:58 (-43.8s)"]
+
+
+def test_format_stats_lines_deleted_and_moved():
+    lines = render.format_stats(
+        _stats(lines_total=42, lines_deleted=2, lines_moved=1)
+    )
+    assert lines[0] == "Lines: 40 of 42 kept (2 deleted, 1 moved)"
+
+
+def test_format_stats_lines_deleted_only():
+    lines = render.format_stats(_stats(lines_total=42, lines_deleted=2))
+    assert lines[0] == "Lines: 40 of 42 kept (2 deleted)"
+
+
+def test_format_stats_lines_moved_only():
+    lines = render.format_stats(_stats(lines_total=42, lines_moved=1))
+    assert lines[0] == "Lines: 42 of 42 kept (1 moved)"
+
+
+def test_format_stats_lines_hidden_when_no_change():
+    lines = render.format_stats(_stats(lines_total=42))
+    assert not any(l.startswith("Lines:") for l in lines)
+
+
+def test_format_stats_fillers_no_skip_omits_paren():
+    lines = render.format_stats(_stats(filler_requested=4, filler_cut=4))
+    assert "Fillers: removed 4 of 4" in lines
+    assert not any("kept:" in l for l in lines)
+
+
+def test_format_stats_fillers_with_skip():
+    lines = render.format_stats(
+        _stats(filler_requested=4, filler_cut=3, filler_skipped_unsafe=1)
+    )
+    assert "Fillers: removed 3 of 4 (1 kept: too close to speech)" in lines
+
+
+def test_format_stats_fillers_hidden_when_none_requested():
+    lines = render.format_stats(_stats())
+    assert not any(l.startswith("Fillers:") for l in lines)
+
+
+def test_format_stats_silence_singular_and_plural():
+    one = render.format_stats(_stats(silence_trim_count=1, silence_trim_removed_s=2.0))
+    assert "Silence: trimmed 1 gap, -2.0s" in one
+    many = render.format_stats(
+        _stats(silence_trim_count=5, silence_trim_removed_s=12.34)
+    )
+    assert "Silence: trimmed 5 gaps, -12.3s" in many
+
+
+def test_format_stats_duration_hhmmss_and_positive_delta():
+    lines = render.format_stats(
+        _stats(source_duration_s=3600.0, output_duration_s=3665.0)
+    )
+    assert lines[-1] == "Duration: 1:00:00 -> 1:01:05 (+65.0s)"
+
+
+# ---- _count_moved_lines ----
+
+def test_count_moved_no_reorder():
+    assert render._count_moved_lines([0, 1, 2, 3]) == 0
+
+
+def test_count_moved_single_swap():
+    # [1,0,2] → LIS=[0,2] 長2 → 移動1
+    assert render._count_moved_lines([1, 0, 2]) == 1
+
+
+def test_count_moved_empty():
+    assert render._count_moved_lines([]) == 0
+
+
+# ---- build_edit_plan.stats 統合テスト ----
+
+def test_stats_silence_trim(tmp_path):
+    _make_gap_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あ\n[0002] い\n[0003] う\n", encoding="utf-8")
+    plan = render.build_edit_plan(str(txt))
+    assert plan.stats.silence_trim_count == 1
+    assert plan.stats.silence_trim_removed_s > 0.0
+    assert plan.stats.source_duration_s == pytest.approx(6.5, abs=0.01)
+    assert plan.stats.output_duration_s < plan.stats.source_duration_s
+
+
+def test_stats_unsafe_filler_kept(tmp_path):
+    _write_words_project(
+        tmp_path,
+        [("結局", 0.0, 1.0, 220.0, 0, False),
+         ("まあ", 1.0, 2.0, 440.0, 1, True),
+         ("面倒", 2.0, 3.0, 660.0, 2, False)],
+        silences=None,
+    )
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] 結局〔まあ〕面倒\n", encoding="utf-8")
+    plan = render.build_edit_plan(str(txt))
+    assert plan.stats.filler_requested == 1
+    assert plan.stats.filler_cut == 0
+    assert plan.stats.filler_skipped_unsafe == 1
+    assert (
+        "Fillers: removed 0 of 1 (1 kept: too close to speech)"
+        in render.format_stats(plan.stats)
+    )
+
+
+def test_stats_safe_filler_cut(tmp_path):
+    _write_words_project(
+        tmp_path,
+        [("結局", 0.0, 1.0, 220.0, 0, False),
+         ("まあ", 1.3, 2.0, 440.0, 1, True),
+         ("面倒", 2.3, 3.3, 660.0, 2, False)],
+        silences=[[1.0, 1.3], [2.0, 2.3]],
+    )
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] 結局〔まあ〕面倒\n", encoding="utf-8")
+    plan = render.build_edit_plan(str(txt))
+    assert plan.stats.filler_requested == 1
+    assert plan.stats.filler_cut == 1
+    assert plan.stats.filler_skipped_unsafe == 0
+
+
+def test_stats_line_deleted(tmp_path):
+    _make_multiseg_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あ\n[0003] う\n", encoding="utf-8")
+    plan = render.build_edit_plan(str(txt))
+    assert plan.stats.lines_total == 3
+    assert plan.stats.lines_deleted == 1
+    assert plan.stats.lines_moved == 0
+
+
+def test_stats_line_reordered(tmp_path):
+    _make_multiseg_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0002] い\n[0001] あ\n[0003] う\n", encoding="utf-8")
+    plan = render.build_edit_plan(str(txt))
+    assert plan.stats.lines_total == 3
+    assert plan.stats.lines_deleted == 0
+    assert plan.stats.lines_moved == 1

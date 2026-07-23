@@ -7,7 +7,7 @@ from fractions import Fraction
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from .render import GAP_MAX_S, GAP_THRESHOLD_S, build_edit_plan
+from .render import GAP_MAX_S, GAP_THRESHOLD_S, build_edit_plan, format_stats
 
 
 _SEQUENCE_AUDIO_RATES = {
@@ -70,8 +70,14 @@ def export_fcpxml(
     output: str | None = None,
     gap_threshold: float = GAP_THRESHOLD_S,
     gap_max: float = GAP_MAX_S,
+    stats_out: list[str] | None = None,
 ) -> str:
-    """編集計画を Logic Pro 用 FCPXML 1.8 として出力する。"""
+    """編集計画を Logic Pro 用 FCPXML 1.8 として出力する。
+
+    stats_out が渡された場合は format_stats の行をそこへ append するだけで
+    print しない（呼び出し元が任意の位置で出力できる）。
+    None の場合は警告出力の後に print する（後方互換）。
+    """
     plan = build_edit_plan(
         txt_path, gap_threshold=gap_threshold, gap_max=gap_max
     )
@@ -163,4 +169,11 @@ def export_fcpxml(
 
     for warning in plan.warnings:
         print(f"警告: {warning}", file=sys.stderr)
+
+    if stats_out is not None:
+        stats_out.extend(format_stats(plan.stats))
+    else:
+        for line in format_stats(plan.stats):
+            print(line)
+
     return str(out_path)
