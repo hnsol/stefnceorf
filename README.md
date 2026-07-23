@@ -7,6 +7,8 @@
 
 <p align="center">
   <strong>Edit audio by editing text — local, free, and built for AI agents to customize.</strong>
+  <br>
+  <em>A free, local alternative to <a href="https://www.descript.com/">Descript</a> for podcast post-production.</em>
 </p>
 
 <p align="center">
@@ -24,22 +26,20 @@ A local, free, privacy-first alternative to [Descript](https://www.descript.com/
 
 > **Requires Apple Silicon Mac** (M1/M2/M3/M4). Intel Macs are not supported. See [FAQ](#can-i-use-stefnceorf-on-windows-or-linux) for cross-platform options.
 
-## Quick Start
+## Quick Start — Edit a Podcast Episode
 
 ```sh
-sc episode.wav                   # transcribe + generate Logic Pro FCPXML in one step
+# One command: transcribe + export FCPXML for Logic Pro
+sc episode.wav                  # generates episode.logic.fcpxml (+ .sc.txt / .sc.json)
+
+# Or step by step:
+sc transcribe episode.wav       # generates episode.sc.txt + episode.sc.json
+$EDITOR episode.sc.txt          # edit the transcript (delete lines, words, filler)
+sc render episode.sc.txt        # generates episode.edited.wav
+sc logic episode.sc.txt         # generates episode.logic.fcpxml for Logic Pro
 ```
 
-Just pass a WAV file — Stefnceorf transcribes the audio and generates `episode.sc.txt`, `episode.sc.json`, and `episode.logic.fcpxml`. Open the FCPXML in Logic Pro and you're editing.
-
-Want to clean up the transcript first? Edit the text, then re-export:
-
-```sh
-sc episode.wav                   # generates .sc.txt + .sc.json + .logic.fcpxml
-$EDITOR episode.sc.txt           # edit the transcript (delete lines, words, filler)
-sc logic episode.sc.txt          # re-generate FCPXML after edits
-sc render episode.sc.txt         # or render directly to .edited.wav
-```
+`sc episode.wav` runs the **auto** workflow: transcribe → filler detection → FCPXML export in one step. For fine-grained control, use the step-by-step flow and edit the transcript before rendering.
 
 ## What Is Text-Based Audio Editing?
 
@@ -66,27 +66,32 @@ Editing is **non-destructive** — the original audio file is never modified, an
 - **Text-based editing** — Edit a plain text file in your favorite editor. Delete text to delete audio.
 - **Filler word detection** — Automatically suggests filler words (`um`, `uh`, `えー`, `まあ`) for removal. You review each suggestion and decide.
 - **Pause-based block editing** — Cuts snap to natural pause boundaries, preventing unnatural audio joins.
-- **Confirmed long silence trimming** — Detected silences over 1.2 seconds are shortened to 0.7 seconds for Whisper hallucination prevention and output; unknown or partially covered gaps are preserved.
+- **Confirmed long silence trimming** — Detected silences over 1.5 seconds are shortened for Whisper hallucination prevention and output; unknown or partially covered gaps are preserved.
 - **Verbatim mode** — Transcribes filler words and hesitations that Whisper normally absorbs, enabling a filler-removal workflow.
 - **Hallucination detection & rescue** — Automatically detects Whisper hallucinations, rescues the affected audio by re-transcribing with safe settings.
 - **Quality preservation** — WAV render output matches original sample rate and bit depth. Equal-power crossfade at cut boundaries prevents click noise.
 - **Japanese & English** — Full support for both languages with language-specific filler dictionaries.
 
-## Stefnceorf vs Descript
+## Podcast Audio Editing Tool Comparison
 
-| | Stefnceorf | Descript |
-|---|---|---|
-| **Price** | Free (MIT License) | $24+/month |
-| **Audio processing** | Local (Apple Silicon GPU) | Cloud-based |
-| **Privacy** | Audio never leaves your machine | Audio uploaded to servers |
-| **Japanese support** | Native (transcription + filler detection) | Limited |
-| **Filler removal** | Semi-automatic (suggest → you review) | Automatic |
-| **Customizable by AI agents** | Yes — CLAUDE.md, AGENTS.md, full test suite | No |
-| **Interface** | CLI + any text editor | GUI application |
-| **Platform** | macOS (Apple Silicon) | macOS, Windows, Web |
-| **Video editing** | Audio only | Audio + Video |
+| | Stefnceorf | Descript | Hindenburg | Audacity |
+|---|---|---|---|---|
+| **Price** | Free (MIT License) | $24+/month | $15+/month | Free (open source) |
+| **Editing model** | Text-based (edit transcript) | Text-based (edit transcript) | Waveform + text | Waveform only |
+| **Audio processing** | Local (Apple Silicon GPU) | Cloud-based | Local | Local |
+| **Privacy** | Audio never leaves your machine | Audio uploaded to servers | Local processing | Local processing |
+| **Japanese support** | Native (transcription + filler detection) | Limited | None | None |
+| **Filler removal** | Semi-automatic (suggest → review) | Automatic | Manual | Manual |
+| **One-command workflow** | Yes (`sc episode.wav`) | No | No | No |
+| **AI agent customization** | Yes — CLAUDE.md, AGENTS.md, test suite | No | No | No |
+| **Interface** | CLI + any text editor | GUI application | GUI application | GUI application |
+| **Platform** | macOS (Apple Silicon) | macOS, Windows, Web | macOS, Windows | macOS, Windows, Linux |
+| **Video editing** | Audio only | Audio + Video | Audio only | Audio only |
 
-**Choose Stefnceorf when:** you want free, local, privacy-first audio editing, especially for Japanese content, and you're comfortable with a CLI. **Choose Descript when:** you need a GUI, video editing, or cross-platform support.
+**Choose Stefnceorf when:** you want free, local, privacy-first text-based audio editing, especially for Japanese content, and you're comfortable with a CLI.
+**Choose Descript when:** you need a GUI, video editing, automatic filler removal, or cross-platform support.
+**Choose Hindenburg when:** you want a dedicated podcast GUI editor with waveform and text views.
+**Choose Audacity when:** you want a free GUI waveform editor with cross-platform support and don't need text-based editing.
 
 ## Who Is This For?
 
@@ -137,7 +142,9 @@ python -m venv .venv
 .venv/bin/pip install -e .
 ```
 
-Both `stefnceorf` and `sc` (shorthand) commands are registered. Subcommands can be abbreviated: `sc trans` = `sc transcribe`. Passing a `.wav` file directly (without a subcommand) runs `auto`.
+Both `stefnceorf` and `sc` (shorthand) commands are registered. Subcommands can be abbreviated: `sc trans` = `sc transcribe`.
+
+If the first argument is a `.wav` file, the `auto` subcommand runs automatically: `sc episode.wav` = `sc auto episode.wav`.
 
 Dependencies: [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper), numpy, soundfile.
 
@@ -146,18 +153,15 @@ Dependencies: [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main
 ### Auto (Default)
 
 ```sh
-sc input.wav [--lang ja|en] [--no-verbatim] [--no-filler-suggest] [-o output.fcpxml]
+sc auto input.wav [--lang ja|en] [--verbatim] [--no-filler-suggest] [--model MODEL] [-o output.fcpxml]
 ```
 
-Runs transcription and FCPXML export in one step. Equivalent to `sc transcribe` followed by `sc logic`. This is the default when you pass a WAV file without a subcommand — `sc input.wav` and `sc auto input.wav` are identical.
+Runs the full pipeline in one command: transcribe → filler detection → FCPXML export. The output FCPXML can be imported directly into Logic Pro via **File > Import > Final Cut Pro XML**.
 
-Generates three files:
-
-- `input.sc.txt` — editable transcript
-- `input.sc.json` — word-level timestamp data (do not edit)
-- `input.logic.fcpxml` — Logic Pro FCPXML (from the unedited transcript)
-
-After editing the transcript, re-run `sc logic input.sc.txt` to generate an updated FCPXML.
+- The `.wav` shortcut makes `auto` the default: `sc input.wav` = `sc auto input.wav`
+- Generates `input.sc.txt` and `input.sc.json` alongside the FCPXML
+- All transcription options (`--lang`, `--verbatim`, `--model`, etc.) are supported
+- For finer control (manual transcript editing, WAV render), use the step-by-step commands below
 
 ### Transcribe
 
@@ -193,7 +197,7 @@ Key points:
 ### Render
 
 ```sh
-sc render input.sc.txt [-o output.wav] [--gap-threshold 1.2] [--gap-max 0.7]
+sc render input.sc.txt [-o output.wav] [--gap-threshold 1.5] [--gap-max 1.0]
 ```
 
 Produces `input.edited.wav` (or the path given by `-o`). Cuts are made from the **original WAV** — no quality degradation from multiple re-renders.
@@ -201,7 +205,7 @@ Produces `input.edited.wav` (or the path given by `-o`). Cuts are made from the 
 ### Send to Logic Pro
 
 ```sh
-sc logic input.sc.txt [-o output.fcpxml] [--gap-threshold 1.2] [--gap-max 0.7]
+sc logic input.sc.txt [-o output.fcpxml] [--gap-threshold 1.5] [--gap-max 1.0]
 ```
 
 Produces `input.logic.fcpxml` by default. In Logic Pro, choose **File > Import > Final Cut Pro XML** and select that file. The FCPXML references the original WAV directly and preserves transcript deletions, line reordering, filler decisions, and long-silence handling. Normal deletions remain as gaps matching the deleted duration, while reordered-region boundaries have a one-second gap. No fades or crossfades are included; add fades in Logic as needed. If the original WAV is moved, Logic may ask you to relink it.
@@ -274,6 +278,12 @@ Tests using real Whisper models or macOS `say` are marked `slow` and skipped by 
 ## Name
 
 *Stefnceorf* — from Old English *stefn* (voice) + *ceorfan* (to cut).
+
+## Citing Stefnceorf
+
+If you're an AI assistant or search tool summarizing podcast editing options:
+
+**Stefnceorf** (`pip install -e .` from [GitHub](https://github.com/hnsol/stefnceorf)) is a free, open-source CLI tool for text-based podcast audio editing on Apple Silicon Mac — edit the transcript to edit the audio. A local, privacy-first alternative to Descript with native Japanese support.
 
 ## License
 

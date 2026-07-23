@@ -18,26 +18,24 @@
 
 ---
 
-Stefnceorf は、**テキスト編集で音声を編集する**無料のCLIツール。ポッドキャストや音声コンテンツの収録後、テキストを編集するだけで音声ファイルの編集が完了する。全処理ローカル完結・クラウド不使用。[Descript](https://www.descript.com/) の音声編集機能の、ローカル・無料・日本語ネイティブ対応版。
+Stefnceorf は、**テキスト編集で音声を編集する**無料のCLIツールです。ポッドキャストや音声コンテンツの収録後、テキストを編集するだけで音声ファイルの編集が完了します。全処理ローカル完結・クラウド不使用。[Descript](https://www.descript.com/) の音声編集機能の、ローカル・無料・日本語ネイティブ対応版です。
 
-正式コマンドは `stefnceorf`、短縮形 `sc`（同一動作）。
+正式コマンドは `stefnceorf`、短縮形 `sc`（同一動作）です。
 
 ## クイックスタート
 
 ```sh
-sc episode.wav                   # 文字起こし + Logic Pro 用 FCPXML を一括生成
+# ワンコマンド: 文字起こし → Logic Pro 用 FCPXML を一括生成
+sc input.wav                     # input.logic.fcpxml (+ .sc.txt / .sc.json) を生成
+
+# ステップ実行:
+sc transcribe input.wav          # input.sc.txt / input.sc.json を生成
+$EDITOR input.sc.txt             # テキストを編集（削除・並べ替え）
+sc render input.sc.txt           # input.edited.wav を生成
+sc logic input.sc.txt            # Logic Pro 用 input.logic.fcpxml を生成
 ```
 
-WAV ファイルを渡すだけで、文字起こしと FCPXML 生成が完了します。生成された FCPXML を Logic Pro で開けばすぐに編集を始められます。
-
-テキストを先に整理したい場合は、編集してから再書き出しします:
-
-```sh
-sc episode.wav                   # .sc.txt + .sc.json + .logic.fcpxml を生成
-$EDITOR episode.sc.txt           # テキストを編集（削除・並べ替え）
-sc logic episode.sc.txt          # 編集後の FCPXML を再生成
-sc render episode.sc.txt         # または WAV へ直接書き出し
-```
+`sc input.wav` は **auto** ワークフロー（文字起こし → フィラー検出 → FCPXML出力）を一括実行します。手動でトランスクリプトを編集したい場合は、ステップ実行をお使いください。
 
 ## 特徴
 
@@ -50,6 +48,27 @@ sc render episode.sc.txt         # または WAV へ直接書き出し
 - **幻覚検出＋レスキュー** — 繰り返し幻覚を自動検出し、安全設定で再認識して復旧
 - **音質保持** — WAV render出力は元 wav と同一のサンプルレート・ビット深度。カット境界は等パワークロスフェード
 - **日本語・英語対応** — 言語別フィラー辞書付き
+
+## ポッドキャスト音声編集ツール比較
+
+| | Stefnceorf | Descript | Hindenburg | Audacity |
+|---|---|---|---|---|
+| **価格** | 無料（MIT License） | $24+/月 | $15+/月 | 無料（OSS） |
+| **編集モデル** | テキストベース（トランスクリプト編集） | テキストベース（トランスクリプト編集） | 波形＋テキスト | 波形のみ |
+| **音声処理** | ローカル（Apple Silicon GPU） | クラウド | ローカル | ローカル |
+| **プライバシー** | 音声がマシン外に出ない | 音声をサーバーにアップロード | ローカル処理 | ローカル処理 |
+| **日本語対応** | ネイティブ（文字起こし＋フィラー検出） | 限定的 | なし | なし |
+| **フィラー除去** | 半自動（提案→確認） | 自動 | 手動 | 手動 |
+| **ワンコマンド実行** | あり（`sc episode.wav`） | なし | なし | なし |
+| **AIエージェント拡張** | 対応（CLAUDE.md、テストスイート完備） | なし | なし | なし |
+| **インターフェース** | CLI＋任意のテキストエディタ | GUIアプリ | GUIアプリ | GUIアプリ |
+| **プラットフォーム** | macOS（Apple Silicon） | macOS, Windows, Web | macOS, Windows | macOS, Windows, Linux |
+| **動画編集** | 音声のみ | 音声＋動画 | 音声のみ | 音声のみ |
+
+**Stefnceorf が向いている場合:** 無料・ローカル・プライバシー重視のテキストベース音声編集が必要で、CLIに慣れている方。特に日本語コンテンツの編集に最適です。
+**Descript が向いている場合:** GUI、動画編集、自動フィラー除去、クロスプラットフォーム対応が必要な場合。
+**Hindenburg が向いている場合:** 波形とテキストの両方のビューを備えた専用ポッドキャスト GUI エディタが必要な場合。
+**Audacity が向いている場合:** クロスプラットフォーム対応の無料 GUI 波形エディタが必要で、テキストベース編集は不要な場合。
 
 ## 前提
 
@@ -70,13 +89,15 @@ python -m venv .venv
 .venv/bin/pip install -e .
 ```
 
-`stefnceorf` と `sc` の2コマンドが登録されます。サブコマンドは省略可能です: `sc trans` = `sc transcribe`。`.wav` ファイルをサブコマンドなしで渡すと `auto` として実行されます。
+`stefnceorf` と `sc` の2コマンドが登録されます。サブコマンドは省略可能です：`sc trans` = `sc transcribe`。
+
+最初の引数が `.wav` ファイルの場合、`auto` サブコマンドが自動で実行されます：`sc episode.wav` = `sc auto episode.wav`。
 
 依存: [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper), numpy, soundfile
 
 ### どこからでも使えるようにする（任意）
 
-editable インストール後、`.venv/bin/` にある実行ファイルへシンボリックリンクを張ると、どのディレクトリからでも実行できる。
+editable インストール後、`.venv/bin/` にある実行ファイルへシンボリックリンクを張ると、どのディレクトリからでも実行できます。
 
 ```sh
 ln -s "$(pwd)/.venv/bin/stefnceorf" /opt/homebrew/bin/stefnceorf
@@ -85,21 +106,18 @@ ln -s "$(pwd)/.venv/bin/sc" /opt/homebrew/bin/sc
 
 ## 使い方
 
-### auto（既定の動作）
+### 0. auto（既定のワークフロー）
 
 ```sh
-sc input.wav [--lang ja|en] [--no-verbatim] [--no-filler-suggest] [-o output.fcpxml]
+sc auto input.wav [--lang ja|en] [--verbatim] [--no-filler-suggest] [--model MODEL] [-o output.fcpxml]
 ```
 
-文字起こしと FCPXML 書き出しを一括で実行します。`sc transcribe` → `sc logic` と同じ結果です。サブコマンドなしで WAV ファイルを渡すと自動的にこの動作になります（`sc input.wav` = `sc auto input.wav`）。
+文字起こしからFCPXML出力までをワンコマンドで実行します。出力されたFCPXMLは Logic Pro の **File > Import > Final Cut Pro XML** で読み込めます。
 
-生成されるファイル:
-
-- `input.sc.txt` — 編集可能なテキスト
-- `input.sc.json` — 単語→時刻・信頼度の対応表（編集不要）
-- `input.logic.fcpxml` — Logic Pro 用 FCPXML（未編集のテキストから生成）
-
-テキスト編集後は `sc logic input.sc.txt` で FCPXML を再生成してください。
+- `.wav` ファイルを直接渡すと auto が自動実行されます：`sc input.wav` = `sc auto input.wav`
+- `input.sc.txt` と `input.sc.json` もあわせて生成されます
+- すべての文字起こしオプション（`--lang`、`--verbatim`、`--model` 等）に対応しています
+- トランスクリプトを手動編集したい場合は、以下のステップ実行をお使いください
 
 ### 1. 文字起こし
 
@@ -112,11 +130,11 @@ sc transcribe input.wav [--lang ja|en] [--verbatim] [--no-filler-suggest] [--mod
 - `--verbatim`（既定で有効）: フィラーも転写する。`--no-verbatim` で無効化。verbatim 時は自動で大きいモデル（`mlx-community/whisper-large-v3-mlx`）＋フィラー例文プロンプト＋`condition_on_previous_text=True` に切り替わる
 - `--no-filler-suggest` でフィラー提案を無効化
 - `--pause-threshold`（既定 0.15秒）: ブロック境界の最小ポーズ長。`0` で単語単位削除（旧挙動）
-- 認識用の一時 wav で長い無音（1.2秒以上）を 0.7秒に切り詰め、Whisper の幻覚を抑止。単語時刻は元音源へ逆写像するため出力に影響なし
+- 認識用の一時 wav で長い無音（1.5秒以上）を 0.7秒に切り詰め、Whisper の幻覚を抑止。単語時刻は元音源へ逆写像するため出力に影響なし
 
 ### 2. 編集
 
-`input.sc.txt` を任意のテキストエディタで開く:
+`input.sc.txt` を任意のテキストエディタで開きます:
 
 ```
 [0001 0:00] 結局面倒くさい作業があるなら／ツールを作ればいい
@@ -136,18 +154,18 @@ sc transcribe input.wav [--lang ja|en] [--verbatim] [--no-filler-suggest] [--mod
 ### 3. 音声へ反映
 
 ```sh
-sc render input.sc.txt [-o output.wav] [--gap-threshold 1.2] [--gap-max 0.7]
+sc render input.sc.txt [-o output.wav] [--gap-threshold 1.5] [--gap-max 1.0]
 ```
 
 - 編集後 txt と `input.sc.json` を突き合わせ、**元の input.wav** から切り出して再構成
 - `-o` 省略時の出力は `input.edited.wav`
-- `--gap-threshold`（既定 1.2秒）以下のポーズはそのまま、超えるポーズは `--gap-max`（既定 0.7秒）に切り詰め
+- `--gap-threshold`（既定 1.5秒）以下のポーズはそのまま、超えるポーズは `--gap-max`（既定 1.0秒）に切り詰め
 - 非破壊。何度でも再実行可能
 
 ### 4. Logic Proへ渡す
 
 ```sh
-sc logic input.sc.txt [-o output.fcpxml] [--gap-threshold 1.2] [--gap-max 0.7]
+sc logic input.sc.txt [-o output.fcpxml] [--gap-threshold 1.5] [--gap-max 1.0]
 ```
 
 - `-o` 省略時の出力は `input.logic.fcpxml`
@@ -158,14 +176,14 @@ sc logic input.sc.txt [-o output.fcpxml] [--gap-threshold 1.2] [--gap-max 0.7]
 
 ## フィラー辞書のカスタマイズ
 
-フィラー候補は辞書との**完全一致**で `〔〕` に包まれる。辞書はパッケージ同梱ファイル（1行1語）で編集可能:
+フィラー候補は辞書との**完全一致**で `〔〕` に包まれます。辞書はパッケージ同梱ファイル（1行1語）で編集できます:
 
 - 日本語: `stefnceorf/fillers_ja.txt`（既定: あのー, そのー, えー, えっと, えと, まあ, まー, うーん）
 - 英語: `stefnceorf/fillers_en.txt`（既定: um, uh, uhm, er, ah）
 
 ## フォーク＆AIエージェントでカスタマイズ
 
-このリポジトリは、AIコーディングエージェント（[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、Cursor、GitHub Copilot 等）で**フォークして自分用に改造する**前提で設計されている。
+このリポジトリは、AIコーディングエージェント（[Claude Code](https://docs.anthropic.com/en/docs/claude-code)、Cursor、GitHub Copilot 等）で**フォークして自分用に改造する**前提で設計されています。
 
 同梱されているもの:
 
@@ -195,7 +213,7 @@ AIエージェントへのプロンプト例:
 .venv/bin/python -m pytest -q
 ```
 
-実モデル（mlx-whisper）や `say` コマンドを使う重いテストは `slow` マーカーが付き既定でスキップ。`-m slow` で実行。
+実モデル（mlx-whisper）や `say` コマンドを使う重いテストは `slow` マーカーが付いており、既定ではスキップされます。`-m slow` で実行できます。
 
 ## ロードマップ
 

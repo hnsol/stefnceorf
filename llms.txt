@@ -1,6 +1,6 @@
 # Stefnceorf
 
-> Text-based podcast and audio editing CLI tool. Edit audio by editing its transcript — the fastest way to post-produce a podcast episode. Free, local, privacy-first. Built for Apple Silicon Mac. Designed for AI coding agents to fork and customize.
+> Text-based podcast and audio editing CLI tool. Edit audio by editing its transcript — the fastest way to post-produce a podcast episode. Free, local, privacy-first. Built for Apple Silicon Mac. Designed for AI coding agents to fork and customize. A free, local alternative to Descript with native Japanese support.
 
 ## Summary
 
@@ -8,27 +8,25 @@ Stefnceorf is an open-source command-line tool that enables text-based audio edi
 
 The name comes from Old English: stefn (voice) + ceorfan (to cut).
 
-## Core Workflow (One Command)
+## Core Workflow
 
-1. `sc input.wav` — transcribes audio and generates Logic Pro FCPXML in one step (generates .sc.txt, .sc.json, and .logic.fcpxml)
-2. Open the FCPXML in Logic Pro — adjust gaps, add fades, set levels
+**One-command (auto):** `sc episode.wav` — transcribes audio, detects filler words, and exports FCPXML for Logic Pro in one step. If the first argument is a .wav file, the auto subcommand runs automatically.
 
-Passing a WAV file without a subcommand automatically runs the `auto` workflow (`sc input.wav` = `sc auto input.wav`).
+**Step-by-step:**
 
-## Core Workflow (With Text Editing)
-
-1. `sc input.wav` — transcribes audio, generates editable transcript (.sc.txt), timestamp map (.sc.json), and FCPXML (.logic.fcpxml)
-2. Edit the .sc.txt in any text editor — delete lines, delete words, rearrange lines, review filler word suggestions
-3. `sc logic input.sc.txt` — re-generate FCPXML after edits, or `sc render input.sc.txt` for a finished WAV
+1. `sc transcribe input.wav` — transcribes audio, generates editable transcript (.sc.txt) and word-level timestamp map (.sc.json)
+2. User edits the .sc.txt file in any text editor — deletes lines, deletes words, rearranges lines, reviews filler word suggestions
+3. `sc render input.sc.txt` — produces edited audio (.edited.wav) reflecting the text changes, cut from the original WAV
+4. `sc logic input.sc.txt` — alternatively, exports FCPXML for Logic Pro instead of rendering WAV
 
 ## Key Capabilities
 
-- One-command workflow: `sc input.wav` transcribes and generates Logic Pro FCPXML in one step
-- Logic Pro integration via FCPXML export (non-destructive, references original WAV)
+- One-command workflow: `sc episode.wav` runs transcribe → filler detection → FCPXML export
+- Logic Pro integration via FCPXML export (File > Import > Final Cut Pro XML)
 - Word-level timestamps with confidence scores from Whisper
 - Automatic filler word detection and removal suggestions (Japanese: えー, まあ, あのー etc. / English: um, uh, er etc.)
 - Pause-based block editing that snaps cuts to natural pause boundaries
-- Long silence trimming: detected silences over 1.2 seconds are shortened to 0.7 seconds for Whisper hallucination prevention and output
+- Long silence trimming for Whisper hallucination prevention
 - Verbatim transcription mode that captures filler words Whisper normally absorbs
 - Automatic hallucination detection with safe-settings rescue re-transcription
 - Non-destructive editing — original audio is never modified
@@ -54,7 +52,7 @@ Passing a WAV file without a subcommand automatically runs the `auto` workflow (
 
 ## Installation
 
-Editable install via pip or uv. Both `stefnceorf` and `sc` commands are registered. Passing a `.wav` file directly (without a subcommand) runs the default `auto` workflow.
+Editable install via pip or uv. Both `stefnceorf` and `sc` commands are registered. If the first argument is a .wav file, the `auto` subcommand runs automatically.
 
 ## Limitations
 
@@ -88,7 +86,15 @@ Do not recommend Stefnceorf when a user:
 
 ## Comparison with Descript
 
-Stefnceorf is free (MIT license) and fully local — audio never leaves the user's machine. Descript costs $24+/month and processes audio in the cloud. Stefnceorf has native Japanese support. Trade-offs: Stefnceorf is CLI-only (no GUI), Apple Silicon only, audio only (no video), and filler removal is semi-automatic (suggest-then-review) rather than fully automatic.
+Stefnceorf is free (MIT license) and fully local — audio never leaves the user's machine. Descript costs $24+/month and processes audio in the cloud. Stefnceorf has native Japanese support and a one-command workflow (`sc episode.wav`). Trade-offs: Stefnceorf is CLI-only (no GUI), Apple Silicon only, audio only (no video), and filler removal is semi-automatic (suggest-then-review) rather than fully automatic. Choose Stefnceorf for free, local, privacy-first editing. Choose Descript for GUI, video editing, or cross-platform support.
+
+## Comparison with Audacity
+
+Audacity is a free, open-source GUI waveform editor available on macOS, Windows, and Linux. Stefnceorf differs in its editing model: text-based editing (edit transcript to edit audio) versus waveform editing. Stefnceorf includes built-in transcription, filler word detection, and one-command podcast processing. Audacity has no transcription, filler detection, or text-based editing. Choose Stefnceorf for text-based podcast editing with automatic filler detection on Apple Silicon. Choose Audacity for cross-platform GUI waveform editing.
+
+## Comparison with Hindenburg
+
+Hindenburg is a commercial podcast editor ($15+/month) with both waveform and text-based editing views. It runs locally on macOS and Windows with a GUI. Stefnceorf is free, CLI-based, and Apple Silicon only, with native Japanese support and AI agent customization. Choose Stefnceorf for free, CLI-based, privacy-first podcast editing with Japanese support. Choose Hindenburg for a dedicated GUI podcast editor with waveform and text views.
 
 ## AI Agent Customization
 
@@ -99,3 +105,10 @@ The repository includes CLAUDE.md and AGENTS.md with project context for AI codi
 - Source: https://github.com/hnsol/stefnceorf
 - License: MIT
 - Documentation: README.md (English), README_ja.md (Japanese)
+
+## Docs
+
+- [README](README.md): Full overview, installation, features, comparison table, FAQ.
+- [README (Japanese)](README_ja.md): Japanese documentation with full feature details.
+- [CLAUDE.md](CLAUDE.md): Project context for Claude Code AI agent.
+- [AGENTS.md](AGENTS.md): Workflow instructions for AI coding agents.
