@@ -6,6 +6,11 @@ import pytest
 from stefnceorf import render
 
 
+def test_default_long_gap_limits():
+    assert render.GAP_THRESHOLD_S == pytest.approx(1.2)
+    assert render.GAP_MAX_S == pytest.approx(0.7)
+
+
 # ---- parse_edited_txt ----
 
 def test_parse_plain():
@@ -1475,7 +1480,7 @@ def _make_gap_project(tmp_path, sr=16000):
 
 
 def test_render_gap_trim_and_keep(tmp_path):
-    """既定: 長無音は1.0sに切り詰め、短ポーズは保持される。"""
+    """既定: 長無音は0.7sに切り詰め、短ポーズは保持される。"""
     import soundfile as sf
 
     _make_gap_project(tmp_path)
@@ -1484,10 +1489,10 @@ def test_render_gap_trim_and_keep(tmp_path):
 
     out = render.render(str(txt))
     o_audio, sr = sf.read(out)
-    # 期待: seg1(≈1.22) + トリム無音(≈1.0) + seg2〜seg3を短ポーズ込みで連続(≈2.87)
-    # ≈ 4.72s。tail_margin=0.2 で後方マージンが拡張されている。
+    # 期待: seg1(≈1.22) + トリム無音(≈0.7) + seg2〜seg3を短ポーズ込みで連続(≈2.87)
+    # ≈ 4.42s。tail_margin=0.2 で後方マージンが拡張されている。
     dur = len(o_audio) / sr
-    assert dur == pytest.approx(4.72, abs=0.15)
+    assert dur == pytest.approx(4.42, abs=0.15)
 
 
 def test_render_gap_threshold_keeps_all(tmp_path):
@@ -1519,7 +1524,7 @@ def test_render_old_json_falls_back_to_silences_for_gap_trim(tmp_path):
     out = render.render(str(txt))
     audio, sr = sf.read(out)
 
-    assert len(audio) / sr == pytest.approx(4.72, abs=0.15)
+    assert len(audio) / sr == pytest.approx(4.42, abs=0.15)
 
 
 def test_render_present_empty_trim_silences_does_not_fallback(tmp_path):

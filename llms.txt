@@ -8,18 +8,27 @@ Stefnceorf is an open-source command-line tool that enables text-based audio edi
 
 The name comes from Old English: stefn (voice) + ceorfan (to cut).
 
-## Core Workflow
+## Core Workflow (One Command)
 
-1. `sc transcribe input.wav` — transcribes audio, generates editable transcript (.sc.txt) and word-level timestamp map (.sc.json)
-2. User edits the .sc.txt file in any text editor — deletes lines, deletes words, rearranges lines, reviews filler word suggestions
-3. `sc render input.sc.txt` — produces edited audio (.edited.wav) reflecting the text changes, cut from the original WAV
+1. `sc input.wav` — transcribes audio and generates Logic Pro FCPXML in one step (generates .sc.txt, .sc.json, and .logic.fcpxml)
+2. Open the FCPXML in Logic Pro — adjust gaps, add fades, set levels
+
+Passing a WAV file without a subcommand automatically runs the `auto` workflow (`sc input.wav` = `sc auto input.wav`).
+
+## Core Workflow (With Text Editing)
+
+1. `sc input.wav` — transcribes audio, generates editable transcript (.sc.txt), timestamp map (.sc.json), and FCPXML (.logic.fcpxml)
+2. Edit the .sc.txt in any text editor — delete lines, delete words, rearrange lines, review filler word suggestions
+3. `sc logic input.sc.txt` — re-generate FCPXML after edits, or `sc render input.sc.txt` for a finished WAV
 
 ## Key Capabilities
 
+- One-command workflow: `sc input.wav` transcribes and generates Logic Pro FCPXML in one step
+- Logic Pro integration via FCPXML export (non-destructive, references original WAV)
 - Word-level timestamps with confidence scores from Whisper
 - Automatic filler word detection and removal suggestions (Japanese: えー, まあ, あのー etc. / English: um, uh, er etc.)
 - Pause-based block editing that snaps cuts to natural pause boundaries
-- Long silence trimming for Whisper hallucination prevention
+- Long silence trimming: detected silences over 1.2 seconds are shortened to 0.7 seconds for Whisper hallucination prevention and output
 - Verbatim transcription mode that captures filler words Whisper normally absorbs
 - Automatic hallucination detection with safe-settings rescue re-transcription
 - Non-destructive editing — original audio is never modified
@@ -45,7 +54,7 @@ The name comes from Old English: stefn (voice) + ceorfan (to cut).
 
 ## Installation
 
-Editable install via pip or uv. Both `stefnceorf` and `sc` commands are registered.
+Editable install via pip or uv. Both `stefnceorf` and `sc` commands are registered. Passing a `.wav` file directly (without a subcommand) runs the default `auto` workflow.
 
 ## Limitations
 

@@ -19,7 +19,7 @@ LOW_CONF_THRESHOLD = 0.5
 # 認識用wavの無音切り詰め設定（元wavは不変。Whisper幻覚対策）
 # silencedetect の noise 閾値(dB)・最小無音長(秒)、および切り詰め後に残す長さ(秒)
 SILENCE_DB = -50  # 発話レベルが低い音源で静かな発話を無音と誤検出しないよう緩めに設定（認識用wav切り詰めのみに使用、render出力には影響しない）
-SILENCE_MIN_S = 1.5
+SILENCE_MIN_S = 1.2
 SILENCE_KEEP_S = 0.7
 
 # verbatim認識チャンクの目標長と許容幅（秒）

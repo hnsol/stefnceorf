@@ -24,17 +24,22 @@ A local, free, privacy-first alternative to [Descript](https://www.descript.com/
 
 > **Requires Apple Silicon Mac** (M1/M2/M3/M4). Intel Macs are not supported. See [FAQ](#can-i-use-stefnceorf-on-windows-or-linux) for cross-platform options.
 
-## Quick Start — Edit a Podcast Episode in 3 Steps
+## Quick Start
 
 ```sh
-sc transcribe episode.wav      # generates episode.sc.txt + episode.sc.json
-$EDITOR episode.sc.txt          # edit the transcript (delete lines, words, filler)
-# Choose one final output:
-sc render episode.sc.txt        # generates episode.edited.wav
-sc logic episode.sc.txt         # generates episode.logic.fcpxml for Logic Pro
+sc episode.wav                   # transcribe + generate Logic Pro FCPXML in one step
 ```
 
-After editing the transcript, render a WAV or send the edit plan to Logic Pro.
+Just pass a WAV file — Stefnceorf transcribes the audio and generates `episode.sc.txt`, `episode.sc.json`, and `episode.logic.fcpxml`. Open the FCPXML in Logic Pro and you're editing.
+
+Want to clean up the transcript first? Edit the text, then re-export:
+
+```sh
+sc episode.wav                   # generates .sc.txt + .sc.json + .logic.fcpxml
+$EDITOR episode.sc.txt           # edit the transcript (delete lines, words, filler)
+sc logic episode.sc.txt          # re-generate FCPXML after edits
+sc render episode.sc.txt         # or render directly to .edited.wav
+```
 
 ## What Is Text-Based Audio Editing?
 
@@ -61,7 +66,7 @@ Editing is **non-destructive** — the original audio file is never modified, an
 - **Text-based editing** — Edit a plain text file in your favorite editor. Delete text to delete audio.
 - **Filler word detection** — Automatically suggests filler words (`um`, `uh`, `えー`, `まあ`) for removal. You review each suggestion and decide.
 - **Pause-based block editing** — Cuts snap to natural pause boundaries, preventing unnatural audio joins.
-- **Confirmed long silence trimming** — Detected silences over 1.5 seconds are shortened for Whisper hallucination prevention and output; unknown or partially covered gaps are preserved.
+- **Confirmed long silence trimming** — Detected silences over 1.2 seconds are shortened to 0.7 seconds for Whisper hallucination prevention and output; unknown or partially covered gaps are preserved.
 - **Verbatim mode** — Transcribes filler words and hesitations that Whisper normally absorbs, enabling a filler-removal workflow.
 - **Hallucination detection & rescue** — Automatically detects Whisper hallucinations, rescues the affected audio by re-transcribing with safe settings.
 - **Quality preservation** — WAV render output matches original sample rate and bit depth. Equal-power crossfade at cut boundaries prevents click noise.
@@ -132,11 +137,27 @@ python -m venv .venv
 .venv/bin/pip install -e .
 ```
 
-Both `stefnceorf` and `sc` (shorthand) commands are registered. Subcommands can be abbreviated: `sc trans` = `sc transcribe`.
+Both `stefnceorf` and `sc` (shorthand) commands are registered. Subcommands can be abbreviated: `sc trans` = `sc transcribe`. Passing a `.wav` file directly (without a subcommand) runs `auto`.
 
 Dependencies: [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper), numpy, soundfile.
 
 ## Usage
+
+### Auto (Default)
+
+```sh
+sc input.wav [--lang ja|en] [--no-verbatim] [--no-filler-suggest] [-o output.fcpxml]
+```
+
+Runs transcription and FCPXML export in one step. Equivalent to `sc transcribe` followed by `sc logic`. This is the default when you pass a WAV file without a subcommand — `sc input.wav` and `sc auto input.wav` are identical.
+
+Generates three files:
+
+- `input.sc.txt` — editable transcript
+- `input.sc.json` — word-level timestamp data (do not edit)
+- `input.logic.fcpxml` — Logic Pro FCPXML (from the unedited transcript)
+
+After editing the transcript, re-run `sc logic input.sc.txt` to generate an updated FCPXML.
 
 ### Transcribe
 
@@ -172,7 +193,7 @@ Key points:
 ### Render
 
 ```sh
-sc render input.sc.txt [-o output.wav] [--gap-threshold 1.5] [--gap-max 1.0]
+sc render input.sc.txt [-o output.wav] [--gap-threshold 1.2] [--gap-max 0.7]
 ```
 
 Produces `input.edited.wav` (or the path given by `-o`). Cuts are made from the **original WAV** — no quality degradation from multiple re-renders.
@@ -180,7 +201,7 @@ Produces `input.edited.wav` (or the path given by `-o`). Cuts are made from the 
 ### Send to Logic Pro
 
 ```sh
-sc logic input.sc.txt [-o output.fcpxml] [--gap-threshold 1.5] [--gap-max 1.0]
+sc logic input.sc.txt [-o output.fcpxml] [--gap-threshold 1.2] [--gap-max 0.7]
 ```
 
 Produces `input.logic.fcpxml` by default. In Logic Pro, choose **File > Import > Final Cut Pro XML** and select that file. The FCPXML references the original WAV directly and preserves transcript deletions, line reordering, filler decisions, and long-silence handling. Normal deletions remain as gaps matching the deleted duration, while reordered-region boundaries have a one-second gap. No fades or crossfades are included; add fades in Logic as needed. If the original WAV is moved, Logic may ask you to relink it.

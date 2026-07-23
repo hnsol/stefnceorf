@@ -8,6 +8,11 @@ from stefnceorf import transcribe
 from stefnceorf import fillers as fillers_mod
 
 
+def test_default_silence_trim_limits():
+    assert transcribe.SILENCE_MIN_S == pytest.approx(1.2)
+    assert transcribe.SILENCE_KEEP_S == pytest.approx(0.7)
+
+
 # ---- plan_chunks（純関数） ----
 
 def test_plan_chunks_chooses_longest_silence_near_target():

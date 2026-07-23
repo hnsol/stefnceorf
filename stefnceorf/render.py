@@ -36,8 +36,8 @@ FADE_S = 0.008
 
 # ギャップ（無音ポーズ）保持・切り詰めのしきい値と上限（秒）
 # g ≤ GAP_THRESHOLD_S: そのまま保持 / g > GAP_THRESHOLD_S: GAP_MAX_S に切り詰め
-GAP_THRESHOLD_S = 1.5
-GAP_MAX_S = 1.0
+GAP_THRESHOLD_S = 1.2
+GAP_MAX_S = 0.7
 
 
 @dataclass(frozen=True)

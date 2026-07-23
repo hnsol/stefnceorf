@@ -192,6 +192,7 @@ v1（faster-whisper＋WhisperX 2段構成）からの変更理由：導入済み
   - **stable-ts 2.19.1 + MLX**：3本すべてで連続転写し、timestamp missing / out-of-bounds / backward は各0件、filler候補は7 / 7 / 5、処理時間は各約7秒、peak RSSは約6.54GiB。ただし短尺だけの結果であり、未認識窓全体、長い履歴文脈、render、試聴は未検証。OpenMP runtimeの統一も必要だったため、現時点では依存を追加せず、別計画を開始する有力なトリガーとして残す
   - **WhisperX 3.8.6**：filler候補は7 / 6 / 2。3本目は47文字だけで冒頭内容が欠落し、時刻も不自然に伸長した。batched経路では一部decode閾値を適用できない backend-native screening であり、今回のレスキューバックエンド候補には不採用。初回downloadを除くwarm run 2本は約38 / 31秒、peak RSSは約3.91GiB
   - 継続判断：stable-tsは短尺では明確な改善候補だが、長尺と最終音声の安全性が未確認なので現行実装へ直結させない。別計画でfull window / long context / render / 試聴を検証し、自然な接続と音声保持を満たす場合だけ移行を検討する
+- **長無音の既定値変更（2026-07-23、ユーザー承認済み）**：試聴で1.5秒超→1.0秒は間が長かったため、出力既定値を1.2秒超→0.7秒へ変更。1.2〜1.5秒も `trim_silences` へ記録されるよう認識用 `SILENCE_MIN_S` も1.2秒へ揃えた。`-50dB` は維持し、CLIオプションで上書き可
 - **Logic Pro用FCPXML出力（2026-07-23、ユーザー承認済み）**：`input.logic.fcpxml` をFCPXML 1.8のサイドカーとして出力する。renderと共有する編集プランを用い、元WAVを直接参照する。リージョンは編集後テキストの順序で配置し、通常の削除境界には削除した音声と同じ長さの空白を残す。元音声上の時間が逆行する境界、または境界間の元音声が別の位置に残っている境界を並べ替え境界とし、固定1秒の空白を置く。フェードはFCPXMLへ含めず、Logic Proで手動適用する。WAV renderの連続配置・クロスフェード挙動は変更しない。このブランチはverbatim-hallucination-containmentの変更に依存する。
 
 ## 12. 受け入れテスト
