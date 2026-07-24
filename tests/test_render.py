@@ -583,6 +583,31 @@ def test_plan_long_gap_trimmed():
     assert flags == [False]
 
 
+def test_plan_output_intervals_trims_only_known_silence_overlap():
+    out, flags = render.plan_output_intervals(
+        [(0.0, 1.0), (4.0, 5.0)],
+        [(0.0, 1.0), (4.0, 5.0)],
+        gap_threshold=1.2,
+        gap_max=0.7,
+        silence_spans=[(1.2, 3.8)],
+    )
+    assert out[0] == pytest.approx((0.0, 1.55))
+    assert out[1] == pytest.approx((3.45, 5.0))
+    assert flags == [False]
+
+
+def test_plan_output_intervals_preserves_partial_unknown_gap_edges():
+    out, _ = render.plan_output_intervals(
+        [(0.0, 1.0), (4.0, 5.0)],
+        [(0.0, 1.0), (4.0, 5.0)],
+        gap_threshold=1.2,
+        gap_max=0.7,
+        silence_spans=[(1.2, 3.8)],
+    )
+    assert out[0][1] > 1.2
+    assert out[1][0] < 3.8
+
+
 def test_plan_deleted_word_in_gap_not_merged():
     # ギャップ [1.0,4.0] に削除単語 [1.5,3.5] が挟まる → クロスフェード結合
     ivs = [(0.0, 1.0), (4.0, 5.0)]
@@ -677,7 +702,7 @@ def test_plan_missing_silence_metadata_preserves_unknown_gap():
     assert flags == []
 
 
-def test_plan_partly_known_silence_preserves_whole_gap():
+def test_plan_partly_known_silence_trims_only_known_overlap():
     ivs = [(0.0, 1.0), (4.0, 5.0)]
 
     out, flags = render.plan_output_intervals(
@@ -685,8 +710,11 @@ def test_plan_partly_known_silence_preserves_whole_gap():
         silence_spans=[(1.0, 3.9)],
     )
 
-    assert out == [(0.0, 5.0)]
-    assert flags == []
+    assert out == [
+        (0.0, pytest.approx(1.35)),
+        (pytest.approx(3.55), 5.0),
+    ]
+    assert flags == [False]
 
 
 # ---- warn_hot_boundaries（通常削除の境界警告 純関数） ----

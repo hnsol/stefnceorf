@@ -551,9 +551,9 @@ def plan_output_intervals(
        min(pre_avail + post_avail, filler_pause_keep)）。無音中のカットなので
        単純結合（cf_flags False）。
     4. g ≤ gap_threshold: ギャップ音声を保持（連続マージ）
-       g > gap_threshold: silence_spans の和集合がギャップ全体を完全被覆する場合だけ
-       gap_max に切り詰める。旧JSON・未知区間・部分被覆は発話の可能性があるため
-       ギャップ全体を保持する。
+       g > gap_threshold: silence_spans とギャップの共通部分のうち gap_max を超える
+       既知無音だけを gap_max に切り詰める。旧JSON・未知区間・短い既知無音は
+       発話の可能性があるため保持する。
 
     戻り値: (区間列, クロスフェードフラグ列)。フラグ列の長さは len(区間列)-1。
     True=クロスフェード結合、False=単純結合（ギャップ切り詰め・フィラーポーズ境界）。
@@ -563,29 +563,22 @@ def plan_output_intervals(
 
     fspans = filler_spans or []
 
-    def _known_silence_covers(start: float, end: float) -> bool:
+    def _known_silence_overlaps(start: float, end: float) -> list[tuple[float, float]]:
         if not silence_spans or end <= start:
-            return False
-        cursor = start
+            return []
         merged: list[list[float]] = []
         for span_start, span_end in sorted(
-            (float(s), float(e))
+            (max(start, float(s)), min(end, float(e)))
             for s, e in silence_spans
-            if float(e) > float(s)
+            if float(e) > start and float(s) < end
         ):
+            if span_end <= span_start:
+                continue
             if merged and span_start <= merged[-1][1]:
                 merged[-1][1] = max(merged[-1][1], span_end)
             else:
                 merged.append([span_start, span_end])
-        for span_start, span_end in merged:
-            if span_end <= cursor:
-                continue
-            if span_start > cursor:
-                return False
-            cursor = max(cursor, span_end)
-            if cursor >= end:
-                return True
-        return False
+        return [(span_start, span_end) for span_start, span_end in merged]
 
     out: list[tuple[float, float]] = []
     cf_flags: list[bool] = []
@@ -631,17 +624,22 @@ def plan_output_intervals(
             pending = [ns - post_keep, cur[1]]
             continue
         # 4. 純無音ギャップ
-        if (
-            g <= gap_threshold
-            or g <= gap_max
-            or not _known_silence_covers(pe, ns)
-        ):
+        if g <= gap_threshold or g <= gap_max:
             pending[1] = cur[1]
-        else:
-            pending[1] = pe + half
+            continue
+
+        trimmed = False
+        for silence_start, silence_end in _known_silence_overlaps(pe, ns):
+            silence_duration = silence_end - silence_start
+            if silence_duration <= gap_max:
+                continue
+            pending[1] = silence_start + half
             out.append((pending[0], pending[1]))
             cf_flags.append(False)
-            pending = [ns - half, cur[1]]
+            pending = [silence_end - half, cur[1]]
+            trimmed = True
+        if not trimmed:
+            pending[1] = cur[1]
     out.append((pending[0], pending[1]))
     return out, cf_flags
 
