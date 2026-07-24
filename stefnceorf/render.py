@@ -69,6 +69,7 @@ class EditPlan:
     total_samples: int
     output_intervals: list[tuple[float, float]]
     crossfade_flags: list[bool]
+    silence_trim_boundaries: frozenset[int]
     warnings: list[str]
     stats: EditStats
 
@@ -1052,10 +1053,12 @@ def build_edit_plan(
     # ただしフィラーポーズ境界（filler_cut_spans と重なる）は無音切り詰めでないため除外。
     silence_trim_count = 0
     silence_trim_removed_s = 0.0
+    silence_trim_boundaries: set[int] = set()
     for k in range(len(out_intervals) - 1):
         if k < len(cf_flags) and not cf_flags[k]:
             pe, ns = out_intervals[k][1], out_intervals[k + 1][0]
             if not any(s < ns and e > pe for s, e in filler_cut_spans):
+                silence_trim_boundaries.add(k)
                 silence_trim_count += 1
                 silence_trim_removed_s += ns - pe
 
@@ -1091,6 +1094,7 @@ def build_edit_plan(
         total_samples=total_samples,
         output_intervals=out_intervals,
         crossfade_flags=cf_flags,
+        silence_trim_boundaries=frozenset(silence_trim_boundaries),
         warnings=all_warnings,
         stats=stats,
     )

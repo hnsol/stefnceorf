@@ -38,10 +38,13 @@ def _audio_layout(channels: int) -> str:
 
 
 def _timeline_offsets(
-    bounds: list[tuple[int, int]], samplerate: int
+    bounds: list[tuple[int, int]],
+    samplerate: int,
+    close_boundaries: set[int] | frozenset[int] | None = None,
 ) -> tuple[list[int], int]:
     if not bounds:
         return [], 0
+    closed = close_boundaries or set()
     offsets = [0]
     destination = bounds[0][1] - bounds[0][0]
     for index in range(1, len(bounds)):
@@ -56,9 +59,12 @@ def _timeline_offsets(
             for other_index, (other_start, other_end) in enumerate(bounds)
         )
         reordered = current_start < previous_start or retained_in_gap
-        gap = samplerate * REORDER_GAP_S if reordered else max(
-            0, current_start - previous_end
-        )
+        if index - 1 in closed:
+            gap = 0
+        else:
+            gap = samplerate * REORDER_GAP_S if reordered else max(
+                0, current_start - previous_end
+            )
         destination += gap
         offsets.append(destination)
         destination += current_end - current_start
@@ -127,13 +133,22 @@ def export_fcpxml(
     sequence = ET.SubElement(project, "sequence", sequence_attrs)
     spine = ET.SubElement(sequence, "spine")
 
-    bounds = []
-    for start, end in plan.output_intervals:
+    indexed_bounds = []
+    for original_index, (start, end) in enumerate(plan.output_intervals):
         source_start = max(0, int(round(start * rate)))
         source_end = min(plan.total_samples, int(round(end * rate)))
         if source_end > source_start:
-            bounds.append((source_start, source_end))
-    offsets, timeline_end = _timeline_offsets(bounds, rate)
+            indexed_bounds.append((original_index, (source_start, source_end)))
+    bounds = [bound for _, bound in indexed_bounds]
+    close_boundaries = {
+        compact_index
+        for compact_index in range(len(indexed_bounds) - 1)
+        if indexed_bounds[compact_index + 1][0] == indexed_bounds[compact_index][0] + 1
+        and indexed_bounds[compact_index][0] in plan.silence_trim_boundaries
+    }
+    offsets, timeline_end = _timeline_offsets(
+        bounds, rate, close_boundaries=close_boundaries
+    )
 
     for clip_number, ((source_start, source_end), offset) in enumerate(
         zip(bounds, offsets), start=1
