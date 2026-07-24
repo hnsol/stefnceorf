@@ -13,7 +13,15 @@ import numpy as np
 import pytest
 
 from stefnceorf import render
-from stefnceorf.fcpxml import export_fcpxml
+from stefnceorf.fcpxml import (
+    EDGE_SAFE_DBFS,
+    EDGE_SEARCH_S,
+    export_fcpxml,
+    _snap_edge_inward,
+    _snap_region,
+)
+
+_SAFE_AMP = 10 ** (EDGE_SAFE_DBFS / 20.0)
 
 
 def _write_project(
@@ -292,6 +300,144 @@ def test_planner_warning_is_printed_once(tmp_path, capsys):
     export_fcpxml(str(txt))
     err = capsys.readouterr().err
     assert err.count("警告:") == 1
+
+
+def _write_sine_project(
+    root: Path,
+    *,
+    freq: float = 240.0,
+    channels: int = 1,
+    samplerate: int = 48000,
+    segments: list[dict] | None = None,
+    txt: str = "[0001] A\n[0002] B\n",
+) -> tuple[Path, Path, int]:
+    import soundfile as sf
+
+    root.mkdir(parents=True, exist_ok=True)
+    wav = root / "元 音声.wav"
+    frames = samplerate * 6
+    t = np.arange(frames) / samplerate
+    mono = 0.5 * np.sin(2 * np.pi * freq * t)
+    audio = mono if channels == 1 else np.stack([mono] * channels, axis=1)
+    sf.write(wav, audio, samplerate, subtype="PCM_16")
+    if segments is None:
+        segments = [
+            {
+                "id": "0001",
+                "text": "A",
+                "words": [],
+                "kind": "unrecognized",
+                "source_start": 0.5003,
+                "source_end": 1.4007,
+            },
+            {
+                "id": "0002",
+                "text": "B",
+                "words": [],
+                "kind": "unrecognized",
+                "source_start": 2.3001,
+                "source_end": 3.2009,
+            },
+        ]
+    data = {"source_wav": str(wav), "language": "ja", "segments": segments}
+    (root / "input.sc.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+    txt_path = root / "input.sc.txt"
+    txt_path.write_text(txt, encoding="utf-8")
+    return txt_path, wav, samplerate
+
+
+def test_snap_edge_leaves_safe_boundary_unchanged():
+    sr = 48000
+    audio = np.zeros(sr)
+    assert _snap_edge_inward(audio, sr, 1000, +1, sr - 1) == 1000
+    assert _snap_edge_inward(audio, sr, 1000, -1, 0) == 1000
+
+
+def test_snap_edge_moves_high_amplitude_edge_inward_to_quiet():
+    sr = 48000
+    t = np.arange(sr) / sr
+    audio = 0.5 * np.sin(2 * np.pi * 240 * t)  # exact zeros every 100 samples
+    max_search = int(round(EDGE_SEARCH_S * sr))
+    # peak at sample 50 (phase pi/2) -> start edge scans forward
+    start_new = _snap_edge_inward(audio, sr, 50, +1, len(audio) - 1)
+    assert start_new >= 50
+    assert start_new - 50 <= max_search
+    assert abs(audio[start_new]) <= _SAFE_AMP
+    # peak at sample 250 -> end edge scans backward
+    end_new = _snap_edge_inward(audio, sr, 250, -1, 0)
+    assert end_new <= 250
+    assert 250 - end_new <= max_search
+    assert abs(audio[end_new]) <= _SAFE_AMP
+
+
+def test_snap_edge_respects_limit_sample():
+    sr = 48000
+    t = np.arange(sr) / sr
+    audio = 0.5 * np.sin(2 * np.pi * 240 * t)
+    # forward direction cannot pass limit_sample
+    result = _snap_edge_inward(audio, sr, 50, +1, 70)
+    assert 50 <= result <= 70
+
+
+def test_snap_edge_stereo_uses_cross_channel_max():
+    sr = 48000
+    t = np.arange(sr) / sr
+    left = 0.5 * np.sin(2 * np.pi * 220 * t)
+    right = 0.5 * np.cos(2 * np.pi * 220 * t)  # never silent together
+    audio = np.stack([left, right], axis=1)
+    max_search = int(round(EDGE_SEARCH_S * sr))
+    peak = 100
+    result = _snap_edge_inward(audio, sr, peak, +1, len(audio) - 1)
+    window = np.max(np.abs(audio[peak : peak + max_search + 1]), axis=1)
+    expected = peak + int(np.argmin(window))
+    # no sub-threshold point exists -> falls back to min cross-channel max
+    assert window.min() > _SAFE_AMP
+    assert result == expected
+
+
+def test_snap_region_only_moves_inward():
+    sr = 48000
+    t = np.arange(sr) / sr
+    audio = 0.5 * np.sin(2 * np.pi * 240 * t)
+    start, end = 5013, 9007
+    new_start, new_end = _snap_region(audio, sr, start, end)
+    assert new_start >= start
+    assert new_end <= end
+    assert new_end - new_start >= 1
+    assert abs(audio[new_start]) <= _SAFE_AMP
+    assert abs(audio[new_end - 1]) <= _SAFE_AMP
+
+
+@pytest.mark.parametrize("length", [1, 2, 5, 480])
+def test_snap_region_keeps_minimum_length(length):
+    sr = 48000
+    t = np.arange(sr) / sr
+    audio = 0.5 * np.sin(2 * np.pi * 240 * t)
+    start = 1013
+    end = start + length
+    new_start, new_end = _snap_region(audio, sr, start, end)
+    assert new_end - new_start >= 1
+    assert new_start >= start
+    assert new_end <= end
+
+
+def test_export_snaps_clip_boundaries_to_quiet(tmp_path):
+    import soundfile as sf
+
+    txt, wav, sr = _write_sine_project(tmp_path)
+    audio, _ = sf.read(wav, dtype="float64", always_2d=False)
+    output = export_fcpxml(str(txt))
+    clips = _root(output).findall("project/sequence/spine/asset-clip")
+    assert clips
+    for clip in clips:
+        start = _time_samples(clip.attrib["start"], sr)
+        duration = _time_samples(clip.attrib["duration"], sr)
+        end = start + duration
+        assert duration >= 1
+        assert abs(audio[start]) <= _SAFE_AMP
+        assert abs(audio[end - 1]) <= _SAFE_AMP
 
 
 def test_generated_xml_validates_against_logic_dtd_when_available(tmp_path):

@@ -7,7 +7,15 @@ from fractions import Fraction
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
+import numpy as np
+
 from .render import GAP_MAX_S, GAP_THRESHOLD_S, build_edit_plan, format_stats
+
+
+# Logic 用 FCPXML はフェードを持たないため、リージョン端を内側の静音点へ
+# 寄せてクリックノイズを防ぐ。最大補正幅と安全とみなす振幅閾値。
+EDGE_SEARCH_S = 0.005
+EDGE_SAFE_DBFS = -50.0
 
 
 _SEQUENCE_AUDIO_RATES = {
@@ -27,6 +35,87 @@ def _time(samples: int, samplerate: int) -> str:
     if value.denominator == 1:
         return f"{value.numerator}s"
     return f"{value.numerator}/{value.denominator}s"
+
+
+def _abs_max_at(audio, index: int) -> float:
+    """指定サンプルの全チャンネル横断の最大 |振幅| を返す。"""
+    value = audio[index]
+    if audio.ndim == 1:
+        return abs(float(value))
+    return float(np.max(np.abs(value)))
+
+
+def _snap_edge_inward(
+    audio, samplerate: int, sample: int, direction: int, limit_sample: int
+) -> int:
+    """リージョン端を内側（direction 方向）へ最大 EDGE_SEARCH_S 走査し補正する。
+
+    全チャンネルの |振幅| が閾値以下になる最短距離の位置を返す。無ければ
+    走査範囲内でチャンネル横断の最大 |振幅| が最小のサンプルを返す。走査
+    範囲が空なら sample をそのまま返す。外側（direction の逆）へは動かない。
+    """
+    total = len(audio)
+    if total == 0:
+        return sample
+    max_search = int(round(EDGE_SEARCH_S * samplerate))
+    threshold = 10 ** (EDGE_SAFE_DBFS / 20.0)
+
+    candidates: list[int] = []
+    for distance in range(0, max_search + 1):
+        idx = sample + direction * distance
+        if idx < 0 or idx >= total:
+            break
+        if direction > 0 and idx > limit_sample:
+            break
+        if direction < 0 and idx < limit_sample:
+            break
+        candidates.append(idx)
+    if not candidates:
+        return sample
+
+    best_idx = candidates[0]
+    best_amp: float | None = None
+    for idx in candidates:  # 距離の近い順
+        amp = _abs_max_at(audio, idx)
+        if amp <= threshold:
+            return idx
+        if best_amp is None or amp < best_amp:
+            best_amp = amp
+            best_idx = idx
+    return best_idx
+
+
+def _snap_region(
+    audio, samplerate: int, start_sample: int, end_sample: int
+) -> tuple[int, int]:
+    """リージョン両端を内側の静音点へ補正する。
+
+    start 端は後方（+1）、end 端は前方（-1）へ寄せる。end_sample は排他境界
+    なので評価対象は最終サンプル index end_sample-1。外側へは動かさず、補正で
+    長さが 1 サンプル未満になる場合は元値を返す。
+    """
+    total = len(audio)
+    if total == 0 or end_sample - start_sample < 1:
+        return start_sample, end_sample
+
+    # 互いの補正が交差しないよう区間中点で制約する。
+    mid = (start_sample + end_sample) // 2
+    start_limit = min(mid, end_sample - 1)
+    new_start = _snap_edge_inward(
+        audio, samplerate, start_sample, +1, start_limit
+    )
+    new_start = max(start_sample, min(new_start, end_sample - 1))
+
+    end_limit = new_start
+    new_end_boundary = _snap_edge_inward(
+        audio, samplerate, end_sample - 1, -1, end_limit
+    )
+    new_end = new_end_boundary + 1
+    new_end = min(end_sample, max(new_end, new_start + 1))
+
+    if new_end - new_start < 1:
+        return start_sample, end_sample
+    return new_start, new_end
 
 
 def _audio_layout(channels: int) -> str:
@@ -132,6 +221,9 @@ def export_fcpxml(
         source_start = max(0, int(round(start * rate)))
         source_end = min(plan.total_samples, int(round(end * rate)))
         if source_end > source_start:
+            source_start, source_end = _snap_region(
+                plan.audio, rate, source_start, source_end
+            )
             bounds.append((source_start, source_end))
     offsets, timeline_end = _timeline_offsets(bounds, rate)
 

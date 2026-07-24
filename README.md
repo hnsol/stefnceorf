@@ -208,7 +208,7 @@ Produces `input.edited.wav` (or the path given by `-o`). Cuts are made from the 
 sc logic input.sc.txt [-o output.fcpxml] [--gap-threshold 1.5] [--gap-max 1.0]
 ```
 
-Produces `input.logic.fcpxml` by default. In Logic Pro, choose **File > Import > Final Cut Pro XML** and select that file. The FCPXML references the original WAV directly and preserves transcript deletions, line reordering, filler decisions, and long-silence handling. Normal deletions remain as gaps matching the deleted duration, while reordered-region boundaries have a one-second gap. No fades or crossfades are included; add fades in Logic as needed. If the original WAV is moved, Logic may ask you to relink it.
+Produces `input.logic.fcpxml` by default. In Logic Pro, choose **File > Import > Final Cut Pro XML** and select that file. The FCPXML references the original WAV directly and preserves transcript deletions, line reordering, filler decisions, and long-silence handling. Normal deletions remain as gaps matching the deleted duration, while reordered-region boundaries have a one-second gap. No fades or crossfades are included; add fades in Logic as needed. To compensate for the fade-free design, each region edge is automatically snapped up to 5 ms inward to a quiet point (at or below -50 dBFS) to prevent click noise. If the original WAV is moved, Logic may ask you to relink it.
 
 ## Filler Dictionary
 
