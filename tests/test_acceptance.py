@@ -508,6 +508,93 @@ def test_no_click_at_cut_boundary(tmp_path):
 
 
 # ==========================================================================
+# auto 主フロー不変条件: 未編集txt素通し
+#   `sc auto`（wav→transcribe→未編集txtを素通し→render）が依存する
+#   「未編集の .sc.txt では全ての〔〕提案が残る＝全提案フィラーが削除指定」
+#   というテキスト規約を、transcribe の実出力生成経路で固定する。
+# ==========================================================================
+
+def test_auto_unedited_txt_removes_all_suggested_fillers(tmp_path):
+    from stefnceorf import fillers as fillers_mod, transcribe
+
+    freqs = [200, 400, 600]
+    # 中央「まあ」= 400Hz。blocks=[[0,1,2]] で「まあ」は単独ブロック→提案対象。
+    # 音響安全判定を通すため既存 test_filler_bracket_kept_is_removed と同様に
+    # まあ[1,2] の両境界へ宣言無音＋実無音化を用意する。
+    _build_project(
+        tmp_path, [[("か", 200), ("まあ", 400), ("き", 600)]],
+        blocks=[[0, 1, 2]],
+        silences=[[0.98, 1.02], [1.98, 2.02]],
+        zero_ranges=[[0.98, 1.02], [1.98, 2.02]],
+    )
+    # txt は手書きせず、transcribe が生成するのと同じ経路で組み立てる:
+    # 生成 json の words から build_segment_line で「未編集txt」を作る。
+    data = json.loads((tmp_path / "input.sc.json").read_text(encoding="utf-8"))
+    words = data["segments"][0]["words"]
+    fillers = fillers_mod.load_fillers("ja")
+    line, _count = transcribe.build_segment_line(
+        "0001", words, fillers, filler_suggest=True, blocks=[0, 1, 2]
+    )
+    # 前提確認: 未編集txtに提案フィラー〔まあ〕が残っている。
+    assert "〔まあ〕" in line
+
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text(line + "\n", encoding="utf-8")
+
+    out = render.render(str(txt))
+    audio, sr = sf.read(out)
+    present = _present_freqs(audio, sr, freqs)
+    assert 400 not in present  # 全提案フィラーが削除指定として消える
+    assert _freq_sequence(audio, sr, freqs) == [200, 600]
+
+
+def test_auto_unedited_txt_trims_long_silence_gap(tmp_path):
+    freqs = [200, 600]
+    # _build_project は単語を隙間なく配置するので使えない。手書き json を作る:
+    # word1「あ」200Hz[0,1] / word2「い」600Hz[4,5]、1.0〜4.0秒を無音化し、
+    # 出力側の長無音短縮用に trim_silences=[[1.0, 4.0]] を持たせる。
+    def _sine(dur, freq):
+        t = np.arange(int(round(dur * SR))) / SR
+        return 0.3 * np.sin(2 * np.pi * freq * t)
+
+    audio_src = np.concatenate([
+        _sine(1.0, 200), np.zeros(int(round(3.0 * SR))), _sine(1.0, 600),
+    ])
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), audio_src, SR, subtype="PCM_16")
+    data = {
+        "source_wav": str(wav.resolve()),
+        "language": "ja",
+        "model": "test",
+        "trim_silences": [[1.0, 4.0]],
+        "segments": [
+            {"id": "0001", "text": "あ",
+             "words": [{"word": "あ", "start": 0.0, "end": 1.0,
+                        "probability": 0.9}]},
+            {"id": "0002", "text": "い",
+             "words": [{"word": "い", "start": 4.0, "end": 5.0,
+                        "probability": 0.9}]},
+        ],
+    }
+    (tmp_path / "input.sc.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あ\n[0002] い\n", encoding="utf-8")  # 未編集txt
+
+    out = render.render(str(txt))  # 既定 gap_threshold=1.2, gap_max=0.7
+    audio, sr = sf.read(out)
+    # 単語1s + 保持ギャップ0.7s + 単語1s ≒ 2.7秒（マージン分の許容 ±SR//4）
+    assert abs(len(audio) - int(round(2.7 * SR))) < SR // 4
+    assert _freq_sequence(audio, sr, freqs) == [200, 600]
+
+    plan = render.build_edit_plan(str(txt))
+    assert plan.stats.silence_trim_count == 1
+    # gap 3.0s − 保持 0.7s = 2.3s（前後マージンが gap を約0.22s 侵食するため許容）
+    assert abs(plan.stats.silence_trim_removed_s - 2.3) < 0.3
+
+
+# ==========================================================================
 # 統合テスト(任意/ローカル): say 合成 → transcribe → render
 #   `-m slow` 明示時のみ実行。mlx_whisper / say / ffmpeg が必要。
 # ==========================================================================
