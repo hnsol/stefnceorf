@@ -17,3 +17,11 @@
 - 1エントリ10行以内
 - 1行だけの追記はしない。毎回上記の構造で書く
 - 記録先は .Codex/Codex.local.md を参照
+
+## リリース手順
+- バージョンは pyproject.toml の version 1箇所で管理する
+  - stefnceorf/__init__.py の __version__ は importlib.metadata で自動取得。手で書き換えない
+- リリース時の手順:
+  1. pyproject.toml の version を上げてコミット・push
+  2. `git tag vX.Y.Z` して `git push origin vX.Y.Z`（タグ名は pyproject の version と一致させる）
+  3. `gh release create vX.Y.Z` でリリースノート付き Release を作成
