@@ -54,7 +54,7 @@ sc logic episode.sc.txt         # generates episode.logic.fcpxml for Logic Pro
 - **Fully local & free** — Transcription runs on Apple Silicon GPU via [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper). No cloud services, no API keys, no cost.
 - **Logic Pro integration** — Exports FCPXML that Logic Pro imports directly via File > Import > Final Cut Pro XML. Each region edge is automatically snapped up to 5 ms inward to a quiet point (at or below −50 dBFS) to prevent click noise in the fade-free FCPXML.
 - **Filler word detection** — Automatically detects filler words (`um`, `uh`, `えー`, `まあ`) and removes them in the auto workflow. In the step-by-step flow, fillers are suggested for your review.
-- **Long silence trimming** — Silences over 1.5 seconds are automatically shortened. Within-segment silences exceeding the gap threshold are also split and trimmed.
+- **Long silence trimming** — Silences over 1.2 seconds are automatically shortened. Within-segment silences exceeding the gap threshold are also split and trimmed.
 - **Verbatim mode** — Transcribes filler words and hesitations that Whisper normally absorbs, enabling accurate filler detection. Enabled by default.
 - **Hallucination detection & rescue** — Automatically detects Whisper hallucinations, rescues the affected audio by re-transcribing with safe settings.
 - **Quality preservation** — WAV render output matches original sample rate and bit depth. Equal-power crossfade at cut boundaries prevents click noise.
@@ -131,7 +131,7 @@ python -m venv .venv
 .venv/bin/pip install -e .
 ```
 
-Both `stefnceorf` and `sc` (shorthand) commands are registered. Subcommands can be abbreviated: `sc trans` = `sc transcribe`.
+Both `stefnceorf` (Old English *stefn* "voice" + *ceorfan* "to cut") and `sc` (shorthand) commands are registered. Subcommands can be abbreviated: `sc trans` = `sc transcribe`.
 
 If the first argument is a `.wav` file, the `auto` subcommand runs automatically: `sc episode.wav` = `sc auto episode.wav`.
 
@@ -175,9 +175,9 @@ Key options:
 Open `input.sc.txt` in any text editor for fine-grained control beyond what the auto workflow provides:
 
 ```
-[0001 0:00] We ended up deciding that／if there's tedious work／just build a tool
-[0002 0:12] 〔um〕and／remove words like that
-[0003 0:25] I have◆plenty of things／I want to talk about
+[0001 0:00] Today I want to talk about／podcast editing workflows
+[0002 0:07] 〔um〕the post-recording cleanup is／really◆time-consuming
+[0003 0:18] but being able to cut audio／just by deleting text is／a game changer〔uh〕
 ```
 
 - **Delete a line** → that entire segment is removed from the audio
@@ -192,7 +192,7 @@ Open `input.sc.txt` in any text editor for fine-grained control beyond what the 
 ### Render
 
 ```sh
-sc render input.sc.txt [-o output.wav] [--gap-threshold 1.5] [--gap-max 1.0]
+sc render input.sc.txt [-o output.wav] [--gap-threshold 1.2] [--gap-max 0.7]
 ```
 
 Produces `input.edited.wav` (or the path given by `-o`). Cuts are made from the **original WAV** — no quality degradation from multiple re-renders.
@@ -200,7 +200,7 @@ Produces `input.edited.wav` (or the path given by `-o`). Cuts are made from the 
 ### Send to Logic Pro
 
 ```sh
-sc logic input.sc.txt [-o output.fcpxml] [--gap-threshold 1.5] [--gap-max 1.0]
+sc logic input.sc.txt [-o output.fcpxml] [--gap-threshold 1.2] [--gap-max 0.7]
 ```
 
 Produces `input.logic.fcpxml` by default. In Logic Pro, choose **File > Import > Final Cut Pro XML** and select that file. The FCPXML references the original WAV directly and preserves transcript deletions, line reordering, filler decisions, and long-silence handling. Normal deletions remain as gaps matching the deleted duration, while reordered-region boundaries have a one-second gap. No fades or crossfades are included; add fades in Logic as needed. To compensate for the fade-free design, each region edge is automatically snapped up to 5 ms inward to a quiet point (at or below −50 dBFS) to prevent click noise. If the original WAV is moved, Logic may ask you to relink it.
@@ -269,10 +269,6 @@ Tests using real Whisper models or macOS `say` are marked `slow` and skipped by 
 - [ ] Custom proper-noun dictionary (initial_prompt / replacement rules)
 - [ ] Speaker diarization
 - [ ] Video support
-
-## Name
-
-*Stefnceorf* — from Old English *stefn* (voice) + *ceorfan* (to cut).
 
 ## Citing Stefnceorf
 
