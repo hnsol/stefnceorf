@@ -199,6 +199,7 @@ def main(argv: list[str] | None = None) -> int:
 
         stats_lines: list[str] = []
         try:
+            print(f"logic: {_ANNOUNCEMENTS['logic']}: {res['txt_path']}")
             out = export_fcpxml(
                 res["txt_path"],
                 output=args.output,
