@@ -240,6 +240,10 @@ Not directly — it requires Apple Silicon for mlx-whisper GPU acceleration. How
 
 No. The default `sc episode.wav` workflow handles everything automatically — filler removal, silence trimming, and FCPXML export. Manual transcript editing is available as an optional step for finer control (removing specific segments, reordering content).
 
+### How long does processing take?
+
+A 25-minute WAV file (144 MB) completes in about 4 minutes on an M4 Pro MacBook Pro (48 GB RAM) — transcription, filler removal, silence trimming, and FCPXML export included. Processing time scales roughly with audio length.
+
 ### What audio formats are supported?
 
 Input must be WAV. Apply noise reduction beforehand (e.g., with Audacity). Stefnceorf handles silence trimming.
