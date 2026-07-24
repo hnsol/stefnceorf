@@ -783,7 +783,7 @@ def format_stats(stats: EditStats) -> list[str]:
     出し分け:
     - Lines 行は削除/移動が1件以上のとき（括弧内は該当項目のみ）
     - Fillers 行は filler_requested > 0 のとき（残置0なら括弧省略）
-    - Silence 行は切り詰めが1箇所以上のとき（1箇所は "1 gap"）
+    - Silence 行は常時（1箇所は "1 gap"）
     - Duration 行は常時
     """
     lines: list[str] = []
@@ -805,12 +805,15 @@ def format_stats(stats: EditStats) -> list[str]:
             line += f" ({stats.filler_skipped_unsafe} kept: too close to speech)"
         lines.append(line)
 
-    if stats.silence_trim_count > 0:
-        gap_word = "gap" if stats.silence_trim_count == 1 else "gaps"
-        lines.append(
-            f"Silence: trimmed {stats.silence_trim_count} {gap_word}, "
-            f"-{stats.silence_trim_removed_s:.1f}s"
-        )
+    gap_word = "gap" if stats.silence_trim_count == 1 else "gaps"
+    removed = (
+        f"-{stats.silence_trim_removed_s:.1f}s"
+        if stats.silence_trim_removed_s > 0
+        else "0.0s"
+    )
+    lines.append(
+        f"Silence: trimmed {stats.silence_trim_count} {gap_word}, {removed}"
+    )
 
     delta = stats.output_duration_s - stats.source_duration_s
     lines.append(

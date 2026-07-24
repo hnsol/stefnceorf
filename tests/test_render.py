@@ -1615,9 +1615,17 @@ def _stats(**over):
 
 
 def test_format_stats_duration_always_present():
-    # 変化ゼロでも Duration 行のみ常に出る
+    # 変化ゼロでも Silence と Duration 行は常に出る
     lines = render.format_stats(_stats(source_duration_s=342.0, output_duration_s=298.2))
-    assert lines == ["Duration: 5:42 -> 4:58 (-43.8s)"]
+    assert lines == [
+        "Silence: trimmed 0 gaps, 0.0s",
+        "Duration: 5:42 -> 4:58 (-43.8s)",
+    ]
+
+
+def test_format_stats_silence_shown_when_zero():
+    lines = render.format_stats(_stats())
+    assert "Silence: trimmed 0 gaps, 0.0s" in lines
 
 
 def test_format_stats_lines_deleted_and_moved():
