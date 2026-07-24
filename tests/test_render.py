@@ -1701,6 +1701,26 @@ def test_count_moved_empty():
 
 # ---- build_edit_plan.stats 統合テスト ----
 
+def test_stats_silence_trim_within_single_segment(tmp_path):
+    _write_words_project(
+        tmp_path,
+        [("あ", 0.0, 1.0, 220.0, 0, False),
+         ("い", 4.0, 5.0, 440.0, 1, False)],
+        silences=[],
+    )
+    json_path = tmp_path / "input.sc.json"
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    data["trim_silences"] = [[1.2, 3.8]]
+    json_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あい\n", encoding="utf-8")
+
+    plan = render.build_edit_plan(str(txt))
+
+    assert plan.stats.silence_trim_count == 1
+    assert plan.stats.silence_trim_removed_s == pytest.approx(1.9)
+
+
 def test_stats_silence_trim(tmp_path):
     _make_gap_project(tmp_path)
     txt = tmp_path / "input.sc.txt"

@@ -468,10 +468,12 @@ def words_to_intervals(
     tail_margin: float = TAIL_MARGIN_S,
     lo: float = 0.0,
     hi: float | None = None,
+    split_gap: float | None = None,
 ) -> list[tuple[float, float]]:
     """残す単語の連続区間をマージし、マージン付与＋クランプした時間区間を返す。
 
-    - 連続する残す単語（index が隣接）を1区間にまとめる
+    - 連続する残す単語（index が隣接）を1区間にまとめる。ただし split_gap 指定時は
+      単語間ギャップが split_gap を超える境界で分割する
     - 各区間の前後に margin を付与（後方は tail_margin まで拡張可能）
     - ただし前後の（削除された）隣接単語の境界、および [lo, hi] に食い込まない
       範囲でクランプする（削除区間・隣接カットに食い込まない）
@@ -483,7 +485,18 @@ def words_to_intervals(
     # 連続 index をランにまとめる
     runs: list[list[int]] = []
     for idx in keep:
-        if runs and idx == runs[-1][-1] + 1:
+        if (
+            runs
+            and idx == runs[-1][-1] + 1
+            and (
+                split_gap is None
+                or (
+                    float(words[idx]["start"])
+                    - float(words[runs[-1][-1]]["end"])
+                    <= split_gap
+                )
+            )
+        ):
             runs[-1].append(idx)
         else:
             runs.append([idx])
@@ -1004,7 +1017,8 @@ def build_edit_plan(
             )
 
         intervals = words_to_intervals(
-            words, keep, margin=MARGIN_S, lo=lo_seg, hi=hi_seg
+            words, keep, margin=MARGIN_S, lo=lo_seg, hi=hi_seg,
+            split_gap=gap_threshold,
         )
         plan_intervals.extend(intervals)
 
