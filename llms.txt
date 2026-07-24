@@ -42,7 +42,7 @@ The name comes from Old English: stefn (voice) + ceorfan (to cut).
 - Audio conversion: ffmpeg
 - Modules: cli.py, transcribe.py, render.py, fcpxml.py, fillers.py
 - Test suite: pytest (unit, CLI, acceptance tests)
-- Lines of code: ~2,500 across 5 modules
+- Lines of code: ~3,300 across 5 modules
 
 ## Requirements
 

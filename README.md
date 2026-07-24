@@ -98,7 +98,7 @@ The repository includes:
 - **`CLAUDE.md`** — Project context and conventions for Claude Code
 - **`AGENTS.md`** — Workflow instructions for AI coding agents
 - **Comprehensive test suite** — Unit tests, CLI tests, and acceptance tests
-- **Clean Python codebase** — ~2,500 lines across 5 modules, well-structured for AI modification
+- **Clean Python codebase** — ~3,300 lines across 5 modules, well-structured for AI modification
 
 Example prompts for your AI agent:
 
@@ -209,7 +209,7 @@ Produces `input.logic.fcpxml` by default. In Logic Pro, choose **File > Import >
 
 Filler words are detected by **exact match** against a dictionary file (one word per line):
 
-- Japanese: `stefnceorf/fillers_ja.txt` (default: あのー, そのー, えー, えっと, えと, まあ, まー, うーん)
+- Japanese: `stefnceorf/fillers_ja.txt` (default: あのー, そのー, えー, えっと, えと, えーと, まあ, まー, うーん)
 - English: `stefnceorf/fillers_en.txt` (default: um, uh, uhm, er, ah)
 
 Edit these files to customize filler detection for your vocabulary.
@@ -246,7 +246,7 @@ Input must be WAV. Apply noise reduction beforehand (e.g., with Audacity). Stefn
 
 ### Can AI coding agents modify this codebase?
 
-Yes. The repository includes `CLAUDE.md` and `AGENTS.md` with project context and workflow instructions. The codebase is intentionally simple (~2,500 lines of Python) with comprehensive tests, making it well-suited for AI-assisted modification.
+Yes. The repository includes `CLAUDE.md` and `AGENTS.md` with project context and workflow instructions. The codebase is intentionally simple (~3,300 lines of Python) with comprehensive tests, making it well-suited for AI-assisted modification.
 
 ## Accuracy & Limitations
 
