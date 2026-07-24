@@ -583,6 +583,31 @@ def test_plan_long_gap_trimmed():
     assert flags == [False]
 
 
+def test_plan_output_intervals_trims_only_known_silence_overlap():
+    out, flags = render.plan_output_intervals(
+        [(0.0, 1.0), (4.0, 5.0)],
+        [(0.0, 1.0), (4.0, 5.0)],
+        gap_threshold=1.2,
+        gap_max=0.7,
+        silence_spans=[(1.2, 3.8)],
+    )
+    assert out[0] == pytest.approx((0.0, 1.55))
+    assert out[1] == pytest.approx((3.45, 5.0))
+    assert flags == [False]
+
+
+def test_plan_output_intervals_preserves_partial_unknown_gap_edges():
+    out, _ = render.plan_output_intervals(
+        [(0.0, 1.0), (4.0, 5.0)],
+        [(0.0, 1.0), (4.0, 5.0)],
+        gap_threshold=1.2,
+        gap_max=0.7,
+        silence_spans=[(1.2, 3.8)],
+    )
+    assert out[0][1] > 1.2
+    assert out[1][0] < 3.8
+
+
 def test_plan_deleted_word_in_gap_not_merged():
     # ギャップ [1.0,4.0] に削除単語 [1.5,3.5] が挟まる → クロスフェード結合
     ivs = [(0.0, 1.0), (4.0, 5.0)]
@@ -677,7 +702,7 @@ def test_plan_missing_silence_metadata_preserves_unknown_gap():
     assert flags == []
 
 
-def test_plan_partly_known_silence_preserves_whole_gap():
+def test_plan_partly_known_silence_trims_only_known_overlap():
     ivs = [(0.0, 1.0), (4.0, 5.0)]
 
     out, flags = render.plan_output_intervals(
@@ -685,8 +710,11 @@ def test_plan_partly_known_silence_preserves_whole_gap():
         silence_spans=[(1.0, 3.9)],
     )
 
-    assert out == [(0.0, 5.0)]
-    assert flags == []
+    assert out == [
+        (0.0, pytest.approx(1.35)),
+        (pytest.approx(3.55), 5.0),
+    ]
+    assert flags == [False]
 
 
 # ---- warn_hot_boundaries（通常削除の境界警告 純関数） ----
@@ -1587,9 +1615,17 @@ def _stats(**over):
 
 
 def test_format_stats_duration_always_present():
-    # 変化ゼロでも Duration 行のみ常に出る
+    # 変化ゼロでも Silence と Duration 行は常に出る
     lines = render.format_stats(_stats(source_duration_s=342.0, output_duration_s=298.2))
-    assert lines == ["Duration: 5:42 -> 4:58 (-43.8s)"]
+    assert lines == [
+        "Silence: trimmed 0 gaps, 0.0s",
+        "Duration: 5:42 -> 4:58 (-43.8s)",
+    ]
+
+
+def test_format_stats_silence_shown_when_zero():
+    lines = render.format_stats(_stats())
+    assert "Silence: trimmed 0 gaps, 0.0s" in lines
 
 
 def test_format_stats_lines_deleted_and_moved():
@@ -1664,6 +1700,26 @@ def test_count_moved_empty():
 
 
 # ---- build_edit_plan.stats 統合テスト ----
+
+def test_stats_silence_trim_within_single_segment(tmp_path):
+    _write_words_project(
+        tmp_path,
+        [("あ", 0.0, 1.0, 220.0, 0, False),
+         ("い", 4.0, 5.0, 440.0, 1, False)],
+        silences=[],
+    )
+    json_path = tmp_path / "input.sc.json"
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    data["trim_silences"] = [[1.2, 3.8]]
+    json_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あい\n", encoding="utf-8")
+
+    plan = render.build_edit_plan(str(txt))
+
+    assert plan.stats.silence_trim_count == 1
+    assert plan.stats.silence_trim_removed_s == pytest.approx(1.9)
+
 
 def test_stats_silence_trim(tmp_path):
     _make_gap_project(tmp_path)

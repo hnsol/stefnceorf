@@ -263,7 +263,10 @@ def test_main_direct_wav_transcribes_then_exports_logic(monkeypatch, tmp_path, c
     ]
     assert capsys.readouterr().out == (
         f"auto: full pipeline: transcribe -> FCPXML: {wav}\n"
-        f"生成: {txt}\n生成: {json_path}\n生成: {fcpxml}\n"
+        f"生成: {txt}\n"
+        f"生成: {json_path}\n"
+        f"logic: exporting FCPXML for Logic Pro: {txt}\n"
+        f"生成: {fcpxml}\n"
     )
 
 
@@ -307,8 +310,10 @@ def test_main_auto_exporter_error_returns_one(monkeypatch, tmp_path, capsys):
     captured = capsys.readouterr()
     assert captured.out == (
         "auto: full pipeline: transcribe -> FCPXML: x.wav\n"
-        f"生成: {tmp_path / 'x.sc.txt'}\n生成: {tmp_path / 'x.sc.json'}\n"
+        f"生成: {tmp_path / 'x.sc.txt'}\n"
+        f"生成: {tmp_path / 'x.sc.json'}\n"
         "フィラー候補: 0箇所\n"
+        f"logic: exporting FCPXML for Logic Pro: {tmp_path / 'x.sc.txt'}\n"
     )
     assert captured.err == "エラー: cannot write\n"
 
@@ -393,6 +398,15 @@ def test_main_auto_announces_and_prints_duration(monkeypatch, tmp_path, capsys):
     assert f"auto: full pipeline: transcribe -> FCPXML: {wav}\n" in out
     lines = out.splitlines()
     assert any(line.startswith("Duration: ") for line in lines)
+    logic_idx = next(
+        i for i, line in enumerate(lines)
+        if line == f"logic: exporting FCPXML for Logic Pro: {txt}"
+    )
+    generated_fcpxml_idx = max(
+        i for i, line in enumerate(lines) if line.startswith("生成:")
+    )
+    silence_idx = next(i for i, line in enumerate(lines) if line.startswith("Silence:"))
+    assert logic_idx < generated_fcpxml_idx < silence_idx
     # 統計行は「生成:」行より後に出力される
     generated_idx = max(i for i, l in enumerate(lines) if l.startswith("生成:"))
     duration_idx = next(i for i, l in enumerate(lines) if l.startswith("Duration:"))

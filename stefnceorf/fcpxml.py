@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -127,7 +128,8 @@ def _audio_layout(channels: int) -> str:
 
 
 def _timeline_offsets(
-    bounds: list[tuple[int, int]], samplerate: int
+    bounds: list[tuple[int, int]],
+    samplerate: int,
 ) -> tuple[list[int], int]:
     if not bounds:
         return [], 0
@@ -262,10 +264,13 @@ def export_fcpxml(
     for warning in plan.warnings:
         print(f"警告: {warning}", file=sys.stderr)
 
+    timeline_stats = replace(
+        plan.stats, output_duration_s=timeline_end / rate if rate else 0.0
+    )
     if stats_out is not None:
-        stats_out.extend(format_stats(plan.stats))
+        stats_out.extend(format_stats(timeline_stats))
     else:
-        for line in format_stats(plan.stats):
+        for line in format_stats(timeline_stats):
             print(line)
 
     return str(out_path)

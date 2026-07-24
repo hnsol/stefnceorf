@@ -295,6 +295,118 @@ def test_exporter_uses_shared_planned_intervals(tmp_path, case):
     assert actual == expected
 
 
+def test_silence_trim_preserves_fcpxml_timeline_gap(tmp_path):
+    segments = [
+        {
+            "id": "0001",
+            "text": "あ",
+            "words": [{"word": "あ", "start": 0.0, "end": 1.0}],
+        },
+        {
+            "id": "0002",
+            "text": "う",
+            "words": [{"word": "う", "start": 4.0, "end": 5.0}],
+        },
+    ]
+    txt, _ = _write_project(
+        tmp_path,
+        segments=segments,
+        txt="[0001] あ\n[0002] う\n",
+        extra={"trim_silences": [[1.0, 4.0]]},
+    )
+
+    root = _root(export_fcpxml(str(txt)))
+    clips = root.findall("project/sequence/spine/asset-clip")
+    sequence = root.find("project/sequence")
+    offsets = [_time_samples(clip.attrib["offset"], 44100) for clip in clips]
+    starts = [_time_samples(clip.attrib["start"], 44100) for clip in clips]
+    durations = [_time_samples(clip.attrib["duration"], 44100) for clip in clips]
+
+    assert len(clips) == 2
+    timeline_gap = offsets[1] - (offsets[0] + durations[0])
+    source_gap = starts[1] - (starts[0] + durations[0])
+    assert timeline_gap == source_gap
+    assert timeline_gap > 0
+    assert sequence is not None
+    sequence_duration = _time_samples(sequence.attrib["duration"], 44100)
+    assert sequence_duration == offsets[1] + durations[1]
+    assert sequence_duration == starts[1] + durations[1]
+
+
+def test_filler_cut_preserves_fcpxml_timeline_gap(tmp_path):
+    segments = [{
+        "id": "0001",
+        "text": "あまあう",
+        "words": [
+            {"word": "あ", "start": 0.0, "end": 1.0},
+            {"word": "まあ", "start": 1.2, "end": 2.0, "suggest": True},
+            {"word": "う", "start": 2.2, "end": 3.0},
+        ],
+    }]
+    txt, _ = _write_project(
+        tmp_path,
+        segments=segments,
+        txt="[0001] あ〔まあ〕う\n",
+        extra={"silences": [[1.0, 1.2], [2.0, 2.2]]},
+    )
+
+    clips = _root(
+        export_fcpxml(str(txt))
+    ).findall("project/sequence/spine/asset-clip")
+    offsets = [_time_samples(clip.attrib["offset"], 44100) for clip in clips]
+    starts = [_time_samples(clip.attrib["start"], 44100) for clip in clips]
+    durations = [_time_samples(clip.attrib["duration"], 44100) for clip in clips]
+
+    assert len(clips) == 2
+    timeline_gap = offsets[1] - (offsets[0] + durations[0])
+    source_gap = starts[1] - (starts[0] + durations[0])
+    assert timeline_gap == source_gap
+    assert timeline_gap > 0
+
+
+def test_fcpxml_stats_duration_uses_logic_timeline_duration(tmp_path):
+    segments = [
+        {
+            "id": "0001",
+            "text": "あ",
+            "words": [{"word": "あ", "start": 0.0, "end": 1.0}],
+        },
+        {
+            "id": "0002",
+            "text": "う",
+            "words": [{"word": "う", "start": 4.0, "end": 5.0}],
+        },
+    ]
+    txt, _ = _write_project(
+        tmp_path,
+        segments=segments,
+        txt="[0001] あ\n[0002] う\n",
+        extra={"trim_silences": [[1.0, 4.0]]},
+    )
+    stats: list[str] = []
+
+    output = export_fcpxml(str(txt), stats_out=stats)
+    sequence = _root(output).find("project/sequence")
+
+    assert sequence is not None
+    duration_s = _time_samples(sequence.attrib["duration"], 44100) / 44100
+    expected = render.format_stats(
+        render.EditStats(
+            source_duration_s=6.0,
+            output_duration_s=duration_s,
+            filler_requested=0,
+            filler_cut=0,
+            filler_skipped_unsafe=0,
+            silence_trim_count=1,
+            silence_trim_removed_s=2.08,
+            lines_total=2,
+            lines_deleted=0,
+            lines_moved=0,
+        )
+    )
+    assert stats == expected
+
+
 def test_planner_warning_is_printed_once(tmp_path, capsys):
     txt, _ = _write_project(tmp_path, txt="[0001] 音声追加\n")
     export_fcpxml(str(txt))

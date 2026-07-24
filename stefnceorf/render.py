@@ -69,6 +69,7 @@ class EditPlan:
     total_samples: int
     output_intervals: list[tuple[float, float]]
     crossfade_flags: list[bool]
+    silence_trim_boundaries: frozenset[int]
     warnings: list[str]
     stats: EditStats
 
@@ -468,10 +469,12 @@ def words_to_intervals(
     tail_margin: float = TAIL_MARGIN_S,
     lo: float = 0.0,
     hi: float | None = None,
+    split_gap: float | None = None,
 ) -> list[tuple[float, float]]:
     """残す単語の連続区間をマージし、マージン付与＋クランプした時間区間を返す。
 
-    - 連続する残す単語（index が隣接）を1区間にまとめる
+    - 連続する残す単語（index が隣接）を1区間にまとめる。ただし split_gap 指定時は
+      単語間ギャップが split_gap を超える境界で分割する
     - 各区間の前後に margin を付与（後方は tail_margin まで拡張可能）
     - ただし前後の（削除された）隣接単語の境界、および [lo, hi] に食い込まない
       範囲でクランプする（削除区間・隣接カットに食い込まない）
@@ -483,7 +486,18 @@ def words_to_intervals(
     # 連続 index をランにまとめる
     runs: list[list[int]] = []
     for idx in keep:
-        if runs and idx == runs[-1][-1] + 1:
+        if (
+            runs
+            and idx == runs[-1][-1] + 1
+            and (
+                split_gap is None
+                or (
+                    float(words[idx]["start"])
+                    - float(words[runs[-1][-1]]["end"])
+                    <= split_gap
+                )
+            )
+        ):
             runs[-1].append(idx)
         else:
             runs.append([idx])
@@ -551,9 +565,9 @@ def plan_output_intervals(
        min(pre_avail + post_avail, filler_pause_keep)）。無音中のカットなので
        単純結合（cf_flags False）。
     4. g ≤ gap_threshold: ギャップ音声を保持（連続マージ）
-       g > gap_threshold: silence_spans の和集合がギャップ全体を完全被覆する場合だけ
-       gap_max に切り詰める。旧JSON・未知区間・部分被覆は発話の可能性があるため
-       ギャップ全体を保持する。
+       g > gap_threshold: silence_spans とギャップの共通部分のうち gap_max を超える
+       既知無音だけを gap_max に切り詰める。旧JSON・未知区間・短い既知無音は
+       発話の可能性があるため保持する。
 
     戻り値: (区間列, クロスフェードフラグ列)。フラグ列の長さは len(区間列)-1。
     True=クロスフェード結合、False=単純結合（ギャップ切り詰め・フィラーポーズ境界）。
@@ -563,29 +577,22 @@ def plan_output_intervals(
 
     fspans = filler_spans or []
 
-    def _known_silence_covers(start: float, end: float) -> bool:
+    def _known_silence_overlaps(start: float, end: float) -> list[tuple[float, float]]:
         if not silence_spans or end <= start:
-            return False
-        cursor = start
+            return []
         merged: list[list[float]] = []
         for span_start, span_end in sorted(
-            (float(s), float(e))
+            (max(start, float(s)), min(end, float(e)))
             for s, e in silence_spans
-            if float(e) > float(s)
+            if float(e) > start and float(s) < end
         ):
+            if span_end <= span_start:
+                continue
             if merged and span_start <= merged[-1][1]:
                 merged[-1][1] = max(merged[-1][1], span_end)
             else:
                 merged.append([span_start, span_end])
-        for span_start, span_end in merged:
-            if span_end <= cursor:
-                continue
-            if span_start > cursor:
-                return False
-            cursor = max(cursor, span_end)
-            if cursor >= end:
-                return True
-        return False
+        return [(span_start, span_end) for span_start, span_end in merged]
 
     out: list[tuple[float, float]] = []
     cf_flags: list[bool] = []
@@ -631,17 +638,22 @@ def plan_output_intervals(
             pending = [ns - post_keep, cur[1]]
             continue
         # 4. 純無音ギャップ
-        if (
-            g <= gap_threshold
-            or g <= gap_max
-            or not _known_silence_covers(pe, ns)
-        ):
+        if g <= gap_threshold or g <= gap_max:
             pending[1] = cur[1]
-        else:
-            pending[1] = pe + half
+            continue
+
+        trimmed = False
+        for silence_start, silence_end in _known_silence_overlaps(pe, ns):
+            silence_duration = silence_end - silence_start
+            if silence_duration <= gap_max:
+                continue
+            pending[1] = silence_start + half
             out.append((pending[0], pending[1]))
             cf_flags.append(False)
-            pending = [ns - half, cur[1]]
+            pending = [silence_end - half, cur[1]]
+            trimmed = True
+        if not trimmed:
+            pending[1] = cur[1]
     out.append((pending[0], pending[1]))
     return out, cf_flags
 
@@ -785,7 +797,7 @@ def format_stats(stats: EditStats) -> list[str]:
     出し分け:
     - Lines 行は削除/移動が1件以上のとき（括弧内は該当項目のみ）
     - Fillers 行は filler_requested > 0 のとき（残置0なら括弧省略）
-    - Silence 行は切り詰めが1箇所以上のとき（1箇所は "1 gap"）
+    - Silence 行は常時（1箇所は "1 gap"）
     - Duration 行は常時
     """
     lines: list[str] = []
@@ -807,12 +819,15 @@ def format_stats(stats: EditStats) -> list[str]:
             line += f" ({stats.filler_skipped_unsafe} kept: too close to speech)"
         lines.append(line)
 
-    if stats.silence_trim_count > 0:
-        gap_word = "gap" if stats.silence_trim_count == 1 else "gaps"
-        lines.append(
-            f"Silence: trimmed {stats.silence_trim_count} {gap_word}, "
-            f"-{stats.silence_trim_removed_s:.1f}s"
-        )
+    gap_word = "gap" if stats.silence_trim_count == 1 else "gaps"
+    removed = (
+        f"-{stats.silence_trim_removed_s:.1f}s"
+        if stats.silence_trim_removed_s > 0
+        else "0.0s"
+    )
+    lines.append(
+        f"Silence: trimmed {stats.silence_trim_count} {gap_word}, {removed}"
+    )
 
     delta = stats.output_duration_s - stats.source_duration_s
     lines.append(
@@ -1003,7 +1018,8 @@ def build_edit_plan(
             )
 
         intervals = words_to_intervals(
-            words, keep, margin=MARGIN_S, lo=lo_seg, hi=hi_seg
+            words, keep, margin=MARGIN_S, lo=lo_seg, hi=hi_seg,
+            split_gap=gap_threshold,
         )
         plan_intervals.extend(intervals)
 
@@ -1037,10 +1053,12 @@ def build_edit_plan(
     # ただしフィラーポーズ境界（filler_cut_spans と重なる）は無音切り詰めでないため除外。
     silence_trim_count = 0
     silence_trim_removed_s = 0.0
+    silence_trim_boundaries: set[int] = set()
     for k in range(len(out_intervals) - 1):
         if k < len(cf_flags) and not cf_flags[k]:
             pe, ns = out_intervals[k][1], out_intervals[k + 1][0]
             if not any(s < ns and e > pe for s, e in filler_cut_spans):
+                silence_trim_boundaries.add(k)
                 silence_trim_count += 1
                 silence_trim_removed_s += ns - pe
 
@@ -1076,6 +1094,7 @@ def build_edit_plan(
         total_samples=total_samples,
         output_intervals=out_intervals,
         crossfade_flags=cf_flags,
+        silence_trim_boundaries=frozenset(silence_trim_boundaries),
         warnings=all_warnings,
         stats=stats,
     )
