@@ -268,9 +268,9 @@ def export_fcpxml(
         plan.stats, output_duration_s=timeline_end / rate if rate else 0.0
     )
     if stats_out is not None:
-        stats_out.extend(format_stats(timeline_stats))
+        stats_out.extend(format_stats(timeline_stats, gaps_preserved=True))
     else:
-        for line in format_stats(timeline_stats):
+        for line in format_stats(timeline_stats, gaps_preserved=True):
             print(line)
 
     return str(out_path)

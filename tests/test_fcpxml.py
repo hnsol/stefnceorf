@@ -404,7 +404,8 @@ def test_fcpxml_stats_duration_uses_logic_timeline_duration(tmp_path):
             lines_total=2,
             lines_deleted=0,
             lines_moved=0,
-        )
+        ),
+        gaps_preserved=True,
     )
     assert stats == expected
 

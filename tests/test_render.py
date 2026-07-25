@@ -1715,6 +1715,20 @@ def test_format_stats_duration_hhmmss_and_positive_delta():
     assert lines[-1] == "Duration: 1:00:00 -> 1:01:05 (+65.0s)"
 
 
+def test_format_stats_gaps_preserved_false_no_annotation():
+    lines = render.format_stats(_stats(source_duration_s=60.0, output_duration_s=58.0))
+    assert lines[-1] == "Duration: 1:00 -> 0:58 (-2.0s)"
+    assert "cuts left as gaps" not in lines[-1]
+
+
+def test_format_stats_gaps_preserved_true_adds_annotation():
+    lines = render.format_stats(
+        _stats(source_duration_s=60.0, output_duration_s=58.0),
+        gaps_preserved=True,
+    )
+    assert lines[-1] == "Duration: 1:00 -> 0:58 (-2.0s, cuts left as gaps)"
+
+
 # ---- _count_moved_lines ----
 
 def test_count_moved_no_reorder():

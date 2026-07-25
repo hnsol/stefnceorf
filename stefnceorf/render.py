@@ -793,14 +793,14 @@ def _format_mmss(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
-def format_stats(stats: EditStats) -> list[str]:
+def format_stats(stats: EditStats, *, gaps_preserved: bool = False) -> list[str]:
     """編集結果統計を表示行リストに整形する（純関数、シンプルな英語）。
 
     出し分け:
     - Lines 行は削除/移動が1件以上のとき（括弧内は該当項目のみ）
     - Fillers 行は filler_requested > 0 のとき（残置0なら括弧省略）
     - Silence 行は常時（1箇所は "1 gap"）
-    - Duration 行は常時
+    - Duration 行は常時（gaps_preserved=True のとき ", cuts left as gaps" を付記）
     """
     lines: list[str] = []
 
@@ -837,9 +837,10 @@ def format_stats(stats: EditStats) -> list[str]:
     )
 
     delta = stats.output_duration_s - stats.source_duration_s
+    suffix = ", cuts left as gaps" if gaps_preserved else ""
     lines.append(
         f"Duration: {_format_mmss(stats.source_duration_s)} -> "
-        f"{_format_mmss(stats.output_duration_s)} ({delta:+.1f}s)"
+        f"{_format_mmss(stats.output_duration_s)} ({delta:+.1f}s{suffix})"
     )
     return lines
 
