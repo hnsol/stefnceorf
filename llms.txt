@@ -4,7 +4,7 @@
 
 ## Summary
 
-Stefnceorf is an open-source command-line tool for one-command podcast post-production. Run `sc episode.wav` and the tool transcribes the audio using Whisper (via mlx-whisper on Apple Silicon GPU), detects and removes filler words, trims long silences, and exports an FCPXML for Logic Pro — all in a single step. For finer control, the generated transcript can be edited as a plain text file before rendering; the transcript uses Whisper turbo's natural orthography, so it reads cleanly as ordinary text. A 25-minute WAV completes in about 1.5 minutes on an M4 Pro. It is a free, local, privacy-first alternative to Descript, with native Japanese language support.
+Stefnceorf is an open-source command-line tool for one-command podcast post-production. Run `sc episode.wav` and the tool transcribes the audio using Whisper (via mlx-whisper on Apple Silicon GPU), detects and removes filler words, trims long silences, and exports an FCPXML for Logic Pro — all in a single step. For finer control, the generated transcript can be edited as a plain text file before rendering; deleting text produces natural-sounding cuts because edit points snap to pause boundaries and silence troughs with crossfades, and the transcript itself reads cleanly (Whisper turbo's natural orthography). A 25-minute WAV completes in about 1.5 minutes on an M4 Pro. It is a free, local, privacy-first alternative to Descript, with native Japanese language support.
 
 The name comes from Old English: stefn (voice) + ceorfan (to cut).
 
@@ -32,7 +32,7 @@ The name comes from Old English: stefn (voice) + ceorfan (to cut).
 - Non-destructive editing — original audio is never modified
 - Equal-power crossfade at cut boundaries for click-free output
 - Output preserves original sample rate and bit depth
-- Text-based editing for fine-grained transcript control, on a transcript clean enough to read as ordinary text
+- Text-based editing for fine-grained control — deleting transcript text yields natural-sounding cuts (pause-boundary snapping + crossfades), on a transcript clean enough to read as ordinary text
 
 ## Technical Stack
 

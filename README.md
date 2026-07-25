@@ -59,7 +59,7 @@ sc logic episode.sc.txt         # generates episode.logic.fcpxml for Logic Pro
 - **Hallucination detection & rescue** — Automatically detects Whisper hallucinations, rescues the affected audio by re-transcribing with safe settings.
 - **Quality preservation** — WAV render output matches original sample rate and bit depth. Equal-power crossfade at cut boundaries prevents click noise.
 - **Japanese & English** — Full support for both languages with language-specific filler dictionaries.
-- **Text-based editing** — For finer control, edit the generated transcript in any text editor. Delete text to delete audio, rearrange lines to reorder segments. Since v0.3.0 the transcript uses the turbo model's natural orthography, so the text you edit reads cleanly. See [Text-Based Editing](#text-based-editing-optional).
+- **Text-based editing** — For finer control, edit the generated transcript in any text editor. Delete text to delete audio, rearrange lines to reorder segments — and the edited audio comes out sounding natural, because cuts snap to pause boundaries and silence troughs with crossfades. Since v0.3.0 the transcript also reads cleanly (turbo's natural orthography). See [Text-Based Editing](#text-based-editing-optional).
 
 ## Podcast Audio Editing Tool Comparison
 
@@ -172,7 +172,7 @@ Key options:
 
 ### Text-Based Editing (Optional)
 
-Open `input.sc.txt` in any text editor for fine-grained control beyond what the auto workflow provides. The transcript is produced with the turbo model's natural orthography (v0.3.0+), so it reads cleanly enough to edit as ordinary text:
+Open `input.sc.txt` in any text editor for fine-grained control beyond what the auto workflow provides. The transcript reads cleanly (turbo's natural orthography, v0.3.0+), and edits produce natural-sounding audio: cuts snap to pause boundaries and silence troughs, so deleting text rarely leaves audible seams:
 
 ```
 [0001 0:00] Today I want to talk about／podcast editing workflows
