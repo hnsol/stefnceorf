@@ -189,7 +189,7 @@ sc logic input.sc.txt [-o output.fcpxml] [--gap-threshold 1.2] [--gap-max 0.7]
 
 フィラー候補は辞書との**完全一致**で `〔〕` に包まれます。辞書はパッケージ同梱ファイル（1行1語）で編集できます:
 
-- 日本語: `stefnceorf/fillers_ja.txt`（既定: あのー, そのー, えー, えっと, えと, えーと, まあ, まー, うーん）
+- 日本語: `stefnceorf/fillers_ja.txt`（既定: あのー, そのー, えー, えっと, えと, えーと, えーっと, まあ, まー, うーん）
 - 英語: `stefnceorf/fillers_en.txt`（既定: um, uh, uhm, er, ah）
 
 ## フォーク＆AIエージェントでカスタマイズ

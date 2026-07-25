@@ -209,7 +209,7 @@ Produces `input.logic.fcpxml` by default. In Logic Pro, choose **File > Import >
 
 Filler words are detected by **exact match** against a dictionary file (one word per line):
 
-- Japanese: `stefnceorf/fillers_ja.txt` (default: あのー, そのー, えー, えっと, えと, えーと, まあ, まー, うーん)
+- Japanese: `stefnceorf/fillers_ja.txt` (default: あのー, そのー, えー, えっと, えと, えーと, えーっと, まあ, まー, うーん)
 - English: `stefnceorf/fillers_en.txt` (default: um, uh, uhm, er, ah)
 
 Edit these files to customize filler detection for your vocabulary.
