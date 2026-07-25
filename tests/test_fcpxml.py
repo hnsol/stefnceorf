@@ -399,6 +399,8 @@ def test_fcpxml_stats_duration_uses_logic_timeline_duration(tmp_path):
             filler_skipped_unsafe=0,
             silence_trim_count=1,
             silence_trim_removed_s=2.08,
+            filler_cut_removed_s=0.0,
+            lines_deleted_removed_s=0.0,
             lines_total=2,
             lines_deleted=0,
             lines_moved=0,

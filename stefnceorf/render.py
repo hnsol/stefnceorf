@@ -51,6 +51,8 @@ class EditStats:
     filler_skipped_unsafe: int     # 音響的に不安全で残置した数
     silence_trim_count: int        # 無音ギャップ切り詰め箇所数
     silence_trim_removed_s: float  # 無音切り詰めの合計秒
+    filler_cut_removed_s: float    # フィラーカットで削った合計秒
+    lines_deleted_removed_s: float # 行削除で削った合計秒
     lines_total: int               # json のセグメント（行）総数
     lines_deleted: int             # 編集で丸ごと削除された行数
     lines_moved: int               # 並べ替えられた行数
@@ -806,7 +808,10 @@ def format_stats(stats: EditStats) -> list[str]:
     if stats.lines_deleted + stats.lines_moved >= 1:
         parts: list[str] = []
         if stats.lines_deleted:
-            parts.append(f"{stats.lines_deleted} deleted")
+            part = f"{stats.lines_deleted} deleted"
+            if stats.lines_deleted_removed_s > 0:
+                part += f", -{stats.lines_deleted_removed_s:.1f}s"
+            parts.append(part)
         if stats.lines_moved:
             parts.append(f"{stats.lines_moved} moved")
         lines.append(
@@ -815,6 +820,8 @@ def format_stats(stats: EditStats) -> list[str]:
 
     if stats.filler_requested > 0:
         line = f"Fillers: removed {stats.filler_cut} of {stats.filler_requested}"
+        if stats.filler_cut_removed_s > 0:
+            line += f", -{stats.filler_cut_removed_s:.1f}s"
         if stats.filler_skipped_unsafe > 0:
             line += f" ({stats.filler_skipped_unsafe} kept: too close to speech)"
         lines.append(line)
@@ -1065,6 +1072,21 @@ def build_edit_plan(
     # 行削除・並べ替えの集計。編集順の seg_id を json 順 index に写像して LIS で算出。
     json_index = {seg["id"]: i for i, seg in enumerate(segments)}
     edited_indices = [json_index[seg_id] for seg_id, _, _ in parsed]
+
+    # フィラーカットで削った合計秒（スナップ後のカット区間長を合算）。
+    filler_cut_removed_s = sum(e - s for s, e in filler_cut_spans)
+
+    # 行削除で削った合計秒。各セグメントの実音源占有区間はセグメント切り出しと同じ
+    # 境界ロジック（ordered: words 先頭start〜末尾end／unrecognized は source_start〜end）
+    # を流用する。編集後 txt に現れない seg_id を削除行として合算する。
+    seg_span = {seg["id"]: (start, end) for seg, start, end in ordered}
+    kept_ids = {seg_id for seg_id, _, _ in parsed}
+    lines_deleted_removed_s = sum(
+        end - start
+        for sid, (start, end) in seg_span.items()
+        if sid not in kept_ids
+    )
+
     stats = EditStats(
         source_duration_s=file_length_s,
         output_duration_s=sum(e - s for s, e in out_intervals),
@@ -1073,6 +1095,8 @@ def build_edit_plan(
         filler_skipped_unsafe=filler_skipped_unsafe,
         silence_trim_count=silence_trim_count,
         silence_trim_removed_s=silence_trim_removed_s,
+        filler_cut_removed_s=filler_cut_removed_s,
+        lines_deleted_removed_s=lines_deleted_removed_s,
         lines_total=len(segments),
         lines_deleted=len(segments) - len(parsed),
         lines_moved=_count_moved_lines(edited_indices),

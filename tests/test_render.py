@@ -1606,6 +1606,8 @@ def _stats(**over):
         filler_skipped_unsafe=0,
         silence_trim_count=0,
         silence_trim_removed_s=0.0,
+        filler_cut_removed_s=0.0,
+        lines_deleted_removed_s=0.0,
         lines_total=0,
         lines_deleted=0,
         lines_moved=0,
@@ -1666,6 +1668,35 @@ def test_format_stats_fillers_with_skip():
 def test_format_stats_fillers_hidden_when_none_requested():
     lines = render.format_stats(_stats())
     assert not any(l.startswith("Fillers:") for l in lines)
+
+
+def test_format_stats_fillers_removed_seconds():
+    lines = render.format_stats(
+        _stats(filler_requested=74, filler_cut=34, filler_skipped_unsafe=40,
+               filler_cut_removed_s=12.34)
+    )
+    assert (
+        "Fillers: removed 34 of 74, -12.3s (40 kept: too close to speech)"
+        in lines
+    )
+
+
+def test_format_stats_fillers_seconds_omitted_when_zero():
+    lines = render.format_stats(_stats(filler_requested=4, filler_cut=4))
+    assert "Fillers: removed 4 of 4" in lines
+    assert not any("s" in l and "-" in l and l.startswith("Fillers:") for l in lines)
+
+
+def test_format_stats_lines_deleted_seconds():
+    lines = render.format_stats(
+        _stats(lines_total=200, lines_deleted=1, lines_deleted_removed_s=8.2)
+    )
+    assert lines[0] == "Lines: 199 of 200 kept (1 deleted, -8.2s)"
+
+
+def test_format_stats_lines_deleted_seconds_omitted_when_zero():
+    lines = render.format_stats(_stats(lines_total=42, lines_deleted=2))
+    assert lines[0] == "Lines: 40 of 42 kept (2 deleted)"
 
 
 def test_format_stats_silence_singular_and_plural():
@@ -1786,3 +1817,46 @@ def test_stats_line_reordered(tmp_path):
     assert plan.stats.lines_total == 3
     assert plan.stats.lines_deleted == 0
     assert plan.stats.lines_moved == 1
+
+
+def test_stats_line_deleted_removed_seconds(tmp_path):
+    # 0002 は [1.0,2.0] を占有 → 削除で 1.0s 減。
+    _make_multiseg_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あ\n[0003] う\n", encoding="utf-8")
+    plan = render.build_edit_plan(str(txt))
+    assert plan.stats.lines_deleted == 1
+    assert plan.stats.lines_deleted_removed_s == pytest.approx(1.0)
+    assert "-1.0s" in render.format_stats(plan.stats)[0]
+
+
+def test_stats_two_fillers_cut_removed_seconds(tmp_path):
+    # フィラー2件（まあ・えー）を前後無音付きで安全カット → 合計秒 > 0。
+    _write_words_project(
+        tmp_path,
+        [("結局", 0.0, 1.0, 220.0, 0, False),
+         ("まあ", 1.3, 2.0, 440.0, 1, True),
+         ("大事", 2.3, 3.3, 660.0, 2, False),
+         ("えー", 3.6, 4.3, 550.0, 3, True),
+         ("面倒", 4.6, 5.6, 330.0, 4, False)],
+        silences=[[1.0, 1.3], [2.0, 2.3], [3.3, 3.6], [4.3, 4.6]],
+    )
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] 結局〔まあ〕大事〔えー〕面倒\n", encoding="utf-8")
+    plan = render.build_edit_plan(str(txt))
+    assert plan.stats.filler_cut == 2
+    # 2件のフィラー（各実尺0.7s）を谷スナップして削った合計。スナップで前後の
+    # 無音谷まで寄るため各カット尺は実尺以上になる → 合計は 1.4s を上回る。
+    assert plan.stats.filler_cut_removed_s > 1.4
+    assert ", -" in [l for l in render.format_stats(plan.stats)
+                     if l.startswith("Fillers:")][0]
+
+
+def test_stats_filler_cut_removed_seconds_zero_when_none(tmp_path):
+    # フィラー削除指定なし → filler_cut_removed_s は 0、Fillers 行も出ない。
+    _make_multiseg_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あ\n[0002] い\n[0003] う\n", encoding="utf-8")
+    plan = render.build_edit_plan(str(txt))
+    assert plan.stats.filler_cut_removed_s == 0.0
+    assert not any(l.startswith("Fillers:") for l in render.format_stats(plan.stats))
