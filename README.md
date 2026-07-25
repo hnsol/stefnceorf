@@ -55,11 +55,11 @@ sc logic episode.sc.txt         # generates episode.logic.fcpxml for Logic Pro
 - **Logic Pro integration** — Exports FCPXML that Logic Pro imports directly via File > Import > Final Cut Pro XML. Each region edge is automatically snapped up to 5 ms inward to a quiet point (at or below −50 dBFS) to prevent click noise in the fade-free FCPXML.
 - **Filler word detection** — Automatically detects filler words (`um`, `uh`, `えー`, `まあ`) and removes them in the auto workflow. In the step-by-step flow, fillers are suggested for your review.
 - **Long silence trimming** — Silences over 1.2 seconds are automatically shortened. Within-segment silences exceeding the gap threshold are also split and trimmed.
-- **Verbatim mode** — Transcribes filler words and hesitations that Whisper normally absorbs, enabling accurate filler detection. Enabled by default.
+- **Verbatim mode** — Transcribes filler words and hesitations that Whisper normally absorbs, enabling accurate filler detection. Enabled by default. Since v0.3.0 it uses the fast `turbo` model with a per-chunk filler prompt — in A/B tests across three episodes it captured more fillers than the previous `large-v3` approach while running twice as fast.
 - **Hallucination detection & rescue** — Automatically detects Whisper hallucinations, rescues the affected audio by re-transcribing with safe settings.
 - **Quality preservation** — WAV render output matches original sample rate and bit depth. Equal-power crossfade at cut boundaries prevents click noise.
 - **Japanese & English** — Full support for both languages with language-specific filler dictionaries.
-- **Optional text-based editing** — For finer control, edit the generated transcript in any text editor. Delete text to delete audio, rearrange lines to reorder segments. See [Text-Based Editing](#text-based-editing-optional).
+- **Text-based editing** — For finer control, edit the generated transcript in any text editor. Delete text to delete audio, rearrange lines to reorder segments. Since v0.3.0 the transcript uses the turbo model's natural orthography, so the text you edit reads cleanly. See [Text-Based Editing](#text-based-editing-optional).
 
 ## Podcast Audio Editing Tool Comparison
 
@@ -172,7 +172,7 @@ Key options:
 
 ### Text-Based Editing (Optional)
 
-Open `input.sc.txt` in any text editor for fine-grained control beyond what the auto workflow provides:
+Open `input.sc.txt` in any text editor for fine-grained control beyond what the auto workflow provides. The transcript is produced with the turbo model's natural orthography (v0.3.0+), so it reads cleanly enough to edit as ordinary text:
 
 ```
 [0001 0:00] Today I want to talk about／podcast editing workflows
@@ -242,7 +242,7 @@ No. The default `sc episode.wav` workflow handles everything automatically — f
 
 ### How long does processing take?
 
-A 25-minute WAV file (144 MB) completes in about 4 minutes on an M4 Pro MacBook Pro (48 GB RAM) — transcription, filler removal, silence trimming, and FCPXML export included. Processing time scales roughly with audio length.
+A 25-minute WAV file (144 MB) completes in about 1.5 minutes on an M4 Pro MacBook Pro (48 GB RAM) — transcription, filler removal, silence trimming, and FCPXML export included. Processing time scales roughly with audio length. (v0.3.0 switched verbatim transcription to the turbo model, cutting processing time by more than half.)
 
 ### What audio formats are supported?
 
@@ -256,7 +256,7 @@ Yes. The repository includes `CLAUDE.md` and `AGENTS.md` with project context an
 
 - Transcription accuracy is ~93–95% for Japanese. Proper nouns and jargon may vary.
 - Word timestamp margins of ±20ms are compensated by crossfade, but **a final listen-through is always recommended**.
-- `--verbatim` mode may trigger Whisper hallucinations in long silent sections. These are automatically detected and rescued, but check any warnings.
+- `--verbatim` mode can rarely produce boilerplate hallucinations at chunk boundaries (e.g., a stray "thanks for watching"). These are detected by a time-density check and rescued automatically, but check any warnings.
 - Audio only — no video, captions, or noise reduction (preprocess with Audacity etc.).
 
 ## Development & Testing

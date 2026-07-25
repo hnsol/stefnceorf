@@ -4,7 +4,7 @@
 
 ## Summary
 
-Stefnceorf is an open-source command-line tool for one-command podcast post-production. Run `sc episode.wav` and the tool transcribes the audio using Whisper (via mlx-whisper on Apple Silicon GPU), detects and removes filler words, trims long silences, and exports an FCPXML for Logic Pro — all in a single step. For finer control, the generated transcript can be edited as a plain text file before rendering. It is a free, local, privacy-first alternative to Descript, with native Japanese language support.
+Stefnceorf is an open-source command-line tool for one-command podcast post-production. Run `sc episode.wav` and the tool transcribes the audio using Whisper (via mlx-whisper on Apple Silicon GPU), detects and removes filler words, trims long silences, and exports an FCPXML for Logic Pro — all in a single step. For finer control, the generated transcript can be edited as a plain text file before rendering; the transcript uses Whisper turbo's natural orthography, so it reads cleanly as ordinary text. A 25-minute WAV completes in about 1.5 minutes on an M4 Pro. It is a free, local, privacy-first alternative to Descript, with native Japanese language support.
 
 The name comes from Old English: stefn (voice) + ceorfan (to cut).
 
@@ -27,12 +27,12 @@ The name comes from Old English: stefn (voice) + ceorfan (to cut).
 - Automatic filler word detection and removal (Japanese: えー, まあ, あのー etc. / English: um, uh, er etc.)
 - Pause-based block editing that snaps cuts to natural pause boundaries
 - Long silence trimming including within-segment gap splitting for silences exceeding the gap threshold
-- Verbatim transcription mode that captures filler words Whisper normally absorbs
+- Verbatim transcription mode that captures filler words Whisper normally absorbs (turbo model with a per-chunk filler prompt since v0.3.0 — faster and higher filler recall than the previous large-v3 approach)
 - Automatic hallucination detection with safe-settings rescue re-transcription
 - Non-destructive editing — original audio is never modified
 - Equal-power crossfade at cut boundaries for click-free output
 - Output preserves original sample rate and bit depth
-- Optional text-based editing for fine-grained transcript control
+- Text-based editing for fine-grained transcript control, on a transcript clean enough to read as ordinary text
 
 ## Technical Stack
 
