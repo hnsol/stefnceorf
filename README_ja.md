@@ -137,7 +137,7 @@ sc transcribe input.wav [--lang ja|en] [--verbatim] [--no-filler-suggest] [--mod
 
 - `input.sc.txt`（人間が編集するテキスト）と `input.sc.json`（単語→時刻・信頼度の対応表）を生成します
 - `--lang` 既定 `ja`。英語は `--lang en`
-- `--verbatim`（既定で有効）: フィラーも転写します。`--no-verbatim` で無効化。verbatim 時は自動で大きいモデル（`mlx-community/whisper-large-v3-mlx`）＋フィラー例文プロンプト＋`condition_on_previous_text=True` に切り替わります
+- `--verbatim`（既定で有効）: フィラーも転写します。`--no-verbatim` で無効化。通常転写と同じ turbo モデルを使い、約30秒の短チャンクに分割して各チャンクへフィラー例文プロンプトを再投入します（`condition_on_previous_text=False`）。速度は非verbatimと同等以上です。チャンク境界でまれに出る定型幻覚は後処理で検出し、その窓を large-v3 モデルで再認識してレスキューします
 - `--no-filler-suggest` でフィラー提案を無効化
 - `--pause-threshold`（既定 0.15秒）: ブロック境界の最小ポーズ長。`0` で単語単位削除（旧挙動）
 - 認識用の一時 wav で長い無音（1.2秒以上）を 0.7秒に切り詰め、Whisper の幻覚を抑止します。単語時刻は元音源へ逆写像するため出力に影響はありません

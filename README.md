@@ -166,7 +166,7 @@ Generates two files:
 Key options:
 
 - `--lang` — Language (default: `ja`). Use `--lang en` for English.
-- `--verbatim` — **Enabled by default.** Transcribes filler words that Whisper normally absorbs, using a slower but more accurate model. Its transcription history is reset about every 4–6 minutes to contain long-context hallucinations. Disable with `--no-verbatim`.
+- `--verbatim` — **Enabled by default.** Transcribes filler words that Whisper normally absorbs. It uses the same fast `turbo` model as normal transcription, split into short (~30s) chunks that each re-inject a filler prompt, so speed is on par with non-verbatim mode. Hallucinated boundary phrases are detected in post-processing and rescued by re-recognizing the window with the larger `large-v3` model. Disable with `--no-verbatim`.
 - `--no-filler-suggest` — Disables filler word detection.
 - `--pause-threshold` — Minimum pause duration (seconds) for block boundaries (default: `0.15`). Set to `0` for word-level editing (legacy behavior).
 

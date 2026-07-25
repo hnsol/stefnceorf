@@ -30,7 +30,7 @@ def _add_transcription_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--model",
         default=None,
-        help=f"mlx-whisperモデル (既定: {DEFAULT_MODEL}、--verbatim時は自動で verbatim用モデル)",
+        help=f"mlx-whisperモデル (既定: {DEFAULT_MODEL}。--verbatim も同じ turbo で認識する)",
     )
     parser.add_argument(
         "--filler-suggest",
@@ -43,8 +43,8 @@ def _add_transcription_arguments(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "フィラーや言い淀みも転写する（モデルは whisper-large-v3-mlx、"
-            "処理は約2倍遅い。既定: 有効。--no-verbatim で無効化）"
+            "フィラーや言い淀みも転写する（turbo＋短チャンクで認識。処理速度は"
+            "非verbatimと同等以上。既定: 有効。--no-verbatim で無効化）"
         ),
     )
     parser.add_argument(

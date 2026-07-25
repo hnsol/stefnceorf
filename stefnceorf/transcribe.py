@@ -22,9 +22,11 @@ SILENCE_DB = -50  # 発話レベルが低い音源で静かな発話を無音と
 SILENCE_MIN_S = 1.2
 SILENCE_KEEP_S = 0.7
 
-# verbatim認識チャンクの目標長と許容幅（秒）
-CHUNK_TARGET_S = 300.0
-CHUNK_TOL_S = 60.0
+# verbatim認識チャンクの目標長と許容幅（秒）。turbo は 30s 窓ごとに
+# initial_prompt（フィラー誘導文）を効かせられるよう短チャンクにする
+# （plan_chunks は無音境界優先のまま。境界が無ければ target+tol で切る）。
+CHUNK_TARGET_S = 30.0
+CHUNK_TOL_S = 6.0
 
 # ポーズベース区切り（ブロック単位削除）設定
 # この秒数以上の無音を「カット可能なポーズ区切り」としてブロック境界にする
@@ -33,8 +35,9 @@ PAUSE_THRESHOLD_S = 0.15
 # 無音クランプ後の単語長がこれ未満になる補正は棄却する（秒）
 CLAMP_MIN_WORD_S = 0.05
 
-# 繰り返し幻覚セグメントの後処理除去（--verbatim の condition_on_previous_text=True
-# で長尺の静音区間から発生する繰り返し幻覚への対策。入力側では完全に防げない）
+# 繰り返し幻覚セグメントの後処理除去（--verbatim の短チャンク turbo が
+# チャンク境界や静音区間でまれに出す繰り返し・定型幻覚への対策。入力側では
+# 完全に防げないため後処理＋レスキューで対処する）
 HALLUC_MIN_WORDS = 5     # セグメント内反復判定の最小語数
 HALLUC_TOP_RATIO = 0.7   # 最頻トークンの占有率閾値
 HALLUC_RUN = 3           # 同一テキストセグメントの連続数閾値
@@ -45,6 +48,10 @@ HALLUC_RUN = 3           # 同一テキストセグメントの連続数閾値
 # ヒューリスティクスがフィラーを幻覚と誤判定して弾くため（A/B実測で
 # フィラー候補 67→4）。
 HALLUC_SILENCE_SKIP_S = 2.0
+
+# 短チャンク幻覚除去（条件f）に用いる最小文字数。これ未満の短いセグメントは
+# 「はい」等の正常な相槌がありうるため密度チェックの対象にしない。
+HALLUC_MIN_CHARS = 4
 
 # 時間密度異常による幻覚除去（条件d）。実発話は 5〜7 文字/秒だが幻覚は
 # 全単語 zero-duration 等で 200 文字/秒超になる。実発話の 3 倍超をしきい値とする。
@@ -82,9 +89,18 @@ BLOCK_SEP = "／"
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 
-# verbatim（フィラーも転写）モード用モデル。turbo はフィラーを吸収し、
-# turbo+condT は繰り返し幻覚が出るため、large+prompt+condT を用いる。
-VERBATIM_MODEL = "mlx-community/whisper-large-v3-mlx"
+# verbatim（フィラーも転写）モード用モデル。2026-07-25 の A/B 実験の結論に基づき
+# turbo（DEFAULT_MODEL と同じ）を用いる。turbo＋FILLER_PROMPT＋condT=False＋30s
+# チャンク（毎チャンクにプロンプト再投入）が、フィラー捕捉・本文の自然さ・処理
+# 速度のすべてで large を上回った（フィラー捕捉 60→88 件、幻覚ほぼゼロ、処理
+# 時間半減）。large は逆にフィラーを取りこぼし、長尺静音区間で繰り返し幻覚を
+# 出したため本認識では使わない。large はレスキュー窓の局所再認識でのみ使用する
+# （下記 RESCUE_MODEL）。
+VERBATIM_MODEL = "mlx-community/whisper-large-v3-turbo"
+
+# レスキュー窓（幻覚除去区間）の局所再認識に用いるモデル（large-v3）。狭い窓を
+# fresh context で丁寧に取り直す用途では large の精度が有効。
+RESCUE_MODEL = "mlx-community/whisper-large-v3-mlx"
 
 # verbatim時に渡す initial_prompt（フィラー例文。読点付きトークンを誘導する）
 FILLER_PROMPT = "えーっと、あのー、そのー、まあ、うーん、なんか、えー、あー。"
@@ -614,6 +630,13 @@ def drop_hallucinations(
        問わない）のいずれかと共通接頭辞 HALLUC_ECHO_PREFIX 文字以上で、かつ
        文字密度が HALLUC_ECHO_DENSITY_CHARS_S 超なら除去。ここで非空とは正規化後
        に1文字以上あること。実発話の言い直し反復は密度条件で誤除去を防ぐ。
+    f. 短チャンク幻覚（時間密度異常・語数不問）: 文字数が HALLUC_MIN_CHARS 以上
+       あり、発話時間（先頭単語 start 〜 末尾単語 end）が正で文字密度が
+       HALLUC_DENSITY_CHARS_S 超、または発話時間が 0 以下なら除去。短チャンク
+       turbo がチャンク境界でまれに出す定型幻覚（例「ご視聴ありがとうござい
+       ました」14文字が0.12秒＝約116文字/秒）を捕まえる。条件 d と違い語数は
+       問わない（境界幻覚は少語数で出るため）。除去分は既存のレスキュー機構に
+       乗る。
 
     戻り値: (残すセグメント列, 除去したセグメント列)。順序は入力順を保つ。
     """
@@ -652,6 +675,11 @@ def drop_hallucinations(
                 drop[i] = True
         # 条件 d: 時間密度異常（a に該当しなかった場合に評価）
         if not drop[i] and len(tokens) >= HALLUC_MIN_WORDS:
+            dens = _density(seg, tokens)
+            if dens is None or dens > HALLUC_DENSITY_CHARS_S:
+                drop[i] = True
+        # 条件 f: 短チャンク幻覚（語数不問・文字数ベースの密度異常）
+        if not drop[i] and len("".join(tokens)) >= HALLUC_MIN_CHARS:
             dens = _density(seg, tokens)
             if dens is None or dens > HALLUC_DENSITY_CHARS_S:
                 drop[i] = True
@@ -1123,8 +1151,9 @@ def transcribe(
     verbatim=True なら VERBATIM_MODEL、そうでなければ DEFAULT_MODEL。
     明示指定されたモデルはそのまま尊重する。
 
-    verbatim=True のときはフィラーを転写するため initial_prompt と
-    condition_on_previous_text=True を渡す（非verbatim時はプロンプトなし・False）。
+    verbatim=True のときはフィラーを転写するため各 30s チャンクに
+    initial_prompt を渡す。condition_on_previous_text は False（短チャンク方式で
+    繰り返し幻覚を断つ。非verbatim時もプロンプトなし・False）。
 
     戻り値: {"json_path", "txt_path", "filler_count", "data"}
     """
@@ -1156,20 +1185,24 @@ def transcribe(
     cuts = build_cuts(cut_periods, keep=SILENCE_KEEP_S)
     trimmed_wav, removed_s = _write_trimmed_wav(tmp_wav, cuts)
     recog_wav = trimmed_wav
-    # verbatim では温度フォールバックと無音スキップを無効にする（A/B実測:
-    # ep22-1 でフィラー候補 67→3〜4 に激減する破壊的相互作用があった）。
-    # - 温度フォールバック: 結果温度>0.5 でプロンプトがリセットされ、
-    #   initial_prompt（フィラー誘導文）ごと以降の全窓から消える
-    # - hallucination_silence_threshold: whisper の単語異常ヒューリスティクス
-    #   （低確率・不自然な長さの語）がフィラーそのものを幻覚と誤判定して弾く
-    # verbatim の幻覚対策は後処理（drop_hallucinations 条件a〜e＋レスキュー）に
+    # verbatim 本認識（2026-07-25 A/B 実験の結論に基づく turbo＋短チャンク方式）:
+    # - モデルは turbo（VERBATIM_MODEL）。30s チャンクごとに initial_prompt
+    #   （フィラー誘導文）を再投入し、全窓でフィラー捕捉を効かせる。
+    # - condition_on_previous_text=False: 直前文脈を引き継がないことで、繰り返し
+    #   幻覚の連鎖を断つ。短チャンク＝1窓なので文脈引き継ぎの利点は小さい。
+    # - 温度フォールバックと hallucination_silence_threshold は無効にする（A/B
+    #   実測でフィラー候補 67→3〜4 に激減する破壊的相互作用があった）:
+    #   温度フォールバックは結果温度>0.5 でプロンプトをリセットして initial_prompt
+    #   を消す。hallucination_silence_threshold は whisper の単語異常
+    #   ヒューリスティクスがフィラーそのものを幻覚と誤判定して弾く。
+    # verbatim の幻覚対策は後処理（drop_hallucinations 条件a〜f＋レスキュー）に
     # 委ねる。非verbatim とレスキュー再認識はフィラーを転写しないため両方有効。
     whisper_kwargs = dict(
         path_or_hf_repo=model,
         word_timestamps=True,
         language=lang,
         temperature=0 if verbatim else TEMPERATURE_FALLBACK,
-        condition_on_previous_text=verbatim,
+        condition_on_previous_text=False,
         no_speech_threshold=0.8,
         compression_ratio_threshold=2.0,
         verbose=False,  # mlx-whisper 組み込みの進捗バー(tqdm)を有効化
@@ -1234,6 +1267,9 @@ def transcribe(
         if dropped_segments:
             dropped_ids = {id(s) for s in dropped_segments}
             wav_dur = recog_wav_duration
+            # verbatim のレスキュー窓は large（RESCUE_MODEL）で丁寧に取り直す。
+            # 非verbatim は本認識と同じモデルのまま。
+            rescue_model = RESCUE_MODEL if verbatim else model
             final_segments: list[dict] = []
             group: list[dict] = []
             last_kept: dict | None = None
@@ -1286,12 +1322,12 @@ def transcribe(
                 if win is not None:
                     attempts.append("verbatim")
                     rescued_segs = _rescue_transcribe(
-                        recog_wav, win[0], win[1], model, lang, True
+                        recog_wav, win[0], win[1], rescue_model, lang, True
                     )
                     if not rescued_segs:
                         attempts.append("safe")
                         rescued_segs = _rescue_transcribe(
-                            recog_wav, win[0], win[1], model, lang, False
+                            recog_wav, win[0], win[1], rescue_model, lang, False
                         )
 
                 # 診断範囲は、JSONで音声を保持する窓境界と一致させる。

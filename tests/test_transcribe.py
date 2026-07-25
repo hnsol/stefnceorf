@@ -16,24 +16,35 @@ def test_default_silence_trim_limits():
 # ---- plan_chunks（純関数） ----
 
 def test_plan_chunks_chooses_longest_silence_near_target():
+    # target/tol を明示して境界選択アルゴリズムを検証する（既定値とは独立）
     assert transcribe.plan_chunks(
-        550.0, [(260.0, 262.0), (320.0, 330.0)]
+        550.0, [(260.0, 262.0), (320.0, 330.0)], target=300.0, tol=60.0
     ) == [(0.0, 325.0), (325.0, 550.0)]
 
 
 def test_plan_chunks_short_audio_is_single_chunk():
-    assert transcribe.plan_chunks(350.0, []) == [(0.0, 350.0)]
+    assert transcribe.plan_chunks(
+        350.0, [], target=300.0, tol=60.0
+    ) == [(0.0, 350.0)]
 
 
 def test_plan_chunks_without_silence_uses_upper_boundary():
-    assert transcribe.plan_chunks(700.0, []) == [
-        (0.0, 360.0), (360.0, 700.0)
+    assert transcribe.plan_chunks(
+        700.0, [], target=300.0, tol=60.0
+    ) == [(0.0, 360.0), (360.0, 700.0)]
+
+
+def test_plan_chunks_default_target_is_short_for_verbatim():
+    # 既定は 30s 短チャンク（毎チャンクにフィラープロンプトを効かせるため）
+    assert (transcribe.CHUNK_TARGET_S, transcribe.CHUNK_TOL_S) == (30.0, 6.0)
+    assert transcribe.plan_chunks(60.0, [(29.0, 31.0)]) == [
+        (0.0, 30.0), (30.0, 60.0)
     ]
 
 
 def test_plan_chunks_has_no_gap_or_overlap():
     chunks = transcribe.plan_chunks(
-        1200.0, [(295.0, 305.0), (600.0, 610.0)]
+        1200.0, [(295.0, 305.0), (600.0, 610.0)], target=300.0, tol=60.0
     )
     assert chunks[0][0] == 0.0
     assert chunks[-1][1] == 1200.0
@@ -919,6 +930,50 @@ def test_drop_halluc_echo_normal_density_kept():
     assert dropped == []
 
 
+# ---- drop_hallucinations 条件f（短チャンク幻覚・語数不問の密度異常） ----
+
+def test_drop_halluc_density_short_boundary_phrase_removed():
+    # 14文字が0.12秒（約116文字/秒）・語数少（1語）→ 条件f で除去
+    s = "ご視聴ありがとうございました"
+    assert len(s) == 14
+    seg = _seg(s, _timed_words([s], 5.0, 5.12))
+    kept, dropped = transcribe.drop_hallucinations([seg])
+    assert kept == []
+    assert dropped == [seg]
+
+
+def test_drop_halluc_density_short_zero_duration_removed():
+    # 4文字以上・発話時間0（全単語同時刻）で語数少→ 条件f で除去
+    seg = _seg("ありがとう", _timed_words(["ありがとう"], 3.0, 3.0))
+    kept, dropped = transcribe.drop_hallucinations([seg])
+    assert kept == []
+    assert dropped == [seg]
+
+
+def test_drop_halluc_density_short_normal_kept():
+    # 10文字を2秒（5文字/秒）・語数少→ 通常密度なので残す
+    seg = _seg(
+        "ありがとうございます",
+        _timed_words(["ありがとう", "ございます"], 3.0, 5.0),
+    )
+    kept, dropped = transcribe.drop_hallucinations([seg])
+    assert kept == [seg]
+    assert dropped == []
+
+
+def test_drop_halluc_density_below_min_chars_kept():
+    # 3文字は高密度でも対象外（相槌等の誤除去防止）
+    seg = _seg("はいはい", _timed_words(["はい", "はい"], 1.0, 1.02))
+    # 4文字だと除去されるため3文字ケースを別に確認
+    short = _seg("うん", _timed_words(["うん"], 1.0, 1.01))
+    kept, dropped = transcribe.drop_hallucinations([short])
+    assert kept == [short]
+    assert dropped == []
+    # 参考: 4文字は除去される（境界確認）
+    kept2, dropped2 = transcribe.drop_hallucinations([seg])
+    assert dropped2 == [seg]
+
+
 # ---- transcribe 全体（mlx_whisper と ffmpeg をモック） ----
 
 @pytest.fixture
@@ -1043,13 +1098,14 @@ def test_transcribe_non_verbatim_defaults(tmp_path, fake_whisper):
 
 
 def test_transcribe_verbatim_uses_verbatim_model_and_prompt(tmp_path, fake_whisper):
-    """verbatim: model未指定→VERBATIM_MODEL・FILLER_PROMPT・condT True・json verbatim True。"""
+    """verbatim: model未指定→VERBATIM_MODEL(turbo)・FILLER_PROMPT・condT False・json verbatim True。"""
     wav = _make_input(tmp_path)
     transcribe.transcribe(str(wav), lang="ja", verbatim=True)
     kw = fake_whisper["kwargs"]
     assert kw["path_or_hf_repo"] == transcribe.VERBATIM_MODEL
+    assert transcribe.VERBATIM_MODEL == transcribe.DEFAULT_MODEL
     assert kw["initial_prompt"] == transcribe.FILLER_PROMPT
-    assert kw["condition_on_previous_text"] is True
+    assert kw["condition_on_previous_text"] is False
     data = json.loads((tmp_path / "input.sc.json").read_text(encoding="utf-8"))
     assert data["verbatim"] is True
     assert data["model"] == transcribe.VERBATIM_MODEL
@@ -1134,12 +1190,12 @@ def test_transcribe_verbatim_chunks_and_offsets_words(tmp_path, monkeypatch):
     fake_mod.transcribe = fake_transcribe
     monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
     monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
-    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 600.0)
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 60.0)
 
     def fake_detect(path, d):
         silence_calls.append((path, d))
         if d == 0.5:
-            return "silence_start: 299.0\nsilence_end: 301.0\n"
+            return "silence_start: 29.0\nsilence_end: 31.0\n"
         return ""
 
     monkeypatch.setattr(transcribe, "_detect_silence", fake_detect)
@@ -1165,17 +1221,18 @@ def test_transcribe_verbatim_chunks_and_offsets_words(tmp_path, monkeypatch):
     wav = _make_input(tmp_path)
     result = transcribe.transcribe(str(wav), lang="ja", verbatim=True)
 
-    assert slices == [(0.0, 300.0), (300.0, 600.0)]
+    assert slices == [(0.0, 30.0), (30.0, 60.0)]
     assert len(calls) == 2
     assert silence_calls[-1][1] == 0.5
     assert planned == {
-        "duration": 600.0,
-        "silences": [(299.0, 301.0)],
+        "duration": 60.0,
+        "silences": [(29.0, 31.0)],
         "target": transcribe.CHUNK_TARGET_S,
         "tol": transcribe.CHUNK_TOL_S,
     }
+    assert (transcribe.CHUNK_TARGET_S, transcribe.CHUNK_TOL_S) == (30.0, 6.0)
     for _, kwargs in calls:
-        assert kwargs["condition_on_previous_text"] is True
+        assert kwargs["condition_on_previous_text"] is False
         assert kwargs["temperature"] == 0
         assert kwargs["initial_prompt"] == transcribe.FILLER_PROMPT
     assert [segment.get("kind", "speech") for segment in result["data"]["segments"]] == [
@@ -1184,9 +1241,9 @@ def test_transcribe_verbatim_chunks_and_offsets_words(tmp_path, monkeypatch):
     assert (
         result["data"]["segments"][2]["source_start"],
         result["data"]["segments"][2]["source_end"],
-    ) == (2.0, 300.5)
-    assert result["data"]["segments"][3]["words"][0]["start"] == 300.5
-    assert result["data"]["segments"][3]["words"][0]["end"] == 301.5
+    ) == (2.0, 30.5)
+    assert result["data"]["segments"][3]["words"][0]["start"] == 30.5
+    assert result["data"]["segments"][3]["words"][0]["end"] == 31.5
     assert result["data"]["language"] == "ja"
     assert all(not path.exists() for path in clip_paths)
 
@@ -1831,6 +1888,23 @@ def test_rescue_uses_verbatim_first_and_accepts_clean_result(
     rescue_range = result["hallucination_ranges"][0]
     assert rescue_range["attempts"] == ["verbatim"]
     assert rescue_range["status"] == "rescued"
+
+
+def test_verbatim_rescue_uses_large_model(tmp_path, monkeypatch):
+    """verbatim: 本認識は turbo、レスキュー窓は large（RESCUE_MODEL）で再認識する。"""
+    calls = _setup_rescue(
+        monkeypatch, _rescue_main_result(), _clean_rescue_result()
+    )
+
+    transcribe.transcribe(
+        str(_make_input(tmp_path)), lang="ja", verbatim=True
+    )
+
+    assert transcribe.RESCUE_MODEL == "mlx-community/whisper-large-v3-mlx"
+    assert transcribe.RESCUE_MODEL != transcribe.VERBATIM_MODEL
+    # calls[0]=本認識(turbo), calls[1]=レスキュー(large)
+    assert calls[0]["kwargs"]["path_or_hf_repo"] == transcribe.VERBATIM_MODEL
+    assert calls[1]["kwargs"]["path_or_hf_repo"] == transcribe.RESCUE_MODEL
 
 
 def test_rescue_falls_back_to_safe_mode_after_verbatim_anomaly(
