@@ -488,6 +488,91 @@ def plan_filler_cut(
     return snapped_start, snapped_end
 
 
+UNRECOGNIZED_PAUSE_KEEP_S = 0.25  # 未認識区間/UTS削除後に元位置で残す間の合計（FILLER_PAUSE_KEEP_S と同値）
+
+
+def plan_guarded_pause(
+    cut_start: float,
+    cut_end: float,
+    previous_end: float,
+    next_start: float,
+    silence_spans: list[tuple[float, float]] | None,
+    pause_keep: float = UNRECOGNIZED_PAUSE_KEEP_S,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """元位置で発話境界に連続する既知無音を pause_keep 秒残す（純関数）。
+
+    未認識区間・UTS行の削除は、デジタル無音の挿入や別位置のルームトーン借用、
+    長いクロスフェードに頼らず「元の録音でその位置が本当に無音だった分だけ」
+    残すという方針の一部。したがって容量に数えてよいのは previous_end から
+    連続する既知無音（左）と next_start まで連続する既知無音（右）だけであり、
+    発話境界と無音区間の間に未知区間（silence_spans に含まれない隙間）が
+    あればそこから先は数えない。
+
+    左は previous_end から、右は next_start までを残すことで、残す区間は
+    常に発話側へ接続したままになる（cut_start/cut_end でクランプし、削除
+    対象の内側にある無音は数えない）。
+
+    配分は pause_keep を半分ずつ割り当て、片側の容量が不足していればその
+    不足分をもう片方へ回す。左右の既知無音容量の合計が pause_keep に満た
+    なければ安全に残せないので None を返す（呼び出し側はカットを諦めるか
+    別の扱いをする）。
+    """
+    if not silence_spans:
+        return None
+
+    # 隣接・重複する区間を先にマージしておく（SILENCE_EDGE_TOL_S 以内の隙間は結合）
+    spans = sorted((float(s), float(e)) for s, e in silence_spans if e > s)
+    merged: list[list[float]] = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1] + SILENCE_EDGE_TOL_S:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+
+    # 左容量: previous_end に接する既知無音の連続部分（cut_start でクランプ）
+    left_capacity = 0.0
+    left_edge = previous_end
+    for s, e in merged:
+        if s <= left_edge + SILENCE_EDGE_TOL_S:
+            e_clamped = min(e, cut_start)
+            if e_clamped > left_edge:
+                left_capacity += e_clamped - left_edge
+                left_edge = e
+        else:
+            break
+
+    # 右容量: next_start に接する既知無音の連続部分（cut_end でクランプ）
+    right_capacity = 0.0
+    right_edge = next_start
+    for s, e in reversed(merged):
+        if e >= right_edge - SILENCE_EDGE_TOL_S:
+            s_clamped = max(s, cut_end)
+            if s_clamped < right_edge:
+                right_capacity += right_edge - s_clamped
+                right_edge = s
+        else:
+            break
+
+    if left_capacity + right_capacity < pause_keep - 1e-6:
+        return None
+
+    half = pause_keep / 2.0
+    left_keep = min(half, left_capacity)
+    right_keep = min(half, right_capacity)
+    # 片側の不足分をもう片方へ回す
+    deficit = pause_keep - (left_keep + right_keep)
+    if deficit > 1e-9:
+        left_keep = min(left_capacity, left_keep + deficit)
+        deficit = pause_keep - (left_keep + right_keep)
+        if deficit > 1e-9:
+            right_keep = min(right_capacity, right_keep + deficit)
+
+    return (
+        (previous_end, previous_end + left_keep),
+        (next_start - right_keep, next_start),
+    )
+
+
 def words_to_intervals(
     words: list[dict],
     keep_indices: set[int],

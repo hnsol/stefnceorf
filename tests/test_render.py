@@ -434,6 +434,56 @@ def test_plan_filler_cut_lo_clamp_prevents_prev_word_intrusion():
     ) is None
 
 
+# ---- plan_guarded_pause ----
+
+def test_guarded_pause_keeps_125ms_on_each_side():
+    result = render.plan_guarded_pause(
+        cut_start=1.30,
+        cut_end=1.70,
+        previous_end=1.00,
+        next_start=2.00,
+        silence_spans=[(1.00, 1.30), (1.70, 2.00)],
+    )
+    assert result == (
+        (pytest.approx(1.00), pytest.approx(1.125)),
+        (pytest.approx(1.875), pytest.approx(2.00)),
+    )
+
+
+def test_guarded_pause_redistributes_short_left_side():
+    result = render.plan_guarded_pause(
+        cut_start=1.05,
+        cut_end=1.70,
+        previous_end=1.00,
+        next_start=2.00,
+        silence_spans=[(1.00, 1.05), (1.70, 2.00)],
+    )
+    assert result == (
+        (pytest.approx(1.00), pytest.approx(1.05)),
+        (pytest.approx(1.80), pytest.approx(2.00)),
+    )
+
+
+def test_guarded_pause_rejects_when_total_known_silence_is_short():
+    assert render.plan_guarded_pause(
+        cut_start=1.10,
+        cut_end=1.90,
+        previous_end=1.00,
+        next_start=2.00,
+        silence_spans=[(1.00, 1.10), (1.90, 2.00)],
+    ) is None
+
+
+def test_guarded_pause_does_not_count_unknown_gap():
+    assert render.plan_guarded_pause(
+        cut_start=1.30,
+        cut_end=1.70,
+        previous_end=1.00,
+        next_start=2.00,
+        silence_spans=[(1.05, 1.30), (1.70, 1.95)],
+    ) is None
+
+
 # ---- surviving_words ----
 
 def test_survive_no_edit():
