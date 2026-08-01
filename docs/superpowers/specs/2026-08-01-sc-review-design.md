@@ -59,6 +59,29 @@ stefnceorf は削除候補（フィラー・未転写発話候補・無音トリ
 - `render_plan` 分離後の既存 `sc render` 回帰
 - 小型 wav での統合テスト。review.wav が既存出力を上書きしないこと
 
+## 追記（2026-08-01）: `--serve` 対話モード（Hlyst）
+
+画面名は **Hlyst**（古英語 hlyst=聴くこと）。UI表記「Hlyst — A/B試聴・編集」。
+静的モード（既定）は従来どおり。`--serve` 時のみ 127.0.0.1 のローカルサーバーを起き、
+チェックボックスで削除ON/OFF→即試聴（`/preview`）→保存（`/save`）を可能にする。
+
+要点（詳細は実装計画 2026-08-01 承認版に従う）:
+
+- **TXT は再構成しない**: raw 行を保持し対象行のみ局所変更（keepends、原子的書き込み、
+  .bak、mtime＋ハッシュの外部変更検出、保存後の基準更新）。起動前から削除済みの行の復活は
+  JSON から標準形式で再生成
+- **フィラー単語トグル**は JSON 単語列と raw 行の構造照合で文字範囲を特定して〔〕を付与/解除。
+  一意対応できなければ保存せず手動編集を案内
+- **`render_plan_window`**: 先頭からのストリーミングで crossfade_concat の累積状態を再現し、
+  全体 render とサンプル一致の窓 wav を返す。`t_center` は新プランの出力時刻
+  （削除ONの対象は結合境界）
+- **`build_edit_plan_from_text(context, edited_text)`** を分離し、メモリ上 TXT から
+  プランを作れるようにする（既存 `build_edit_plan(path)` はそれを呼ぶ）
+- **状態モデル**: `requested_delete`（TXT上の指定）と `effective_delete`（安全判定後の実際）を
+  分離。チェックは requested、表示・再生中心は effective
+- **サーバー保護**: 起動毎トークン（URL＋POSTヘッダ）、Host/Origin 完全一致検証、
+  配信は原音・review.wav の allowlist のみ、POST サイズ上限、preview/save の直列化
+
 ## 不採用にした代替案
 
 - **擬似編集再生（timeupdate スキップ）**: 決定事項 2 の理由で撤回
