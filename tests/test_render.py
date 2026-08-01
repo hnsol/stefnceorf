@@ -1916,6 +1916,96 @@ def test_guarded_cut_rms_window_does_not_reach_neighbor_speech(tmp_path):
     assert _pause_between_outer_tones(plan) == pytest.approx(0.25, abs=1 / 16000)
 
 
+def test_exact_cut_residual_gap_still_trims_long_silence():
+    # exact カット後に残ったギャップも通常規則（長無音の切り詰め）で処理する。
+    out, flags = render.plan_output_intervals(
+        [(0.0, 1.0), (6.0, 7.0)],
+        [],
+        exact_cut_spans=[(1.0, 1.5)],
+        silence_spans=[(1.5, 6.0)],
+    )
+    assert out == [
+        (0.0, pytest.approx(1.0)),
+        (pytest.approx(1.5), pytest.approx(1.85)),
+        (pytest.approx(5.65), 7.0),
+    ]
+    assert flags == [False, False]
+
+
+def test_exact_cut_residual_gap_drops_deleted_word_audio():
+    # exact カットの後ろに削除単語が残っていれば、その音声を復活させない。
+    out, flags = render.plan_output_intervals(
+        [(0.0, 1.0), (4.0, 5.0)],
+        [(2.0, 3.0)],
+        exact_cut_spans=[(1.0, 1.5)],
+    )
+    assert out == [(0.0, pytest.approx(1.0)), (4.0, 5.0)]
+    assert flags == [True]
+
+
+def _write_guarded_with_deleted_next_row(tmp_path, sr=16000):
+    """A / 無音 / 未認識 / 無音 / B / 長無音 / C を書き txt パスを返す。
+
+    B（0003）を行削除すると、guarded cut の残余ギャップに削除単語と長無音が
+    残る。ここを通常規則で再評価しないと B の音声と長無音が復活する。
+    """
+    import soundfile as sf
+
+    total = 5.6
+    audio = np.zeros(int(round(total * sr)))
+
+    def put(s, e, freq):
+        n = int(round(e * sr)) - int(round(s * sr))
+        t = np.arange(n) / sr
+        audio[int(round(s * sr)):int(round(s * sr)) + n] = (
+            0.3 * np.cos(2 * np.pi * freq * t)
+        )
+
+    put(0.0, 1.0, 200.0)    # A
+    put(1.3, 1.8, 400.0)    # 未認識
+    put(2.1, 2.6, 800.0)    # B（行削除される）
+    put(4.6, 5.6, 600.0)    # C
+
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), audio, sr, subtype="PCM_16")
+    data = {
+        "source_wav": str(wav.resolve()),
+        "language": "ja",
+        "model": "test",
+        "silences": [[1.0, 1.3], [1.8, 2.1], [2.6, 4.6]],
+        "segments": [
+            {"id": "0001", "text": "あ",
+             "words": [{"word": "あ", "start": 0.0, "end": 1.0,
+                        "probability": 0.9}]},
+            {"id": "0002", "kind": "unrecognized", "text": "⚠ 未認識区間",
+             "source_start": 1.3, "source_end": 1.8, "words": []},
+            {"id": "0003", "text": "い",
+             "words": [{"word": "い", "start": 2.1, "end": 2.6,
+                        "probability": 0.9}]},
+            {"id": "0004", "text": "う",
+             "words": [{"word": "う", "start": 4.6, "end": 5.6,
+                        "probability": 0.9}]},
+        ],
+    }
+    (tmp_path / "input.sc.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+    return tmp_path / "input.sc.txt"
+
+
+def test_guarded_cut_does_not_revive_next_deleted_row(tmp_path):
+    txt = _write_guarded_with_deleted_next_row(tmp_path)
+    txt.write_text("[0001] あ\n[0004] う\n", encoding="utf-8")
+    plan = render.build_edit_plan(str(txt))
+
+    assert plan.stats.unrecognized_cut == 1
+    audio, sr = _guarded_render(plan)
+    # 未認識(400) と削除行(800) はどちらも出力に現れない
+    assert _render_freq_sequence(audio, sr, [200, 400, 600, 800]) == [200, 600]
+    # 長無音(2.0s)も復活しない。A 1.0s + 左ポーズ0.125s + C 1.0s 強の尺に収まる
+    assert len(audio) / sr < 2.3
+
+
 def test_guarded_cut_boundaries_rejects_empty_keep_window():
     audio = np.zeros(16000)
     assert not render.guarded_cut_boundaries_are_safe(

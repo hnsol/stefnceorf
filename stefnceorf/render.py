@@ -727,7 +727,10 @@ def plan_output_intervals(
        重なる span の [a, b] をそのまま切り落とし（前区間終端を a、次区間始端を
        b にする）単純結合する。ここで追加のポーズ配分はしない。この分岐が
        単語判定より先に来るのは、削除対象の未認識音声が word_spans に残って
-       いてもギャップ音声を復活させないため。
+       いてもギャップ音声を復活させないため。切り落とした前後に残るギャップは
+       分岐 3〜5 で改めて評価する（後続行が丸ごと削除されている場合に、その
+       音声や長無音を無条件保持しないため）。同一ギャップに複数の exact span
+       があれば左から順に同じ処理を繰り返す。
     3. 間に単語（フィラー以外の削除単語）が挟まる: 従来どおりクロスフェード結合
     4. filler_spans のうち (pe, ns) に重なるものがある: フィラーポーズ分岐。
        安全にカットされたフィラーが挟まる無音ギャップなので、削除後に残す間の
@@ -748,7 +751,18 @@ def plan_output_intervals(
         return [], []
 
     fspans = filler_spans or []
-    espans = exact_cut_spans or []
+    # exact span は重なり・接触をマージして昇順にしておく（同一ギャップに複数の
+    # guarded cut があっても左から順に処理できるようにするため）。
+    espans: list[tuple[float, float]] = []
+    for span_start, span_end in sorted(
+        (float(s), float(e))
+        for s, e in (exact_cut_spans or [])
+        if float(e) > float(s)
+    ):
+        if espans and span_start <= espans[-1][1]:
+            espans[-1] = (espans[-1][0], max(espans[-1][1], span_end))
+        else:
+            espans.append((span_start, span_end))
 
     def _known_silence_overlaps(start: float, end: float) -> list[tuple[float, float]]:
         if not silence_spans or end <= start:
@@ -772,41 +786,42 @@ def plan_output_intervals(
     pending = [intervals[0][0], intervals[0][1]]
     half = gap_max / 2.0
     fhalf = filler_pause_keep / 2.0
-    for k in range(1, len(intervals)):
-        cur = intervals[k]
-        pe = intervals[k - 1][1]
-        ns = cur[0]
-        g = ns - pe
-        if g < 0:
-            # 1. ソース逆行 → クロスフェード結合
-            out.append((pending[0], pending[1]))
-            cf_flags.append(True)
-            pending = [cur[0], cur[1]]
-            continue
-        exact = [(s, e) for s, e in espans if s < ns and e > pe]
-        if exact:
-            # 2. guarded cut（未認識/UTS）→ 確定済み区間を切り落として単純結合。
-            # 前後に残すポーズは既に intervals 側へ含まれているため再配分しない。
-            a = max(pending[0], min(s for s, _e in exact))
-            b = min(cur[1], max(e for _s, e in exact))
-            pending[1] = a
-            out.append((pending[0], pending[1]))
-            cf_flags.append(False)
-            pending = [b, cur[1]]
-            continue
-        if _word_in_gap(word_spans, pe, ns):
+    def _emit(crossfade: bool) -> None:
+        """pending を確定出力する。
+
+        空区間（exact カット直後の残余処理で生じうる）は出力へ足さず、結合
+        フラグだけを引き継ぐ。クロスフェード要求は安全側なので優先する
+        （削除単語の境界がクリック防止フェードと hot 境界警告の対象で
+        あり続けるようにするため）。
+        """
+        if out and pending[1] <= pending[0]:
+            if crossfade and cf_flags:
+                cf_flags[-1] = True
+            return
+        out.append((pending[0], pending[1]))
+        cf_flags.append(crossfade)
+
+    def _resolve_gap(
+        gap_start: float, next_start: float, next_end: float
+    ) -> None:
+        """保持しないギャップ [gap_start, next_start) を通常規則で処理する。
+
+        分岐 3（削除単語）→ 4（フィラーポーズ）→ 5（無音トリム/保持）。
+        next_end は次に保持する区間の暫定終端。exact カット後の残余ギャップも
+        この関数を通すので、削除された行の音声や長無音が復活しない。
+        """
+        if _word_in_gap(word_spans, gap_start, next_start):
             # 3. フィラー以外の削除単語が挟まる → クロスフェード結合
-            out.append((pending[0], pending[1]))
-            cf_flags.append(True)
-            pending = [cur[0], cur[1]]
-            continue
-        overlap = [(s, e) for s, e in fspans if s < ns and e > pe]
+            _emit(True)
+            pending[:] = [next_start, next_end]
+            return
+        overlap = [(s, e) for s, e in fspans if s < next_start and e > gap_start]
         if overlap:
             # 4. フィラーポーズ分岐（無音中カット → 単純結合）
-            f_start = min(max(s, pe) for s, e in overlap)
-            f_end = max(min(e, ns) for s, e in overlap)
-            pre_avail = max(0.0, f_start - pe)
-            post_avail = max(0.0, ns - f_end)
+            f_start = min(max(s, gap_start) for s, e in overlap)
+            f_end = max(min(e, next_start) for s, e in overlap)
+            pre_avail = max(0.0, f_start - gap_start)
+            post_avail = max(0.0, next_start - f_end)
             pre_keep = min(pre_avail, fhalf)
             post_keep = min(post_avail, fhalf)
             # 片側の余り（fhalf を使い切れなかった分）を他方の avail 範囲で再配分。
@@ -816,29 +831,67 @@ def plan_output_intervals(
             pre_keep += add_pre
             leftover -= add_pre
             post_keep += min(leftover, post_avail - post_keep)
-            pending[1] = pe + pre_keep
-            out.append((pending[0], pending[1]))
-            cf_flags.append(False)
-            pending = [ns - post_keep, cur[1]]
-            continue
+            pending[1] = gap_start + pre_keep
+            _emit(False)
+            pending[:] = [next_start - post_keep, next_end]
+            return
         # 5. 純無音ギャップ
+        g = next_start - gap_start
         if g <= gap_threshold or g <= gap_max:
-            pending[1] = cur[1]
-            continue
+            pending[1] = next_end
+            return
 
         trimmed = False
-        for silence_start, silence_end in _known_silence_overlaps(pe, ns):
+        for silence_start, silence_end in _known_silence_overlaps(
+            gap_start, next_start
+        ):
             silence_duration = silence_end - silence_start
             if silence_duration <= gap_max:
                 continue
             pending[1] = silence_start + half
-            out.append((pending[0], pending[1]))
-            cf_flags.append(False)
-            pending = [silence_end - half, cur[1]]
+            _emit(False)
+            pending[:] = [silence_end - half, next_end]
             trimmed = True
         if not trimmed:
-            pending[1] = cur[1]
-    out.append((pending[0], pending[1]))
+            pending[1] = next_end
+
+    for k in range(1, len(intervals)):
+        cur = intervals[k]
+        pe = intervals[k - 1][1]
+        ns = cur[0]
+        if ns - pe < 0:
+            # 1. ソース逆行 → クロスフェード結合
+            _emit(True)
+            pending[:] = [cur[0], cur[1]]
+            continue
+        exact = [(s, e) for s, e in espans if s < ns and e > pe]
+        if exact:
+            # 2. guarded cut（未認識/UTS）→ 確定済み区間を切り落として単純結合。
+            # 前後に残すポーズは既に intervals 側へ含まれているため再配分しない。
+            # exact 区間の前後に残るギャップは通常規則へ回す（切り落として終わりに
+            # すると、後続の削除行の音声や長無音がそのまま復活してしまう）。
+            gap_start = pe
+            for span_start, span_end in exact:
+                a = max(pending[0], span_start)
+                if a > gap_start:
+                    _resolve_gap(gap_start, a, a)
+                b = min(cur[1], max(span_end, a))
+                pending[1] = max(a, pending[0])
+                _emit(False)
+                pending[:] = [b, b]
+                gap_start = b
+            if gap_start < ns:
+                _resolve_gap(gap_start, ns, cur[1])
+            else:
+                pending[1] = cur[1]
+            continue
+        _resolve_gap(pe, ns, cur[1])
+    if out and pending[1] <= pending[0]:
+        # 末尾が空区間になる場合はフラグ数の整合を保ったまま落とす
+        if cf_flags:
+            cf_flags.pop()
+    else:
+        out.append((pending[0], pending[1]))
     return out, cf_flags
 
 
