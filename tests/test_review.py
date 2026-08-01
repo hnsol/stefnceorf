@@ -662,3 +662,128 @@ def test_review_unknown_id_raises(tmp_path):
     txt = _write_txt(tmp_path, "[9999] なし\n")
     with pytest.raises(ValueError):
         review.review(str(txt), open_browser=False)
+
+
+# ---- 状態モデル（requested / effective）と serve モードの HTML ----
+
+def test_state_label_combinations():
+    assert review.state_label(True, True) == "削除"
+    assert review.state_label(True, False) == "unsafeのため保持"
+    assert review.state_label(False, False) == "保持"
+    assert review.state_label(False, True) == "削除（手動編集）"
+
+
+def test_review_data_reports_requested_and_effective(tmp_path):
+    """既定（requested 未指定）では TXT の行の有無と写像の被覆から推定する。"""
+    _plan, rd = _build(tmp_path, "[0001] あえーい\n[0003] う\n")
+    assert _seg(rd, "0002")["requested_delete"] is True
+    assert _seg(rd, "0002")["effective_delete"] is True
+    assert _seg(rd, "0001")["requested_delete"] is False
+    assert _seg(rd, "0001")["effective_delete"] is False
+
+
+def test_review_data_requested_override_is_used(tmp_path):
+    """requested を渡すと（unsafe 等で）effective と食い違っても保持される。"""
+    _make_project(tmp_path)
+    txt = _write_txt(tmp_path, _FULL_TXT)
+    plan = render.build_edit_plan(str(txt))
+    data = json.loads((tmp_path / "input.sc.json").read_text(encoding="utf-8"))
+    rd = review.build_review_data(
+        plan, data, {"0001", "0002", "0003", "0004"},
+        "input.wav", "input.review.wav",
+        serve=True,
+        requested={"segments": {"0001": True}, "words": {"0001": {1: True}}},
+    )
+    assert _seg(rd, "0001")["requested_delete"] is True
+    assert _seg(rd, "0001")["effective_delete"] is False
+    assert _seg(rd, "0001")["words"][1]["requested_delete"] is True
+    assert _seg(rd, "0001")["words"][1]["effective_delete"] is False
+
+
+def test_review_data_uts_toggle_kind(tmp_path):
+    _plan, rd = _build(tmp_path, _FULL_TXT)
+    assert _seg(rd, "0002")["toggle"] == "bracket"
+    assert _seg(rd, "0001")["toggle"] == "line"
+
+
+def test_html_title_is_hlyst(tmp_path):
+    html, _rd = _html(tmp_path)
+    assert "<title>Hlyst — input</title>" in html
+    assert "A/B試聴" in html
+
+
+def test_static_html_has_no_checkboxes(tmp_path):
+    html, _rd = _html(tmp_path)
+    assert 'type="checkbox"' not in html
+    assert 'id="save"' not in html
+
+
+def _serve_html(tmp_path, body=_FULL_TXT, requested=None):
+    _make_project(tmp_path)
+    txt = _write_txt(tmp_path, body)
+    plan = render.build_edit_plan(str(txt))
+    data = json.loads((tmp_path / "input.sc.json").read_text(encoding="utf-8"))
+    kept = {sid for sid, _t, _b in render.parse_edited_txt(
+        txt.read_text(encoding="utf-8"))}
+    rd = review.build_review_data(
+        plan, data, kept, "/audio/source?token=t", "/audio/review?token=t",
+        serve=True, requested=requested, token="t",
+    )
+    return review.render_html(rd), rd
+
+
+def test_serve_html_has_line_and_word_checkboxes(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    transcript = _transcript_html(html)
+    assert '<input type="checkbox" class="del" data-i="0"' in transcript
+    assert 'class="delw" data-i="0" data-w="1"' in transcript
+    # フィラー提案でない単語にはチェックボックスを付けない
+    assert 'data-w="0" aria-label' not in transcript
+
+
+def test_serve_html_checkbox_reflects_requested_state(tmp_path):
+    html, _rd = _serve_html(
+        tmp_path, "[0001] あ〔えー〕い\n[0002] ⚠\n[0003] う\n[0004] え\n"
+    )
+    transcript = _transcript_html(html)
+    assert 'class="delw" data-i="0" data-w="1" aria-label="このフィラーを削除" checked' \
+        in transcript
+
+
+def test_serve_html_shows_state_labels(tmp_path):
+    html, _rd = _serve_html(
+        tmp_path, "[0001] あ〔えー〕い\n[0002] ⚠\n[0003] う\n",
+    )
+    transcript = _transcript_html(html)
+    assert '<span class="state" data-i="0">保持</span>' in transcript
+    assert '<span class="state" data-i="3">削除</span>' in transcript
+
+
+def test_serve_html_shows_unsafe_state(tmp_path):
+    html, _rd = _serve_html(
+        tmp_path, _FULL_TXT, requested={"segments": {"0001": True}, "words": {}}
+    )
+    assert "unsafeのため保持" in _transcript_html(html)
+
+
+def test_serve_html_includes_save_controls_and_script(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    assert 'id="save"' in html
+    assert 'id="audio-preview"' in html
+    assert '"/preview"' in html
+    assert '"/save"' in html
+    assert "X-Hlyst-Token" in html
+
+
+def test_serve_html_has_no_cdn(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    assert "http://" not in html
+    assert "https://" not in html
+    assert "<script src=" not in html
+
+
+def test_serve_html_embeds_token(tmp_path):
+    html, rd = _serve_html(tmp_path)
+    assert rd["token"] == "t"
+    assert _payload_json(html)["serve"] is True
+    assert _payload_json(html)["token"] == "t"

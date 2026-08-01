@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -2117,3 +2119,180 @@ def test_stats_filler_cut_removed_seconds_zero_when_none(tmp_path):
     plan = render.build_edit_plan(str(txt))
     assert plan.stats.filler_cut_removed_s == 0.0
     assert not any(l.startswith("Fillers:") for l in render.format_stats(plan.stats))
+
+
+# ---- build_edit_plan_from_text（メモリ上 TXT からの計画） ----
+
+def test_plan_context_and_text_match_build_edit_plan(tmp_path):
+    """PlanContext + テキストから作った計画は build_edit_plan と同じ結果になる。"""
+    _make_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あう\n", encoding="utf-8")
+
+    reference = render.build_edit_plan(str(txt))
+    context = render.load_plan_context(str(txt))
+    plan = render.build_edit_plan_from_text(context, "[0001] あう\n")
+
+    assert plan.output_intervals == reference.output_intervals
+    assert plan.crossfade_flags == reference.crossfade_flags
+    assert plan.stats == reference.stats
+    assert plan.txt_path == reference.txt_path
+    assert plan.base_name == reference.base_name
+
+
+def test_plan_from_text_uses_memory_text_not_file(tmp_path):
+    """ファイルを書き換えずに、メモリ上の編集内容だけで計画が変わる。"""
+    _make_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あいう\n", encoding="utf-8")
+    context = render.load_plan_context(str(txt))
+
+    full = render.build_edit_plan_from_text(context, "[0001] あいう\n")
+    cut = render.build_edit_plan_from_text(context, "[0001] あう\n")
+
+    assert cut.stats.output_duration_s < full.stats.output_duration_s
+    assert txt.read_text(encoding="utf-8") == "[0001] あいう\n"
+
+
+def test_plan_context_missing_txt_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        render.load_plan_context(str(tmp_path / "nope.sc.txt"))
+
+
+def test_plan_context_missing_json_raises(tmp_path):
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あ\n", encoding="utf-8")
+    with pytest.raises(FileNotFoundError):
+        render.load_plan_context(str(txt))
+
+
+# ---- render_plan_window（窓抽出が全体レンダーとサンプル一致） ----
+
+def _window_plan(audio, sr, intervals, flags, subtype="PCM_16"):
+    """render_plan_window 検証用の EditPlan を直接組み立てる。"""
+    stats = render.EditStats(
+        source_duration_s=len(audio) / sr, output_duration_s=0.0,
+        filler_requested=0, filler_cut=0, filler_skipped_unsafe=0,
+        silence_trim_count=0, silence_trim_removed_s=0.0,
+        filler_cut_removed_s=0.0, lines_deleted_removed_s=0.0,
+        lines_total=1, lines_deleted=0, lines_moved=0,
+    )
+    return render.EditPlan(
+        txt_path=Path("dummy.sc.txt"), base_name="dummy",
+        source_wav=Path("dummy.wav"), audio=audio,
+        audio_info=SimpleNamespace(subtype=subtype), samplerate=sr,
+        total_samples=len(audio), output_intervals=intervals,
+        crossfade_flags=flags, silence_trim_boundaries=frozenset(),
+        warnings=[], stats=stats,
+    )
+
+
+def _full_render(plan):
+    """plan 全体を crossfade_concat で結合した参照出力。"""
+    bounds, flags, _ = render.plan_chunk_bounds(plan)
+    chunks = [plan.audio[s0:s1] for s0, s1 in bounds]
+    fade = int(round(render.FADE_S * plan.samplerate))
+    return render.crossfade_concat(chunks, fade, flags if flags else None)
+
+
+def _assert_window_matches(plan, center, pad):
+    full = _full_render(plan)
+    window, start = render.render_plan_window(plan, center, pad)
+    sr = plan.samplerate
+    expect_start = max(0, int(round((center - pad) * sr)))
+    expect_end = min(len(full), max(expect_start, int(round((center + pad) * sr))))
+    assert start == expect_start
+    assert np.array_equal(window, full[expect_start:expect_end])
+    return window
+
+
+@pytest.mark.parametrize("center", [0.0, 0.02, 0.05, 0.08, 0.12, 0.2])
+def test_window_matches_full_render_crossfade(center):
+    """クロスフェード境界を含む出力の窓が、全体レンダーの同区間と一致する。"""
+    sr = 1000
+    rng = np.random.default_rng(3)
+    audio = rng.normal(0, 0.3, 400)
+    # 40サンプル区間 x 5（fade=8サンプルより十分長い）
+    intervals = [(i * 0.08, i * 0.08 + 0.04) for i in range(5)]
+    plan = _window_plan(audio, sr, intervals, [True] * 4)
+    _assert_window_matches(plan, center, 0.02)
+
+
+def test_window_matches_with_short_chunks_below_fade():
+    """fade 長未満の短チャンクが連続しても全体レンダーとサンプル一致する。
+
+    累積長クランプ f = min(fade, 累積長, 次チャンク長) の状態は先頭から
+    追わないと再現できない（前後1チャンクの結合では合わない）。
+    """
+    sr = 1000  # fade = round(0.008*1000) = 8 サンプル
+    rng = np.random.default_rng(5)
+    audio = rng.normal(0, 0.3, 300)
+    # 3サンプル（=fade未満）の区間を連続させる
+    intervals = [(i * 0.01, i * 0.01 + 0.003) for i in range(12)]
+    plan = _window_plan(audio, sr, intervals, [True] * 11)
+    full = _full_render(plan)
+    assert len(full) < sum(3 for _ in intervals)  # クロスフェードで縮んでいる
+    for center in np.arange(0.0, len(full) / sr, 0.005):
+        _assert_window_matches(plan, float(center), 0.006)
+
+
+def test_window_matches_with_non_crossfade_boundaries():
+    """非クロスフェード境界（無音切り詰め等）では保持 tail が全確定される。"""
+    sr = 1000
+    rng = np.random.default_rng(7)
+    audio = rng.normal(0, 0.3, 500)
+    intervals = [(i * 0.06, i * 0.06 + 0.03) for i in range(6)]
+    flags = [False, True, False, True, False]
+    plan = _window_plan(audio, sr, intervals, flags)
+    for center in [0.01, 0.03, 0.06, 0.09, 0.13]:
+        _assert_window_matches(plan, center, 0.015)
+
+
+def test_window_clamped_at_head_and_tail():
+    sr = 1000
+    audio = np.random.default_rng(9).normal(0, 0.3, 400)
+    intervals = [(0.0, 0.05), (0.1, 0.15)]
+    plan = _window_plan(audio, sr, intervals, [True])
+    full = _full_render(plan)
+
+    head, start = render.render_plan_window(plan, 0.0, 0.02)
+    assert start == 0
+    assert np.array_equal(head, full[:20])
+
+    tail, start = render.render_plan_window(plan, len(full) / sr, 0.02)
+    assert np.array_equal(tail, full[start:])
+
+
+def test_window_beyond_output_is_empty():
+    sr = 1000
+    audio = np.random.default_rng(11).normal(0, 0.3, 200)
+    plan = _window_plan(audio, sr, [(0.0, 0.05)], [])
+    window, _start = render.render_plan_window(plan, 10.0, 0.02)
+    assert len(window) == 0
+
+
+def test_window_supports_stereo():
+    sr = 1000
+    audio = np.random.default_rng(13).normal(0, 0.3, (400, 2))
+    intervals = [(0.0, 0.04), (0.08, 0.12), (0.16, 0.2)]
+    plan = _window_plan(audio, sr, intervals, [True, True])
+    full = _full_render(plan)
+    window, start = render.render_plan_window(plan, 0.05, 0.02)
+    assert window.shape[1] == 2
+    assert np.array_equal(window, full[start:start + len(window)])
+
+
+def test_window_matches_real_project_render(tmp_path):
+    """実プロジェクト（build_edit_plan → render_plan）の出力と窓が一致する。"""
+    import soundfile as sf
+
+    _make_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あう\n", encoding="utf-8")
+    plan = render.build_edit_plan(str(txt))
+    out = render.render_plan(plan, tmp_path / "ref.wav")
+    full, _sr = sf.read(out, dtype="float64")
+
+    window, start = render.render_plan_window(plan, 1.0, 0.5)
+    # wav は PCM_16 へ量子化されるので許容誤差つきで比較する
+    assert np.allclose(window, full[start:start + len(window)], atol=1e-4)

@@ -125,6 +125,20 @@ def test_parser_review_no_open():
     assert args.gap_max == pytest.approx(0.5)
 
 
+def test_parser_review_serve_defaults_to_ephemeral_port():
+    args = cli._build_parser().parse_args(["review", "input.sc.txt"])
+    assert args.serve is False
+    assert args.port == 0
+
+
+def test_parser_review_serve_and_port():
+    args = cli._build_parser().parse_args(
+        ["review", "input.sc.txt", "--serve", "--port", "8123"]
+    )
+    assert args.serve is True
+    assert args.port == 8123
+
+
 # ---- main() のディスパッチ ----
 
 @pytest.fixture
@@ -414,6 +428,24 @@ def test_main_review_no_open_does_not_launch_browser(tmp_path, monkeypatch):
 
     monkeypatch.setattr(review_mod.webbrowser, "open", _fail)
     assert cli.main(["review", str(txt), "--no-open"]) == 0
+
+
+def test_main_review_serve_passes_flags(tmp_path, monkeypatch, capsys):
+    """--serve 時は Hlyst 対話モードへ委譲し、静的な生成物の出力はしない。"""
+    _, txt, _ = _make_real_project(tmp_path)
+    calls = {}
+
+    def _fake_serve(path, **kwargs):
+        calls.update(kwargs)
+        calls["path"] = path
+        return {"wav_path": "w.wav", "url": "http://127.0.0.1:1/?token=x"}
+
+    monkeypatch.setattr("stefnceorf.serve.serve_review", _fake_serve)
+    assert cli.main(["review", str(txt), "--serve", "--port", "8123"]) == 0
+    assert calls["path"] == str(txt)
+    assert calls["port"] == 8123
+    assert calls["open_browser"] is True
+    assert "生成:" not in capsys.readouterr().out
 
 
 def test_main_review_missing_txt_returns_one(tmp_path, capsys):

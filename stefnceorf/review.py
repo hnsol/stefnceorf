@@ -213,11 +213,24 @@ def build_review_data(
     kept_ids: set[str],
     source_audio: str,
     review_audio: str,
+    serve: bool = False,
+    requested: dict | None = None,
+    token: str | None = None,
 ) -> dict:
     """EditPlan と json から HTML へ渡すレビューデータを構築する。
 
     サンプル単位で写像を組み、HTML へは秒（float）で渡す。単語の残存判定は写像表の
     被覆で行う（diff ロジックを複製せず、実レンダー結果と必ず整合させるため）。
+
+    削除の状態は2値に分ける（unsafe 判定で「TXT は削除指定だが EditPlan は保持」と
+    いう正当な矛盾が起きるため）:
+
+    - requested_delete: TXT 上で削除指定されているか（行なし／〔〕あり）
+    - effective_delete: EditPlan で実際に音が消えたか（安全判定通過後）
+
+    requested は serve モードで raw TXT から算出したものを
+    {"segments": {id: bool}, "words": {id: {word_index: bool}}} で渡す。
+    None のときは TXT 上の行の有無・写像の被覆から推定する（静的モード）。
     """
     samplerate = plan.samplerate
     segments = data.get("segments", [])
@@ -240,6 +253,9 @@ def build_review_data(
     def _sec(sample: int | None) -> float:
         return (sample / samplerate) if (sample is not None and samplerate) else 0.0
 
+    req_segments: dict[str, bool] = (requested or {}).get("segments", {})
+    req_words: dict[str, dict] = (requested or {}).get("words", {})
+
     out_segments: list[dict] = []
     for index, seg in enumerate(segments):
         seg_id = seg["id"]
@@ -255,8 +271,18 @@ def build_review_data(
         else:
             output = 0
 
+        # 未認識/UTS 行の精密カットは前後にポーズを残すため、島の一部（マージン分）が
+        # 出力に残る。「音が1サンプルでも残っているか」では削除を検出できないので、
+        # 島の中央が残っているかで判定する（単語の cut 判定と同じ考え方）。
+        if seg.get("kind") == "unrecognized":
+            seg_mid = int(round((source_start + source_end) / 2.0 * samplerate))
+            effective_delete = not any(s0 <= seg_mid < s1 for s0, s1 in bounds)
+        else:
+            effective_delete = not has_audio
+
+        seg_req_words = req_words.get(seg_id, {})
         words_out: list[dict] = []
-        for word in seg.get("words", []) or []:
+        for word_index, word in enumerate(seg.get("words", []) or []):
             w_start = word.get("start")
             w_end = word.get("end")
             if w_start is None or w_end is None:
@@ -266,13 +292,20 @@ def build_review_data(
             mid = int(round((w_start + w_end) / 2.0 * samplerate))
             covered = any(s0 <= mid < s1 for s0, s1 in bounds)
             head = int(round(w_start * samplerate))
+            word_req = seg_req_words.get(
+                word_index, seg_req_words.get(str(word_index), not covered)
+            )
             words_out.append(
                 {
+                    "index": word_index,
                     "text": word.get("word", "").replace(BLOCK_SEP, ""),
                     "source": w_start,
+                    "center": (w_start + w_end) / 2.0,
                     "output": _sec(map_source_sample(bounds, starts, head)),
                     "suggest": bool(word.get("suggest")),
                     "cut": not covered,
+                    "requested_delete": bool(word_req),
+                    "effective_delete": not covered,
                 }
             )
 
@@ -283,6 +316,13 @@ def build_review_data(
                 "kind": seg.get("kind", "speech"),
                 "reason": seg.get("reason"),
                 "deleted": deleted,
+                "requested_delete": bool(req_segments.get(seg_id, deleted)),
+                "effective_delete": effective_delete,
+                "toggle": (
+                    "bracket"
+                    if seg.get("kind") == "unrecognized" and seg.get("reason") == "uts"
+                    else "line"
+                ),
                 "ts": _format_mmss(source_start),
                 "source": source_start,
                 "source_end": source_end,
@@ -320,6 +360,8 @@ def build_review_data(
 
     return {
         "base": plan.base_name,
+        "serve": bool(serve),
+        "token": token,
         "source_audio": source_audio,
         "review_audio": review_audio,
         "pad": PLAY_PAD_S,
@@ -361,10 +403,29 @@ def _relative_media(target: Path, html_dir: Path) -> str:
     return quote(rel.replace(os.sep, "/"))
 
 
-def _segment_markup(seg: dict) -> str:
-    """1セグメント分のトランスクリプト行 HTML（テキストは HTML エスケープ）。"""
+def state_label(requested: bool, effective: bool) -> str:
+    """requested / effective の組み合わせから状態表示文言を返す（純関数）。
+
+    ON かつ EditPlan でも削除 → 「削除」、ON だが安全判定で残った → 「unsafeのため保持」。
+    OFF なのに音が無い（手でテキストを消した等）→ 「削除（手動編集）」。
+    """
+    if requested and effective:
+        return "削除"
+    if requested and not effective:
+        return "unsafeのため保持"
+    if effective:
+        return "削除（手動編集）"
+    return "保持"
+
+
+def _segment_markup(seg: dict, serve: bool = False) -> str:
+    """1セグメント分のトランスクリプト行 HTML（テキストは HTML エスケープ）。
+
+    取消線は effective_delete（EditPlan で実際に消えたか）で付ける。serve モードでは
+    requested_delete を操作するチェックボックスと状態表示を足す。
+    """
     classes = ["line"]
-    if seg["deleted"]:
+    if seg["effective_delete"]:
         classes.append("deleted")
     if seg["kind"] == "unrecognized":
         classes.append("unrec")
@@ -373,10 +434,18 @@ def _segment_markup(seg: dict) -> str:
 
     parts = [
         f'<div class="{" ".join(classes)}" data-i="{seg["index"]}">',
+    ]
+    if serve:
+        checked = " checked" if seg["requested_delete"] else ""
+        parts.append(
+            f'<input type="checkbox" class="del" data-i="{seg["index"]}"'
+            f' aria-label="この行を削除"{checked}>'
+        )
+    parts.extend([
         f'<span class="ts">{escape(seg["ts"])}</span>',
         f'<span class="sid">[{escape(seg["id"])}]</span>',
         '<span class="text">',
-    ]
+    ])
     if seg["words"]:
         for wi, word in enumerate(seg["words"]):
             wclasses = ["w"]
@@ -384,13 +453,28 @@ def _segment_markup(seg: dict) -> str:
                 wclasses.append("suggest")
             if word["cut"]:
                 wclasses.append("cut")
-            parts.append(
+            span = (
                 f'<span class="{" ".join(wclasses)}" data-w="{wi}">'
                 f'{escape(word["text"])}</span>'
             )
+            if serve and word["suggest"]:
+                wchecked = " checked" if word["requested_delete"] else ""
+                span = (
+                    f'<label class="wt"><input type="checkbox" class="delw"'
+                    f' data-i="{seg["index"]}" data-w="{wi}"'
+                    f' aria-label="このフィラーを削除"{wchecked}>{span}</label>'
+                )
+            parts.append(span)
     else:
         parts.append(escape(seg["label"]))
-    parts.append("</span></div>")
+    parts.append("</span>")
+    if serve:
+        parts.append(
+            f'<span class="state" data-i="{seg["index"]}">'
+            f'{escape(state_label(seg["requested_delete"], seg["effective_delete"]))}'
+            "</span>"
+        )
+    parts.append("</div>")
     return "".join(parts)
 
 
@@ -408,13 +492,14 @@ def _trim_markup(trim: dict) -> str:
 def _transcript_markup(review: dict) -> str:
     """トランスクリプト全体（無音トリムマーカーを原音時刻順に差し込む）。"""
     trims = sorted(review["trims"], key=lambda t: t["source"])
+    serve = bool(review.get("serve"))
     blocks: list[str] = []
     ti = 0
     for seg in review["segments"]:
         while ti < len(trims) and trims[ti]["source"] < seg["source"]:
             blocks.append(_trim_markup(trims[ti]))
             ti += 1
-        blocks.append(_segment_markup(seg))
+        blocks.append(_segment_markup(seg, serve))
     for trim in trims[ti:]:
         blocks.append(_trim_markup(trim))
     return "\n".join(blocks)
@@ -432,7 +517,8 @@ body {
   font-family: -apple-system, "Hiragino Sans", sans-serif;
   margin: 0 auto; padding: 1rem; max-width: 60rem; line-height: 1.7;
 }
-h1 { font-size: 1.2rem; margin: 0 0 .5rem; }
+h1 { font-size: 1.2rem; margin: 0 0 .1rem; }
+.subtitle { font-size: .85rem; opacity: .7; margin: 0 0 .5rem; }
 .note {
   font-size: .85rem; padding: .5rem .75rem; margin: 0 0 1rem;
   border-left: 3px solid #c90; background: rgba(204,153,0,.12);
@@ -478,10 +564,25 @@ h1 { font-size: 1.2rem; margin: 0 0 .5rem; }
 .w.suggest { background: rgba(200,0,140,.16); }
 .w.cut { text-decoration: line-through; opacity: .5; }
 .trim { color: #0a7d50; font-size: .85rem; }
+/* --serve（Hlyst 対話モード）専用 */
+.save { display: flex; align-items: center; gap: .75rem; margin-bottom: .75rem; }
+.save button {
+  font: inherit; padding: .25rem 1rem; cursor: pointer; border-radius: .25rem;
+  border: 1px solid currentColor; background: transparent;
+}
+.save button:disabled { opacity: .4; cursor: default; }
+.save button.dirty { background: #0a7d50; color: #fff; border-color: #0a7d50; }
+.save .msg { font-size: .8rem; }
+.save .msg.error { color: #c02020; }
+.state { font-size: .75rem; opacity: .65; min-width: 8rem; text-align: right; }
+label.wt { display: inline; }
+label.wt input { margin: 0 .1em 0 .2em; vertical-align: middle; }
+.line > input.del { margin: 0; align-self: center; }
 </style>
 </head>
 <body>
 <h1>$title</h1>
+<p class="subtitle">$subtitle</p>
 <p class="note">$note</p>
 <div class="controls">
 <div class="players">
@@ -492,6 +593,7 @@ h1 { font-size: 1.2rem; margin: 0 0 .5rem; }
   <button type="button" class="mode active" data-mode="src">原音を再生</button>
   <button type="button" class="mode" data-mode="out">編集後を再生</button>
 </div>
+$save_area
 <ul class="legend">
   <li><span class="w suggest">フィラー提案</span></li>
   <li><span class="w cut">カット済み</span></li>
@@ -544,6 +646,8 @@ $transcript
   }
 
   document.getElementById("transcript").addEventListener("click", function (ev) {
+    // --serve のチェックボックス操作は change ハンドラ（試聴）に任せる
+    if (ev.target.closest("input, label.wt")) { return; }
     var trim = ev.target.closest(".trim");
     if (trim) {
       setActive(trim);
@@ -575,15 +679,228 @@ $transcript
   );
 })();
 </script>
+$serve_script
 </body>
 </html>
 """)
 
 
+# --serve 時だけ差し込むコントロール（保存ボタン＋試聴プレイヤー＋通知欄）
+_SAVE_AREA = """<div class="save">
+  <button type="button" id="save" disabled>保存</button>
+  <audio id="audio-preview" controls preload="none"></audio>
+  <span class="msg" id="save-msg"></span>
+</div>"""
+
+
+# --serve 時だけ差し込む対話スクリプト（トグル→即試聴→保存）
+_SERVE_SCRIPT = """<script>
+(function () {
+  "use strict";
+  var DATA = JSON.parse(document.getElementById("sc-data").textContent);
+  if (!DATA.serve) { return; }
+
+  var preview = document.getElementById("audio-preview");
+  var saveBtn = document.getElementById("save");
+  var msg = document.getElementById("save-msg");
+  var dirty = false;
+  var busy = false;
+  var baseline = snapshot();
+
+  function snapshot() {
+    var s = {};
+    DATA.segments.forEach(function (seg) {
+      s["L" + seg.id] = seg.requested_delete;
+      seg.words.forEach(function (w) {
+        if (w.suggest) { s["W" + seg.id + ":" + w.index] = w.requested_delete; }
+      });
+    });
+    return s;
+  }
+
+  function toggles() {
+    var out = [];
+    DATA.segments.forEach(function (seg) {
+      out.push({ type: "line", id: seg.id, delete: seg.requested_delete });
+      seg.words.forEach(function (w) {
+        if (w.suggest) {
+          out.push({
+            type: "word", id: seg.id, word: w.index, delete: w.requested_delete
+          });
+        }
+      });
+    });
+    return out;
+  }
+
+  function setDirty() {
+    var cur = snapshot();
+    dirty = Object.keys(cur).some(function (k) { return cur[k] !== baseline[k]; });
+    saveBtn.disabled = !dirty || busy;
+    saveBtn.classList.toggle("dirty", dirty && !busy);
+  }
+
+  function note(text, isError) {
+    msg.textContent = text;
+    msg.classList.toggle("error", !!isError);
+  }
+
+  function stateLabel(requested, effective) {
+    if (requested && effective) { return "削除"; }
+    if (requested) { return "unsafeのため保持"; }
+    if (effective) { return "削除（手動編集）"; }
+    return "保持";
+  }
+
+  function applyStates() {
+    DATA.segments.forEach(function (seg) {
+      var line = document.querySelector('.line[data-i="' + seg.index + '"]');
+      if (!line) { return; }
+      line.classList.toggle("deleted", seg.effective_delete);
+      var box = line.querySelector("input.del");
+      if (box) { box.checked = seg.requested_delete; }
+      var state = line.querySelector(".state");
+      if (state) {
+        state.textContent = stateLabel(seg.requested_delete, seg.effective_delete);
+      }
+      seg.words.forEach(function (w) {
+        var span = line.querySelector('.w[data-w="' + w.index + '"]');
+        if (span) { span.classList.toggle("cut", w.effective_delete); }
+        var wbox = line.querySelector('input.delw[data-w="' + w.index + '"]');
+        if (wbox) { wbox.checked = w.requested_delete; }
+      });
+    });
+  }
+
+  function post(path, body) {
+    return fetch(path + "?token=" + encodeURIComponent(DATA.token), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Hlyst-Token": DATA.token
+      },
+      body: JSON.stringify(body)
+    }).then(function (res) {
+      return res.json().then(function (payload) {
+        if (!res.ok || payload.error) {
+          throw new Error(payload.error || ("HTTP " + res.status));
+        }
+        return payload;
+      });
+    });
+  }
+
+  function findWord(seg, index) {
+    var found = null;
+    seg.words.forEach(function (w) { if (w.index === index) { found = w; } });
+    return found;
+  }
+
+  function mergeStates(segments) {
+    var byId = {};
+    segments.forEach(function (s) { byId[s.id] = s; });
+    DATA.segments.forEach(function (seg) {
+      var fresh = byId[seg.id];
+      if (!fresh) { return; }
+      seg.requested_delete = fresh.requested_delete;
+      seg.effective_delete = fresh.effective_delete;
+      seg.output = fresh.output;
+      seg.words.forEach(function (w) {
+        var fw = findWord(fresh, w.index);
+        if (!fw) { return; }
+        w.requested_delete = fw.requested_delete;
+        w.effective_delete = fw.effective_delete;
+        w.output = fw.output;
+      });
+    });
+  }
+
+  function toBlob(b64) {
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i += 1) { bytes[i] = bin.charCodeAt(i); }
+    return new Blob([bytes], { type: "audio/wav" });
+  }
+
+  function runPreview(target) {
+    if (busy) { return; }
+    busy = true;
+    saveBtn.disabled = true;
+    note("試聴を生成中…", false);
+    post("/preview", { toggles: toggles(), target: target })
+      .then(function (payload) {
+        mergeStates(payload.segments);
+        applyStates();
+        note(payload.message || "試聴", false);
+        if (preview.dataset.blob) { URL.revokeObjectURL(preview.dataset.blob); }
+        preview.dataset.blob = URL.createObjectURL(toBlob(payload.audio));
+        preview.src = preview.dataset.blob;
+        var playing = preview.play();
+        if (playing && playing.catch) { playing.catch(function () {}); }
+      })
+      .catch(function (err) { note(err.message, true); })
+      .then(function () { busy = false; setDirty(); });
+  }
+
+  document.getElementById("transcript").addEventListener("change", function (ev) {
+    var box = ev.target;
+    if (!box.classList || !box.dataset) { return; }
+    var seg = DATA.segments[Number(box.dataset.i)];
+    if (!seg) { return; }
+    if (box.classList.contains("del")) {
+      seg.requested_delete = box.checked;
+      setDirty();
+      runPreview({ type: "line", id: seg.id });
+    } else if (box.classList.contains("delw")) {
+      var word = findWord(seg, Number(box.dataset.w));
+      if (!word) { return; }
+      word.requested_delete = box.checked;
+      setDirty();
+      runPreview({ type: "word", id: seg.id, word: word.index });
+    }
+  });
+
+  saveBtn.addEventListener("click", function () {
+    if (busy || !dirty) { return; }
+    busy = true;
+    saveBtn.disabled = true;
+    note("保存中…", false);
+    post("/save", { toggles: toggles() })
+      .then(function (payload) {
+        mergeStates(payload.segments);
+        applyStates();
+        document.querySelector(".stats").textContent = payload.stats.join("\\n");
+        var out = document.getElementById("audio-out");
+        out.src = DATA.review_audio + "&v=" + payload.version;
+        out.load();
+        baseline = snapshot();
+        note("保存しました: " + payload.txt_path, false);
+      })
+      .catch(function (err) { note(err.message, true); })
+      .then(function () { busy = false; setDirty(); });
+  });
+
+  applyStates();
+  setDirty();
+})();
+</script>"""
+
+
 def render_html(review: dict) -> str:
-    """レビューデータから単一 HTML を生成する（純関数、外部依存なし）。"""
+    """レビューデータから単一 HTML を生成する（純関数、外部依存なし）。
+
+    serve=True のときだけ保存コントロールと対話スクリプトを差し込む
+    （静的モードの出力は従来どおり読み取り専用）。
+    """
+    serve = bool(review.get("serve"))
     return _HTML_TEMPLATE.substitute(
-        title=escape(f"{review['base']} — sc review"),
+        title=escape(f"Hlyst — {review['base']}"),
+        subtitle=escape(
+            "A/B試聴・編集（チェックで削除ON/OFF→即試聴→保存）"
+            if serve else "A/B試聴"
+        ),
+        save_area=_SAVE_AREA if serve else "",
+        serve_script=_SERVE_SCRIPT if serve else "",
         note=escape(review["note"]),
         source_audio=escape(review["source_audio"], quote=True),
         review_audio=escape(review["review_audio"], quote=True),
@@ -600,12 +917,29 @@ def review(
     gap_max: float = GAP_MAX_S,
     open_browser: bool = True,
     stats_out: list[str] | None = None,
+    serve: bool = False,
+    port: int = 0,
 ) -> dict:
     """レビュー音声と A/B 試聴 HTML を生成し、生成物のパスを返す。
 
     戻り値 {"wav_path": ..., "html_path": ...}。stats_out が渡された場合は
     format_stats の行をそこへ append するだけで print しない（render と同じ流儀）。
+
+    serve=True のときは HTML ファイルを書かず、127.0.0.1 のローカルサーバー
+    （Hlyst 対話モード）を起こして Ctrl-C まで待ち受ける
+    （戻り値は {"wav_path": ..., "url": ...}）。
     """
+    if serve:
+        from .serve import serve_review
+
+        return serve_review(
+            txt_path,
+            gap_threshold=gap_threshold,
+            gap_max=gap_max,
+            open_browser=open_browser,
+            port=port,
+        )
+
     plan = build_edit_plan(txt_path, gap_threshold=gap_threshold, gap_max=gap_max)
 
     out_dir = plan.txt_path.parent

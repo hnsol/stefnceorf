@@ -116,6 +116,21 @@ def _build_parser() -> argparse.ArgumentParser:
         default=True,
         help="生成後にブラウザで自動オープンしない",
     )
+    p_rv.add_argument(
+        "--serve",
+        action="store_true",
+        default=False,
+        help=(
+            "Hlyst 対話モード（127.0.0.1 のローカルサーバーを起こし、"
+            "チェックボックスで削除ON/OFF→即試聴→保存できるようにする）"
+        ),
+    )
+    p_rv.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="--serve のポート番号（既定: 空きポートを自動選択）",
+    )
     _add_gap_arguments(p_rv)
 
     p_logic = sub.add_parser("logic", help="編集後テキストから Logic Pro 用FCPXMLを生成")
@@ -290,10 +305,14 @@ def main(argv: list[str] | None = None) -> int:
                 gap_max=args.gap_max,
                 open_browser=args.open_browser,
                 stats_out=stats_lines,
+                serve=args.serve,
+                port=args.port,
             )
         except (RuntimeError, OSError, ValueError) as exc:
             print(f"エラー: {exc}", file=sys.stderr)
             return 1
+        if args.serve:
+            return 0
         print(f"生成: {res['wav_path']}")
         print(f"生成: {res['html_path']}")
         for line in stats_lines:

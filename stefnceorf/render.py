@@ -63,6 +63,26 @@ class EditStats:
 
 
 @dataclass(frozen=True)
+class PlanContext:
+    """編集計画の構築に必要な「txt 以外」の入力一式（読み込み結果のキャッシュ）。
+
+    同じ音声・json に対して編集後テキストだけを差し替えて何度も計画を作り直す
+    用途（review --serve のトグル即試聴）のため、重い読み込み（wav・json）を
+    分離して保持する。
+    """
+
+    txt_path: Path
+    base_name: str
+    json_path: Path
+    data: dict
+    source_wav: Path
+    audio: Any
+    audio_info: Any
+    samplerate: int
+    total_samples: int
+
+
+@dataclass(frozen=True)
 class EditPlan:
     """レンダーと外部編集形式出力で共有する編集計画。"""
 
@@ -858,12 +878,12 @@ def format_stats(stats: EditStats, *, gaps_preserved: bool = False) -> list[str]
     return lines
 
 
-def build_edit_plan(
-    txt_path: str,
-    gap_threshold: float = GAP_THRESHOLD_S,
-    gap_max: float = GAP_MAX_S,
-) -> EditPlan:
-    """編集後 txt と json から共有編集計画を構築する。"""
+def load_plan_context(txt_path: str | Path) -> PlanContext:
+    """txt に対応する json と元 wav を読み込み PlanContext を返す。
+
+    編集後テキストそのものは読まない（メモリ上の編集内容から計画を作れるように
+    するため）。存在チェックの順序・例外文言は従来の build_edit_plan と同じ。
+    """
     import soundfile as sf
 
     txt = Path(txt_path)
@@ -878,6 +898,53 @@ def build_edit_plan(
         )
 
     data = json.loads(json_path.read_text(encoding="utf-8"))
+    source_wav = data.get("source_wav")
+    if not source_wav or not Path(source_wav).exists():
+        raise FileNotFoundError(f"元 wav が見つかりません: {source_wav}")
+
+    # 音声読み込み（元フォーマット維持のため subtype を保持）
+    audio, samplerate = sf.read(source_wav, dtype="float64", always_2d=False)
+    info = sf.info(source_wav)
+    return PlanContext(
+        txt_path=txt,
+        base_name=base,
+        json_path=json_path,
+        data=data,
+        source_wav=Path(source_wav),
+        audio=audio,
+        audio_info=info,
+        samplerate=samplerate,
+        total_samples=len(audio),
+    )
+
+
+def build_edit_plan(
+    txt_path: str,
+    gap_threshold: float = GAP_THRESHOLD_S,
+    gap_max: float = GAP_MAX_S,
+) -> EditPlan:
+    """編集後 txt と json から共有編集計画を構築する。"""
+    context = load_plan_context(txt_path)
+    return build_edit_plan_from_text(
+        context,
+        context.txt_path.read_text(encoding="utf-8"),
+        gap_threshold=gap_threshold,
+        gap_max=gap_max,
+    )
+
+
+def build_edit_plan_from_text(
+    context: PlanContext,
+    edited_text: str,
+    gap_threshold: float = GAP_THRESHOLD_S,
+    gap_max: float = GAP_MAX_S,
+) -> EditPlan:
+    """PlanContext とメモリ上の編集後テキストから共有編集計画を構築する。
+
+    ファイルに書き出されていない編集内容（review --serve のトグル状態）からも
+    同じ計画を作れるようにするため、build_edit_plan の中核をここへ分離している。
+    """
+    data = context.data
     segments = data.get("segments", [])
     # 音響安全判定用の無音区間（旧 json は None → RMS のみで判定）
     silences = data.get("silences")
@@ -890,19 +957,14 @@ def build_edit_plan(
     for seg in segments:
         seg_map[seg["id"]] = seg
 
-    source_wav = data.get("source_wav")
-    if not source_wav or not Path(source_wav).exists():
-        raise FileNotFoundError(f"元 wav が見つかりません: {source_wav}")
-
-    parsed = parse_edited_txt(txt.read_text(encoding="utf-8"))
+    parsed = parse_edited_txt(edited_text)
 
     # フィラー〔〕削除の構造マッチング用に辞書を1回ロードする。
     fillers_set = fillers_mod.load_fillers(data.get("language"))
 
-    # 音声読み込み（元フォーマット維持のため subtype を保持）
-    audio, samplerate = sf.read(source_wav, dtype="float64", always_2d=False)
-    info = sf.info(source_wav)
-    total_samples = len(audio)
+    audio = context.audio
+    samplerate = context.samplerate
+    total_samples = context.total_samples
     file_length_s = total_samples / samplerate if samplerate else 0.0
 
     # 各セグメントのマージンクランプ境界を、ソース時間軸（json の並び順）で
@@ -1162,11 +1224,11 @@ def build_edit_plan(
     )
 
     return EditPlan(
-        txt_path=txt,
-        base_name=base,
-        source_wav=Path(source_wav),
+        txt_path=context.txt_path,
+        base_name=context.base_name,
+        source_wav=context.source_wav,
         audio=audio,
-        audio_info=info,
+        audio_info=context.audio_info,
         samplerate=samplerate,
         total_samples=total_samples,
         output_intervals=out_intervals,
@@ -1232,6 +1294,88 @@ def render_plan(plan: EditPlan, output_path: str | Path) -> str:
         str(out_path), result, plan.samplerate, subtype=plan.audio_info.subtype
     )
     return str(out_path)
+
+
+def render_plan_window(
+    plan: EditPlan, t_center_s: float, pad_s: float
+) -> tuple[Any, int]:
+    """出力時刻 t_center_s±pad_s の窓だけを実レンダーと同一内容で切り出す。
+
+    戻り値 (窓の音声配列, 窓の開始サンプル位置)。開始位置は 0 でクランプされ、
+    終端は出力全長でクランプされるため、返る配列長は 2*pad_s より短くなりうる。
+
+    方式は「先頭からのストリーミング」。crossfade_concat をチャンク順に追体験し、
+    まだ後続のクロスフェードで書き換わりうる末尾（最大 fade サンプル）だけを
+    状態として保持し、確定した部分は捨てる（窓に重なる分だけ書き出す）。
+    「対象の前後1チャンクだけを取り出して結合する」方式では、fade 長未満の短い
+    チャンクが連続したときの累積長クランプ f = min(fade, 累積長, 次チャンク長)
+    を再現できず全体レンダーとサンプル一致しないため採らない。
+    """
+    import numpy as np
+
+    bounds, flags, _ = plan_chunk_bounds(plan)
+    fade = int(round(FADE_S * plan.samplerate))
+    sr = plan.samplerate
+
+    w0 = max(0, int(round((t_center_s - pad_s) * sr)))
+    w1 = max(w0, int(round((t_center_s + pad_s) * sr)))
+
+    channels = plan.audio.shape[1] if plan.audio.ndim == 2 else 0
+    shape = (w1 - w0, channels) if channels else (w1 - w0,)
+    window = np.zeros(shape, dtype=np.float64)
+    written_end = 0  # 窓内で実際に埋まった末尾（相対位置）
+
+    def _emit(pos: int, block) -> None:
+        """出力位置 pos から始まる確定ブロックのうち窓に重なる分を書き込む。"""
+        nonlocal written_end
+        a = max(pos, w0)
+        b = min(pos + len(block), w1)
+        if b <= a:
+            return
+        window[a - w0: b - w0] = block[a - pos: b - pos]
+        written_end = max(written_end, b - w0)
+
+    total = 0          # これまでの出力累積長（crossfade_concat の len(out)）
+    tail = None        # out の末尾 min(total, fade) サンプル（未確定領域）
+    for k, (s0, s1) in enumerate(bounds):
+        chunk = plan.audio[s0:s1].astype(np.float64)
+        n = len(chunk)
+        if k == 0:
+            tail = chunk[:0]
+        do_cf = True
+        if k > 0:
+            do_cf = flags[k - 1] if k - 1 < len(flags) else True
+        f = min(fade, total, n) if (k > 0 and do_cf) else 0
+
+        base = total - len(tail)
+        if f > 0:
+            t = (np.arange(f) + 0.5) / f
+            mixed = (
+                _apply_weights(tail[len(tail) - f:], np.cos(t * np.pi / 2.0))
+                + _apply_weights(chunk[:f], np.sin(t * np.pi / 2.0))
+            )
+            buf = np.concatenate(
+                [tail[: len(tail) - f], mixed, chunk[f:]], axis=0
+            )
+        else:
+            buf = np.concatenate([tail, chunk], axis=0)
+        total = base + len(buf)
+
+        keep = min(total, fade)
+        cut = len(buf) - keep
+        if cut > 0:
+            _emit(base, buf[:cut])
+        tail = buf[cut:]
+
+        # 未確定領域の先頭が窓を追い越したら以降は窓に影響しない
+        if total - len(tail) >= w1:
+            tail = tail[:0]
+            break
+
+    if tail is not None and len(tail):
+        _emit(total - len(tail), tail)
+
+    return window[:written_end], w0
 
 
 def render(
