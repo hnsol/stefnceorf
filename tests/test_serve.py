@@ -1,6 +1,7 @@
 import base64
 import http.client
 import json
+import os
 import threading
 
 import numpy as np
@@ -259,6 +260,34 @@ def test_set_word_bracket_error_when_restoring_deleted_word(tmp_path):
     words = _words(tmp_path)
     with pytest.raises(serve.TxtEditError):
         serve.set_word_bracket("あい", words, 1, False)
+
+
+def test_set_word_bracket_error_on_ambiguous_duplicate_after_manual_delete():
+    """同一テキストの語が複数あり1語が手動削除済みだと、残存全語のトグルが失敗。
+
+    json「え／え／え」・raw「ええ」（1語を手動削除済み）→ SequenceMatcher の
+    整列は恣意的なので、どの「え」に対する操作も TxtEditError にする。
+    """
+    words = [
+        {"word": "え", "start": 0.0, "end": 0.3},
+        {"word": "え", "start": 0.3, "end": 0.6},
+        {"word": "え", "start": 0.6, "end": 0.9},
+    ]
+    body = "ええ"
+    for idx in range(3):
+        with pytest.raises(serve.TxtEditError):
+            serve.set_word_bracket(body, words, idx, True)
+
+
+def test_set_word_bracket_succeeds_when_all_duplicates_uniquely_mapped():
+    """同一テキストの語が複数あっても全語が raw へ一意対応できれば従来どおり成功する。"""
+    words = [
+        {"word": "え", "start": 0.0, "end": 0.3},
+        {"word": "え", "start": 0.3, "end": 0.6},
+    ]
+    body = "ええ"
+    assert serve.set_word_bracket(body, words, 0, True) == "〔え〕え"
+    assert serve.set_word_bracket(body, words, 1, True) == "え〔え〕"
 
 
 def test_set_line_bracket_round_trip(tmp_path):
@@ -564,6 +593,25 @@ def test_save_detects_external_change(tmp_path):
         session.save(_all_toggles(tmp_path, session.raw_text))
 
 
+def test_save_detects_external_change_with_preserved_mtime(tmp_path):
+    """mtime を維持した内容変更（os.utime で偽装）でも検出される。"""
+    session, txt = _session(tmp_path)
+    stat_before = txt.stat()
+    txt.write_text(_TXT + "[0005 0:09] 外部編集\n", encoding="utf-8")
+    os.utime(txt, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns))
+    with pytest.raises(serve.ExternalChangeError):
+        session.save(_all_toggles(tmp_path, session.raw_text))
+
+
+def test_atomic_write_preserves_existing_permissions(tmp_path):
+    path = tmp_path / "target.txt"
+    path.write_text("before", encoding="utf-8")
+    os.chmod(path, 0o600)
+    serve._atomic_write(path, "after")
+    assert path.read_text(encoding="utf-8") == "after"
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+
 def test_save_leaves_no_temp_file(tmp_path):
     session, _txt = _session(tmp_path)
     toggles = _all_toggles(tmp_path, session.raw_text)
@@ -605,6 +653,24 @@ def test_save_review_wav_equals_render_output(tmp_path):
     a, _sr = sf.read(str(session.review_wav))
     b, _sr2 = sf.read(reference)
     assert np.array_equal(a, b)
+
+
+def test_save_audio_render_failure_still_saves_txt(tmp_path, monkeypatch):
+    """review.wav の再生成に失敗しても TXT は保存済みのまま、専用エラーになる。"""
+    session, txt = _session(tmp_path)
+    toggles = _all_toggles(tmp_path, session.raw_text)
+    for t in toggles:
+        if t["type"] == "line" and t["id"] == "0003":
+            t["delete"] = True
+
+    def _boom(*args, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(serve, "render_plan", _boom)
+    with pytest.raises(serve.AudioRenderError) as exc:
+        session.save(toggles)
+    assert "保存済み" in str(exc.value)
+    assert "[0003" not in txt.read_text(encoding="utf-8")
 
 
 def test_save_error_does_not_touch_file(tmp_path):
@@ -912,6 +978,27 @@ def test_save_endpoint_writes_txt_and_reloads(server):
     assert "[0003" not in txt.read_text(encoding="utf-8")
     assert payload["version"] >= 2
     assert _seg(payload["segments"], "0003")["effective_delete"] is True
+
+
+def test_save_endpoint_reports_audio_render_failure(server, monkeypatch):
+    """review.wav の再生成失敗は「保存失敗」ではなく txt_saved フラグ付きで返す。"""
+    httpd, _url, txt = server
+    session = httpd.session
+    toggles = _all_toggles(_txt_dir(_txt_path(httpd)), session.raw_text)
+    for t in toggles:
+        if t["type"] == "line" and t["id"] == "0003":
+            t["delete"] = True
+
+    def _boom(*args, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(serve, "render_plan", _boom)
+    status, _h, body = _post(httpd, "/save", {"toggles": toggles})
+    assert status == 500
+    payload = json.loads(body)
+    assert payload["txt_saved"] is True
+    assert "保存済み" in payload["error"]
+    assert "[0003" not in txt.read_text(encoding="utf-8")
 
 
 def test_save_endpoint_reports_conflict(server):

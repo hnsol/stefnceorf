@@ -89,6 +89,14 @@ class ExternalChangeError(Exception):
     """起動後に .sc.txt が外部で変更されていた場合のエラー。"""
 
 
+class AudioRenderError(Exception):
+    """.sc.txt への書き込みは成功したが review.wav の再生成に失敗した場合のエラー。
+
+    TXT は既にディスクへ保存済みなので、呼び出し側は「保存失敗」ではなく
+    「TXT は保存済み・音声の更新のみ失敗」と分かる文言/フラグで応答する。
+    """
+
+
 # ---------------------------------------------------------------- raw TXT 操作
 
 def detect_newline(text: str) -> str:
@@ -262,6 +270,24 @@ def word_requested_delete(body: str, words: list[dict], word_index: int) -> bool
     return locate_word_span(body, words, word_index) is None
 
 
+def _ambiguous_duplicate_word(body: str, words: list[dict], word_index: int) -> bool:
+    """word_index と同一の本体テキストを持つ語が同じセグメント内に複数あり、
+
+    かつそのうち1語でも raw へ一意対応できていない（locate_word_spans に
+    現れない）場合に True を返す。SequenceMatcher の整列は同一テキストが
+    複数出現すると恣意的になるため、そのグループのどれか1語でも対応が
+    崩れていれば、対象語自身が一意に見えても保守的に不確定とみなす。
+    """
+    if not (0 <= word_index < len(words)):
+        return False
+    text = words[word_index].get("word", "")
+    siblings = [i for i, w in enumerate(words) if w.get("word", "") == text]
+    if len(siblings) < 2:
+        return False
+    located = locate_word_spans(body, words)
+    return any(i not in located for i in siblings)
+
+
 def set_word_bracket(
     body: str, words: list[dict], word_index: int, delete: bool
 ) -> str:
@@ -270,9 +296,19 @@ def set_word_bracket(
     既に目的の状態なら本文をそのまま返す（未変更行をバイト単位で不変にするため）。
     構造照合で raw 上の文字範囲を一意に特定できない（手動で消された等）場合は
     TxtEditError を送出し、呼び出し側で保存せずに手動編集を案内する。
+
+    同一テキストの語が同じセグメント内に複数あり、そのうち1語でも一意対応
+    できていない場合も、対象語自身が特定できて見えるかにかかわらず保守的に
+    TxtEditError にする（SequenceMatcher の整列は同一語の重複に対して恣意的
+    なため、見かけ上の対応を信用しない）。
     """
-    spans = bracket_word_spans(body, words)
     text = words[word_index].get("word", "").strip() if word_index < len(words) else ""
+    if _ambiguous_duplicate_word(body, words, word_index):
+        raise TxtEditError(
+            f"「{text}」と同じ文言の語が複数あり、raw 上で一意に対応づけ"
+            f"られません{_MANUAL_HINT}"
+        )
+    spans = bracket_word_spans(body, words)
     if delete:
         if word_index in spans:
             return body
@@ -571,9 +607,12 @@ class HlystSession:
         """トグル状態を .sc.txt へ局所パッチし、review.wav を作り直す。"""
         with self.lock:
             path = self.context.txt_path
-            current = path.read_text(encoding="utf-8")
             mtime_ns = path.stat().st_mtime_ns
-            if mtime_ns != self.mtime_ns and _sha256(current) != self.digest:
+            # 判定は hash 不一致だけを基準にする（mtime は偽装され得るため
+            # 「mtime 一致＝無検査で信頼してよい」とはしない）。mtime 一致なら
+            # hash 計算を省略してよいという高速化はここでは採用しない。
+            current = path.read_text(encoding="utf-8")
+            if _sha256(current) != self.digest:
                 raise ExternalChangeError(
                     "起動後に .sc.txt が外部で変更されています。"
                     "画面を閉じて `sc review --serve` をやり直してください"
@@ -592,7 +631,17 @@ class HlystSession:
                 self.digest = _sha256(text)
             self.mtime_ns = path.stat().st_mtime_ns
 
-            self.refresh()
+            # ここまでで TXT の書き込みは既に完了している。以降で失敗しても
+            # 「保存失敗」ではなく「TXT は保存済み・音声の更新のみ失敗」と
+            # 呼び出し側に伝える（TxtEditError/ExternalChangeError と違い、
+            # ロールバックすべきディスク上の状態が既に無いため）。
+            try:
+                self.refresh()
+            except Exception as exc:
+                raise AudioRenderError(
+                    "TXT は保存済みです。review.wav の更新に失敗しました: "
+                    f"{exc}"
+                ) from exc
             data = self.review_data(self.raw_text, self.plan)
             return {
                 "version": self.version,
@@ -604,9 +653,15 @@ class HlystSession:
 
 
 def _atomic_write(path: Path, text: str) -> None:
-    """同ディレクトリの一時ファイルへ書いてから rename する（原子的置換）。"""
+    """同ディレクトリの一時ファイルへ書いてから rename する（原子的置換）。
+
+    元ファイルが存在する場合はそのパーミッションを一時ファイルへ引き継ぐ
+    （さもないと umask 依存の既定パーミッションで置き換わってしまう）。
+    """
     tmp = path.with_name(f".{path.name}.hlyst.tmp")
     tmp.write_text(text, encoding="utf-8")
+    if path.exists():
+        os.chmod(tmp, os.stat(path).st_mode)
     os.replace(tmp, path)
 
 
@@ -894,6 +949,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(200, self.session.preview(toggles, target))
             else:
                 self._send_json(200, self.session.save(toggles))
+        except AudioRenderError as exc:
+            # TXT の書き込みは成功しているので "保存失敗" とは区別する
+            # （txt_saved フラグと文言の両方で伝える）。
+            self._send_json(
+                500, {"error": str(exc), "txt_saved": True}, close=True
+            )
         except ExternalChangeError as exc:
             self._error(409, str(exc))
         except TxtEditError as exc:

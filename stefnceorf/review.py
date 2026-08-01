@@ -806,6 +806,9 @@ _SERVE_SCRIPT = """<script>
   // トグル直後は自動再生せず、取得した音声をキャッシュして
   // 対象の行/単語をクリックしたときに再生する（key -> object URL）。
   var previewCache = {};
+  // /preview, /save の応答が世代遅れ（その後に新しい操作が始まっている）なら
+  // 状態を巻き戻さないよう、リクエストごとに世代IDを振って照合する。
+  var generation = 0;
 
   function previewKey(target) {
     return target.type === "word"
@@ -844,6 +847,27 @@ _SERVE_SCRIPT = """<script>
     dirty = Object.keys(cur).some(function (k) { return cur[k] !== baseline[k]; });
     saveBtn.disabled = !dirty || busy;
     saveBtn.classList.toggle("dirty", dirty && !busy);
+  }
+
+  // busy 中は全チェックボックスと保存ボタンを操作不能にする（見た目にも分かる
+  // ようにする）。busy を素通しして黙って古い操作を捨てる経路を作らないため。
+  function setControlsBusy(value) {
+    busy = value;
+    Array.prototype.forEach.call(
+      document.querySelectorAll("input.del, input.delw"),
+      function (box) { box.disabled = value; }
+    );
+    setDirty();
+  }
+
+  // previewCache の全 object URL を revoke して破棄する。トグル変更のたびに
+  // 呼ぶ（他項目のトグルで編集後プランが変わり、古いキャッシュ音声は現在の
+  // 計画と対応しなくなるため。単純な全破棄方式で陳腐化を防ぐ）。
+  function clearPreviewCache() {
+    Object.keys(previewCache).forEach(function (key) {
+      URL.revokeObjectURL(previewCache[key]);
+      delete previewCache[key];
+    });
   }
 
   function note(text, isError) {
@@ -941,22 +965,30 @@ _SERVE_SCRIPT = """<script>
 
   function runPreview(target) {
     if (busy) { return; }
-    busy = true;
-    saveBtn.disabled = true;
+    var myGeneration = ++generation;
+    setControlsBusy(true);
     note("試聴を生成中…", false);
     post("/preview", { toggles: toggles(), target: target })
       .then(function (payload) {
+        // この応答より後に新しい操作（トグル/保存）が始まっていたら、
+        // 画面の状態を巻き戻さないよう破棄する。
+        if (myGeneration !== generation) { return; }
         mergeStates(payload.segments);
         applyStates();
         note((payload.message || "試聴") + "（クリックで再生）", false);
         // 自動再生はせず、対象の行/単語をクリックしたときに再生できるよう
-        // 音声だけキャッシュしておく（key 単位で古い URL は破棄する）。
+        // 音声だけキャッシュしておく。
         var key = previewKey(target);
-        if (previewCache[key]) { URL.revokeObjectURL(previewCache[key]); }
         previewCache[key] = URL.createObjectURL(toBlob(payload.audio));
       })
-      .catch(function (err) { note(err.message, true); })
-      .then(function () { busy = false; setDirty(); });
+      .catch(function (err) {
+        if (myGeneration !== generation) { return; }
+        note(err.message, true);
+      })
+      .then(function () {
+        if (myGeneration !== generation) { return; }
+        setControlsBusy(false);
+      });
   }
 
   // キャッシュされた試聴音声があれば、その行/単語のクリックで再生する
@@ -988,23 +1020,26 @@ _SERVE_SCRIPT = """<script>
     if (box.classList.contains("del")) {
       seg.requested_delete = box.checked;
       setDirty();
+      clearPreviewCache();
       runPreview({ type: "line", id: seg.id });
     } else if (box.classList.contains("delw")) {
       var word = findWord(seg, Number(box.dataset.w));
       if (!word) { return; }
       word.requested_delete = box.checked;
       setDirty();
+      clearPreviewCache();
       runPreview({ type: "word", id: seg.id, word: word.index });
     }
   });
 
   saveBtn.addEventListener("click", function () {
     if (busy || !dirty) { return; }
-    busy = true;
-    saveBtn.disabled = true;
+    var myGeneration = ++generation;
+    setControlsBusy(true);
     note("保存中…", false);
     post("/save", { toggles: toggles() })
       .then(function (payload) {
+        if (myGeneration !== generation) { return; }
         mergeStates(payload.segments);
         applyStates();
         document.querySelector(".stats").textContent = payload.stats.join("\\n");
@@ -1012,10 +1047,19 @@ _SERVE_SCRIPT = """<script>
         out.src = DATA.review_audio + "&v=" + payload.version;
         out.load();
         baseline = snapshot();
+        // 保存成功後は編集後プランが確定するため、古いプレビュー音声を
+        // すべて破棄する（保存前の中間状態の音が再生されないようにする）。
+        clearPreviewCache();
         note("保存しました: " + payload.txt_path, false);
       })
-      .catch(function (err) { note(err.message, true); })
-      .then(function () { busy = false; setDirty(); });
+      .catch(function (err) {
+        if (myGeneration !== generation) { return; }
+        note(err.message, true);
+      })
+      .then(function () {
+        if (myGeneration !== generation) { return; }
+        setControlsBusy(false);
+      });
   });
 
   applyStates();

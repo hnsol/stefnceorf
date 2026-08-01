@@ -860,6 +860,31 @@ def test_serve_script_does_not_autoplay_preview_on_toggle(tmp_path):
     assert "preview.play()" in html
 
 
+def test_serve_script_disables_checkboxes_while_busy(tmp_path):
+    """busy 中はチェックボックス（.del/.delw）と保存ボタンを操作不能にする。"""
+    html, _rd = _serve_html(tmp_path)
+    assert "input.del, input.delw" in html
+    assert "function setControlsBusy(value) {" in html
+    assert "box.disabled = value;" in html
+
+
+def test_serve_script_guards_stale_responses_with_generation(tmp_path):
+    """世代IDが最新でない応答は mergeStates/applyStates/キャッシュ格納を行わない。"""
+    html, _rd = _serve_html(tmp_path)
+    assert "var generation = 0;" in html
+    assert "var myGeneration = ++generation;" in html
+    assert "if (myGeneration !== generation) { return; }" in html
+
+
+def test_serve_script_clears_preview_cache_on_toggle_and_save(tmp_path):
+    """任意のトグル変更時と保存成功時に previewCache を全破棄する。"""
+    html, _rd = _serve_html(tmp_path)
+    assert "function clearPreviewCache() {" in html
+    assert "URL.revokeObjectURL(previewCache[key]);" in html
+    # change ハンドラ（トグル）と保存成功時の両方で呼ばれている
+    assert html.count("clearPreviewCache();") >= 3
+
+
 def test_html_has_seek_buttons_for_both_players(tmp_path):
     html, _rd = _html(tmp_path)
     assert html.count('data-player="src"') == 4
