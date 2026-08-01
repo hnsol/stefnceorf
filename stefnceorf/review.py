@@ -634,15 +634,37 @@ h1 { font-size: 1.2rem; margin: 0 0 .1rem; }
 }
 .trim { color: var(--green); font-size: .85rem; }
 /* --serve（Hlyst 対話モード）専用 */
-.save { display: flex; align-items: center; gap: .75rem; margin-bottom: .75rem; }
-.save button {
+/* 保存ボタンは1段目右端に、余白/区切りで原音プレイヤーと分離する */
+.save-area {
+  display: flex; align-items: center; gap: .5rem; margin-left: auto;
+  padding-left: .75rem; border-left: 1px solid var(--border);
+}
+#save {
   font: inherit; padding: .25rem 1rem; cursor: pointer; border-radius: .25rem;
   border: 1px solid currentColor; background: transparent;
 }
-.save button:disabled { opacity: .4; cursor: default; }
-.save button.dirty { background: var(--green); color: var(--on-accent); border-color: var(--green); }
-.save .msg { font-size: .8rem; }
-.save .msg.error { color: var(--red); }
+#save:disabled { opacity: .5; cursor: default; }
+#save.dirty { background: var(--green); color: var(--on-accent); border-color: var(--green); }
+.msg { font-size: .8rem; }
+.msg.error { color: var(--red); }
+/* 3段目: 試聴範囲切替・絶対時刻・現在案プレビュー */
+.preview-panel {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .4rem 1rem;
+  margin-bottom: .75rem;
+}
+.pad-select { display: flex; gap: .25rem; }
+.padbtn {
+  font: inherit; font-size: .75rem; padding: .15rem .6rem; cursor: pointer;
+  border: 1px solid var(--border); background: transparent; border-radius: .25rem;
+  color: var(--text);
+}
+.padbtn.active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.abs-times {
+  display: flex; flex-wrap: wrap; gap: .2rem 1rem; font-size: .8rem;
+  font-variant-numeric: tabular-nums;
+}
+.abs-times .abs-row { white-space: nowrap; color: var(--text-muted); }
+.abs-times .abs-row b { color: var(--text); font-weight: 400; }
 .state { font-size: .75rem; color: var(--text-muted); min-width: 8rem; text-align: right; }
 .state.unsafe { color: var(--red); font-weight: 700; }
 label.wt { display: inline; }
@@ -664,6 +686,7 @@ label.wt input { margin: 0 .1em 0 .2em; vertical-align: middle; }
     <button type="button" class="seek-btn" data-player="src" data-seek="5">＋5s</button>
     <button type="button" class="seek-btn" data-player="src" data-seek="10">＋10s</button>
   </span>
+$save_area
 </div>
 <div class="player-row">
   <button type="button" class="mode active" data-mode="out">保存済み編集後を再生</button>
@@ -675,7 +698,7 @@ label.wt input { margin: 0 .1em 0 .2em; vertical-align: middle; }
     <button type="button" class="seek-btn" data-player="out" data-seek="10">＋10s</button>
   </span>
 </div>
-$save_area
+$preview_panel
 <ul class="legend">
   <li><span class="w suggest">フィラー提案</span></li>
   <li><span class="w cut">カット済み</span></li>
@@ -683,6 +706,7 @@ $save_area
   <li><span class="state unsafe" style="display:inline">削除指定→安全判定で保持</span></li>
   <li><span class="trim" style="display:inline">✂ 無音トリム</span></li>
   <li>行・単語をクリックすると前後 $pad 秒を再生します</li>
+$extra_legend
 </ul>
 </div>
 <pre class="stats">$stats</pre>
@@ -782,12 +806,36 @@ $serve_script
 """)
 
 
-# --serve 時だけ差し込むコントロール（保存ボタン＋試聴プレイヤー＋通知欄）
-_SAVE_AREA = """<div class="save">
-  <button type="button" id="save" disabled>保存</button>
-  <audio id="audio-preview" controls preload="none"></audio>
+# --serve 時だけ差し込む保存ボタン（1段目右端、原音プレイヤーと余白/区切りで分離）
+_SAVE_AREA = """<span class="save-area">
+  <button type="button" id="save" disabled>保存済み</button>
   <span class="msg" id="save-msg"></span>
+</span>"""
+
+
+# --serve 時だけ差し込む3段目（試聴範囲切替・絶対時刻・現在案プレビュー）
+_PREVIEW_PANEL = """<div class="preview-panel">
+  <span class="pad-select">
+    <button type="button" class="padbtn" data-pad="2">±2秒</button>
+    <button type="button" class="padbtn active" data-pad="4">±4秒</button>
+    <button type="button" class="padbtn" data-pad="8">±8秒</button>
+  </span>
+  <span class="abs-times">
+    <span class="abs-row">対象 原音 <b id="abs-target">--:--.-</b></span>
+    <span class="abs-row">現在案 <b id="abs-center">--:--.-</b></span>
+    <span class="abs-row">試聴範囲 <b id="abs-window">--:--.- – --:--.-（±4秒）</b></span>
+    <span class="abs-row">再生位置 <b id="abs-pos">--:--.-</b></span>
+  </span>
+  <audio id="audio-preview" controls preload="none"></audio>
+  <span class="msg" id="preview-msg"></span>
 </div>"""
+
+
+# --serve 時だけ差し込む凡例（クリック操作の割り当てをショートカット無しでも分かるように）
+_EXTRA_LEGEND = (
+    "<li>クリック=現在案を試聴／Shift+クリック=保存済み編集後／"
+    "Option(Alt)+クリック=原音</li>"
+)
 
 
 # --serve 時だけ差し込む対話スクリプト（トグル→即試聴→保存）
@@ -798,22 +846,37 @@ _SERVE_SCRIPT = """<script>
   if (!DATA.serve) { return; }
 
   var preview = document.getElementById("audio-preview");
+  var audioSrc = document.getElementById("audio-src");
+  var audioOut = document.getElementById("audio-out");
   var saveBtn = document.getElementById("save");
-  var msg = document.getElementById("save-msg");
+  var saveMsg = document.getElementById("save-msg");
+  var previewMsg = document.getElementById("preview-msg");
+  var absTarget = document.getElementById("abs-target");
+  var absCenter = document.getElementById("abs-center");
+  var absWindow = document.getElementById("abs-window");
+  var absPos = document.getElementById("abs-pos");
   var dirty = false;
   var busy = false;
   var baseline = snapshot();
+  // 3段目「現在案プレビュー」の試聴範囲（秒）。3段目付近のボタンで切替できる。
+  var currentPad = 4;
+  // 直前にプレビューした対象（行/単語）。試聴範囲を切り替えたときの再生成に使う。
+  var currentTarget = null;
+  // audio-preview の再生位置表示（window_start_s + currentTime）の基準値。
+  var currentWindowStart = 0;
   // トグル直後は自動再生せず、取得した音声をキャッシュして
-  // 対象の行/単語をクリックしたときに再生する（key -> object URL）。
+  // 対象の行/単語をクリックしたときに再生する（key -> {url, windowStart, ...}）。
+  // キーには pad を含める（対象・pad・編集状態が一致する場合のみ再利用する）。
   var previewCache = {};
   // /preview, /save の応答が世代遅れ（その後に新しい操作が始まっている）なら
   // 状態を巻き戻さないよう、リクエストごとに世代IDを振って照合する。
   var generation = 0;
 
-  function previewKey(target) {
-    return target.type === "word"
+  function previewKey(target, pad) {
+    var base = target.type === "word"
       ? "W" + target.id + ":" + target.word
       : "L" + target.id;
+    return base + "@" + pad;
   }
 
   function snapshot() {
@@ -842,11 +905,24 @@ _SERVE_SCRIPT = """<script>
     return out;
   }
 
-  function setDirty() {
+  function dirtyKeys() {
     var cur = snapshot();
-    dirty = Object.keys(cur).some(function (k) { return cur[k] !== baseline[k]; });
-    saveBtn.disabled = !dirty || busy;
-    saveBtn.classList.toggle("dirty", dirty && !busy);
+    return Object.keys(cur).filter(function (k) { return cur[k] !== baseline[k]; });
+  }
+
+  // 保存ボタンの表示を busy／変更あり（件数入り）／変更なしの3状態で切り替える。
+  function updateSaveButton() {
+    if (busy) {
+      saveBtn.disabled = true;
+      saveBtn.classList.remove("dirty");
+      saveBtn.textContent = "保存中…";
+      return;
+    }
+    var n = dirtyKeys().length;
+    dirty = n > 0;
+    saveBtn.disabled = !dirty;
+    saveBtn.classList.toggle("dirty", dirty);
+    saveBtn.textContent = dirty ? "変更を保存（" + n + "件）" : "保存済み";
   }
 
   // busy 中は全チェックボックスと保存ボタンを操作不能にする（見た目にも分かる
@@ -857,7 +933,7 @@ _SERVE_SCRIPT = """<script>
       document.querySelectorAll("input.del, input.delw"),
       function (box) { box.disabled = value; }
     );
-    setDirty();
+    updateSaveButton();
   }
 
   // previewCache の全 object URL を revoke して破棄する。トグル変更のたびに
@@ -865,14 +941,42 @@ _SERVE_SCRIPT = """<script>
   // 計画と対応しなくなるため。単純な全破棄方式で陳腐化を防ぐ）。
   function clearPreviewCache() {
     Object.keys(previewCache).forEach(function (key) {
-      URL.revokeObjectURL(previewCache[key]);
+      URL.revokeObjectURL(previewCache[key].url);
       delete previewCache[key];
     });
   }
 
-  function note(text, isError) {
-    msg.textContent = text;
-    msg.classList.toggle("error", !!isError);
+  function notePreview(text, isError) {
+    previewMsg.textContent = text;
+    previewMsg.classList.toggle("error", !!isError);
+  }
+
+  function noteSave(text, isError) {
+    saveMsg.textContent = text;
+    saveMsg.classList.toggle("error", !!isError);
+  }
+
+  // 秒 → "M:SS.d" 形式（等幅数字表示欄で使う）。
+  function formatTime(t) {
+    if (typeof t !== "number" || !isFinite(t)) { return "--:--.-"; }
+    var sign = t < 0 ? "-" : "";
+    t = Math.abs(t);
+    var m = Math.floor(t / 60);
+    var s = t - m * 60;
+    var sStr = s.toFixed(1);
+    if (s < 10) { sStr = "0" + sStr; }
+    return sign + m + ":" + sStr;
+  }
+
+  // キャッシュ済み/応答直後の試聴データから絶対時刻表示を更新する。
+  function updateAbsTimes(entry) {
+    currentWindowStart = entry.windowStart;
+    absTarget.textContent = formatTime(entry.target);
+    absCenter.textContent = formatTime(entry.center);
+    absWindow.textContent =
+      formatTime(entry.windowStart) + "–" + formatTime(entry.windowEnd) +
+      "（±" + Math.round(entry.pad) + "秒）";
+    absPos.textContent = formatTime(entry.windowStart);
   }
 
   function stateLabel(requested, effective, kind, reason) {
@@ -963,26 +1067,38 @@ _SERVE_SCRIPT = """<script>
     return new Blob([bytes], { type: "audio/wav" });
   }
 
+  // トグル反映済みの現在案から試聴音声を取得する（現在選択中の対象として記録し、
+  // 応答が来たら audio-preview へ設定して再生を試みる）。
   function runPreview(target) {
     if (busy) { return; }
+    currentTarget = target;
     var myGeneration = ++generation;
     setControlsBusy(true);
-    note("試聴を生成中…", false);
-    post("/preview", { toggles: toggles(), target: target })
+    notePreview("試聴を生成中…", false);
+    post("/preview", { toggles: toggles(), target: target, pad_s: currentPad })
       .then(function (payload) {
         // この応答より後に新しい操作（トグル/保存）が始まっていたら、
         // 画面の状態を巻き戻さないよう破棄する。
         if (myGeneration !== generation) { return; }
         mergeStates(payload.segments);
         applyStates();
-        note((payload.message || "試聴") + "（クリックで再生）", false);
+        notePreview((payload.message || "試聴") + "（クリックで再生）", false);
         // 対象の行/単語をクリックしたときにも再生できるよう音声をキャッシュ
         // しておく（従来どおり）。加えて、チェック変更の結果をすぐ耳で確認
         // できるよう audio-preview へも即座に設定し load/play を試みる
         // （autoplay 拒否は握りつぶし、src 設定と load だけは完了させる）。
-        var key = previewKey(target);
+        var key = previewKey(target, currentPad);
         var url = URL.createObjectURL(toBlob(payload.audio));
-        previewCache[key] = url;
+        var entry = {
+          url: url,
+          windowStart: payload.window_start_s,
+          windowEnd: payload.window_end_s,
+          center: payload.center_s,
+          target: payload.target_source_s,
+          pad: payload.pad_s
+        };
+        previewCache[key] = entry;
+        updateAbsTimes(entry);
         preview.src = url;
         preview.load();
         var playing = preview.play();
@@ -990,7 +1106,7 @@ _SERVE_SCRIPT = """<script>
       })
       .catch(function (err) {
         if (myGeneration !== generation) { return; }
-        note(err.message, true);
+        notePreview(err.message, true);
       })
       .then(function () {
         if (myGeneration !== generation) { return; }
@@ -998,26 +1114,89 @@ _SERVE_SCRIPT = """<script>
       });
   }
 
-  // キャッシュされた試聴音声があれば、その行/単語のクリックで再生する
-  // （まだ保存前のため、原音/編集後プレイヤーの再生位置は最新状態を反映しない）。
-  // capture フェーズで先取りし、通常のクリック再生（本文スクリプト側）より優先させる。
+  // 現在案プレビューを再生する（対象＋現在の試聴範囲でキャッシュ済みなら即再生、
+  // 無ければ現在のチェック状態で /preview を生成してから再生する）。
+  function playCurrentPlan(target) {
+    currentTarget = target;
+    var key = previewKey(target, currentPad);
+    var cached = previewCache[key];
+    if (cached) {
+      updateAbsTimes(cached);
+      preview.src = cached.url;
+      var playing = preview.play();
+      if (playing && playing.catch) { playing.catch(function () {}); }
+      return;
+    }
+    runPreview(target);
+  }
+
+  function seekAndPlay(audio, t) {
+    try { audio.currentTime = t; } catch (e) { /* metadata 未読込 */ }
+    var playing = audio.play();
+    if (playing && playing.catch) { playing.catch(function () {}); }
+  }
+
+  function setActiveLine(el) {
+    var prev = document.querySelector(".line.active, .trim.active");
+    if (prev) { prev.classList.remove("active"); }
+    el.classList.add("active");
+  }
+
+  // 行/単語クリックの再生先を切り替える（capture フェーズで先取りし、本文
+  // スクリプト側の既定動作＝上段2プレイヤーへは渡さない）。
+  // 通常クリック＝3段目「現在案プレビュー」、Shift+クリック＝保存済み編集後、
+  // Option(Alt)+クリック＝原音。無音トリムは対象が無いため上段プレイヤーの
+  // 既定動作（本文スクリプト側）に委ねる。
   document.getElementById("transcript").addEventListener("click", function (ev) {
     if (ev.target.closest("input, label.wt")) { return; }
-    var word = ev.target.closest(".w");
+    if (ev.target.closest(".trim")) { return; }
     var line = ev.target.closest(".line");
     if (!line) { return; }
     var seg = DATA.segments[Number(line.dataset.i)];
     if (!seg) { return; }
-    var key = word
-      ? previewKey({ type: "word", id: seg.id, word: Number(word.dataset.w) })
-      : previewKey({ type: "line", id: seg.id });
-    var cached = previewCache[key];
-    if (!cached) { return; }
+    var word = ev.target.closest(".w");
+    var wordData = word ? findWord(seg, Number(word.dataset.w)) : null;
+
     ev.stopPropagation();
-    preview.src = cached;
-    var playing = preview.play();
-    if (playing && playing.catch) { playing.catch(function () {}); }
+    setActiveLine(line);
+
+    if (ev.shiftKey) {
+      seekAndPlay(audioOut, wordData ? wordData.output : seg.output);
+      return;
+    }
+    if (ev.altKey) {
+      seekAndPlay(audioSrc, wordData ? wordData.source : seg.source);
+      return;
+    }
+
+    var target = wordData
+      ? { type: "word", id: seg.id, word: wordData.index }
+      : { type: "line", id: seg.id };
+    playCurrentPlan(target);
   }, true);
+
+  // 試聴範囲（±2/±4/±8秒）の切替。現在選択中の対象があれば再生成する。
+  Array.prototype.forEach.call(
+    document.querySelectorAll(".padbtn"),
+    function (btn) {
+      btn.addEventListener("click", function () {
+        var pad = Number(btn.dataset.pad);
+        if (pad === currentPad) { return; }
+        currentPad = pad;
+        Array.prototype.forEach.call(
+          document.querySelectorAll(".padbtn"),
+          function (b) { b.classList.remove("active"); }
+        );
+        btn.classList.add("active");
+        if (currentTarget) { playCurrentPlan(currentTarget); }
+      });
+    }
+  );
+
+  // 再生位置表示（3段目）。window_start_s + currentTime を M:SS.d で更新する。
+  preview.addEventListener("timeupdate", function () {
+    absPos.textContent = formatTime(currentWindowStart + preview.currentTime);
+  });
 
   document.getElementById("transcript").addEventListener("change", function (ev) {
     var box = ev.target;
@@ -1026,14 +1205,14 @@ _SERVE_SCRIPT = """<script>
     if (!seg) { return; }
     if (box.classList.contains("del")) {
       seg.requested_delete = box.checked;
-      setDirty();
+      updateSaveButton();
       clearPreviewCache();
       runPreview({ type: "line", id: seg.id });
     } else if (box.classList.contains("delw")) {
       var word = findWord(seg, Number(box.dataset.w));
       if (!word) { return; }
       word.requested_delete = box.checked;
-      setDirty();
+      updateSaveButton();
       clearPreviewCache();
       runPreview({ type: "word", id: seg.id, word: word.index });
     }
@@ -1043,7 +1222,6 @@ _SERVE_SCRIPT = """<script>
     if (busy || !dirty) { return; }
     var myGeneration = ++generation;
     setControlsBusy(true);
-    note("保存中…", false);
     post("/save", { toggles: toggles() })
       .then(function (payload) {
         if (myGeneration !== generation) { return; }
@@ -1057,11 +1235,11 @@ _SERVE_SCRIPT = """<script>
         // 保存成功後は編集後プランが確定するため、古いプレビュー音声を
         // すべて破棄する（保存前の中間状態の音が再生されないようにする）。
         clearPreviewCache();
-        note("保存しました: " + payload.txt_path, false);
+        noteSave("保存しました: " + payload.txt_path, false);
       })
       .catch(function (err) {
         if (myGeneration !== generation) { return; }
-        note(err.message, true);
+        noteSave(err.message, true);
       })
       .then(function () {
         if (myGeneration !== generation) { return; }
@@ -1070,7 +1248,7 @@ _SERVE_SCRIPT = """<script>
   });
 
   applyStates();
-  setDirty();
+  updateSaveButton();
 })();
 </script>"""
 
@@ -1089,6 +1267,8 @@ def render_html(review: dict) -> str:
             if serve else "A/B試聴"
         ),
         save_area=_SAVE_AREA if serve else "",
+        preview_panel=_PREVIEW_PANEL if serve else "",
+        extra_legend=_EXTRA_LEGEND if serve else "",
         serve_script=_SERVE_SCRIPT if serve else "",
         note=escape(review["note"]),
         source_audio=escape(review["source_audio"], quote=True),

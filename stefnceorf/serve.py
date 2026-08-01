@@ -51,7 +51,6 @@ from .render import (
     render_plan_window,
 )
 from .review import (
-    PLAY_PAD_S,
     REVIEW_WAV_SUFFIX,
     build_review_data,
     chunk_output_starts,
@@ -65,8 +64,9 @@ HOST = "127.0.0.1"
 # POST ボディのサイズ上限。トグル状態は1行あたり数十バイトなので長尺でも十分収まる。
 MAX_POST_BYTES = 4 * 1024 * 1024
 
-# 試聴窓の前後余白（秒）。静的モードのクリック再生と同じ長さ。
-PREVIEW_PAD_S = PLAY_PAD_S
+# 試聴窓の前後余白（秒）。画面の3段目付近で切替できる（既定 ±4秒）。
+PREVIEW_PAD_OPTIONS = (2.0, 4.0, 8.0)
+PREVIEW_PAD_DEFAULT_S = 4.0
 
 # 配信を許す音声（allowlist）。パスからファイルを組み立てないので traversal 不可。
 AUDIO_ROUTES = ("/audio/source", "/audio/review")
@@ -580,23 +580,40 @@ class HlystSession:
 
     # -- 試聴
 
-    def preview(self, toggles: list[dict], target: dict) -> dict:
-        """トグル反映済みの計画から対象周辺の窓 wav を作って返す。"""
+    def preview(
+        self, toggles: list[dict], target: dict, pad_s: float = PREVIEW_PAD_DEFAULT_S
+    ) -> dict:
+        """トグル反映済みの計画から対象周辺の窓 wav を作って返す。
+
+        pad_s は試聴窓の前後余白（秒）。呼び出し側（HTTP ハンドラ）が
+        PREVIEW_PAD_OPTIONS で検証済みの値を渡す前提。
+        """
         with self.lock:
             text = apply_toggles(
                 self.raw_text, self.context.data, self.fillers, toggles
             )
             plan = self.plan_for(text)
             data = self.review_data(text, plan)
-            center, message = preview_center(plan, data, target)
-            window, _start = render_plan_window(plan, center, PREVIEW_PAD_S)
+            info = preview_center(plan, data, target)
+            center = info["center"]
+            window, start_sample = render_plan_window(plan, center, pad_s)
             wav = encode_wav(
                 window, plan.samplerate, plan.audio_info.subtype
+            )
+            samplerate = plan.samplerate
+            window_start_s = (start_sample / samplerate) if samplerate else 0.0
+            window_end_s = (
+                window_start_s + (len(window) / samplerate) if samplerate else 0.0
             )
             return {
                 "audio": base64.b64encode(wav).decode("ascii"),
                 "center": center,
-                "message": message,
+                "center_s": center,
+                "target_source_s": info["target_source_s"],
+                "window_start_s": window_start_s,
+                "window_end_s": window_end_s,
+                "pad_s": pad_s,
+                "message": info["message"],
                 "segments": data["segments"],
                 "stats": data["stats"],
             }
@@ -665,12 +682,15 @@ def _atomic_write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def preview_center(plan, data: dict, target: dict) -> tuple[float, str]:
-    """試聴の中心時刻（新プランの出力時刻）と通知文言を返す。
+def preview_center(plan, data: dict, target: dict) -> dict:
+    """試聴の中心時刻（新プランの出力時刻）・対象の原音時刻・通知文言を返す。
 
     削除OFF（復活試聴）は対象中央を新プランの写像で出力時刻へ変換する。
     削除ON（削除試聴）は対象が新出力に存在しないため、削除後の前後区間の
     結合境界を中心にする（単純な source→output 変換では扱えない）。
+
+    戻り値 {"center": 出力時刻(秒), "target_source_s": 対象の原音時刻(秒),
+    "message": 通知文言}。
     """
     samplerate = plan.samplerate
     bounds, flags, _ = plan_chunk_bounds(plan)
@@ -689,27 +709,29 @@ def preview_center(plan, data: dict, target: dict) -> tuple[float, str]:
         word = next((w for w in seg["words"] if w["index"] == word_index), None)
         if word is None:
             raise ValueError(f"単語が見つかりません: [{seg['id']}] {word_index}")
-        mid = int(round(word["center"] * samplerate))
+        target_source_s = float(word["center"])
+        mid = int(round(target_source_s * samplerate))
         center = _sec(map_source_sample(bounds, starts, mid))
         requested = word["requested_delete"]
         effective = word["effective_delete"]
     else:
+        target_source_s = (float(seg["source"]) + float(seg["source_end"])) / 2.0
         if seg["effective_delete"]:
             # 削除済み → 結合境界（build_review_data が算出済み）
             center = seg["output"]
         else:
-            mid = int(round((seg["source"] + seg["source_end"]) / 2.0 * samplerate))
+            mid = int(round(target_source_s * samplerate))
             center = _sec(map_source_sample(bounds, starts, mid))
         requested = seg["requested_delete"]
         effective = seg["effective_delete"]
 
     if requested and not effective:
-        message = "安全判定により保持しました（対象の中央を再生）"
+        message = "現在案プレビュー：安全判定により保持"
     elif requested:
-        message = "削除した場合を試聴"
+        message = "現在案プレビュー：削除"
     else:
-        message = "保持した場合を試聴"
-    return center, message
+        message = "現在案プレビュー：保持"
+    return {"center": center, "target_source_s": target_source_s, "message": message}
 
 
 # ---------------------------------------------------------------- HTTP
@@ -946,7 +968,12 @@ class _Handler(BaseHTTPRequestHandler):
                 ):
                     self._error(400, "target が不正です")
                     return
-                self._send_json(200, self.session.preview(toggles, target))
+                try:
+                    pad_s = _validate_pad_s(payload.get("pad_s"))
+                except ValueError as exc:
+                    self._error(400, str(exc))
+                    return
+                self._send_json(200, self.session.preview(toggles, target, pad_s))
             else:
                 self._send_json(200, self.session.save(toggles))
         except AudioRenderError as exc:
@@ -963,6 +990,18 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(400, str(exc))
         except OSError as exc:
             self._error(500, f"入出力エラー: {exc}")
+
+
+def _validate_pad_s(value) -> float:
+    """POST の pad_s を検証して返す（未指定は既定値、他は allowlist で拒否）。"""
+    if value is None:
+        return PREVIEW_PAD_DEFAULT_S
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"pad_s が不正です: {value!r}")
+    pad = float(value)
+    if pad not in PREVIEW_PAD_OPTIONS:
+        raise ValueError(f"pad_s が不正です: {value!r}")
+    return pad
 
 
 def _validate_toggles(toggles, data: dict) -> list[dict]:

@@ -514,7 +514,7 @@ def test_preview_center_of_cut_word_is_join_boundary(tmp_path):
     )
     # えー[1.1,1.6) はカット済み。中心は「あ」の終端＝結合境界の近傍
     assert 0.9 < result["center"] < 1.3
-    assert result["message"] == "削除した場合を試聴"
+    assert result["message"] == "現在案プレビュー：削除"
 
 
 def test_preview_does_not_write_txt(tmp_path):
@@ -531,6 +531,26 @@ def test_preview_does_not_write_txt(tmp_path):
     assert word["effective_delete"] is False
 
 
+def test_preview_on_off_differ_in_audio_and_message(tmp_path):
+    """削除ON/OFFで試聴音声のバイト列とメッセージが変わる。"""
+    session, _txt = _session(tmp_path)
+    toggles = _all_toggles(tmp_path, session.raw_text)
+
+    def _set(delete):
+        for t in toggles:
+            if t["type"] == "line" and t["id"] == "0003":
+                t["delete"] = delete
+
+    _set(True)
+    on_result = session.preview(list(toggles), {"type": "line", "id": "0003"})
+    _set(False)
+    off_result = session.preview(list(toggles), {"type": "line", "id": "0003"})
+
+    assert on_result["message"] == "現在案プレビュー：削除"
+    assert off_result["message"] == "現在案プレビュー：保持"
+    assert on_result["audio"] != off_result["audio"]
+
+
 def test_preview_returns_playable_wav(tmp_path):
     import io
 
@@ -542,13 +562,101 @@ def test_preview_returns_playable_wav(tmp_path):
     )
     audio, sr = sf.read(io.BytesIO(base64.b64decode(result["audio"])))
     assert sr == 16000
-    assert 0 < len(audio) <= int(2 * serve.PREVIEW_PAD_S * sr)
+    assert 0 < len(audio) <= int(2 * serve.PREVIEW_PAD_DEFAULT_S * sr)
 
 
 def test_preview_unknown_segment_raises(tmp_path):
     session, _txt = _session(tmp_path)
     with pytest.raises(ValueError):
         session.preview([], {"type": "line", "id": "9999"})
+
+
+# ---- preview 範囲（pad_s）と絶対時刻 ----
+
+@pytest.mark.parametrize("pad", [2.0, 4.0, 8.0])
+def test_preview_window_length_matches_pad(tmp_path, pad):
+    import io
+
+    import soundfile as sf
+
+    session, _txt = _session(tmp_path)
+    result = session.preview(
+        _all_toggles(tmp_path, session.raw_text),
+        {"type": "line", "id": "0003"},
+        pad_s=pad,
+    )
+    audio, sr = sf.read(io.BytesIO(base64.b64decode(result["audio"])))
+    assert 0 < len(audio) <= int(2 * pad * sr)
+    assert result["pad_s"] == pad
+
+
+def test_preview_window_clamped_at_boundaries(tmp_path):
+    """先頭付近の対象は pad_s ぶんフルには取れず、窓長が短くなる（境界クランプ）。"""
+    session, _txt = _session(tmp_path)
+    result = session.preview(
+        _all_toggles(tmp_path, session.raw_text),
+        {"type": "line", "id": "0001"},
+        pad_s=8.0,
+    )
+    assert result["window_start_s"] == 0.0
+    assert result["window_end_s"] - result["window_start_s"] < 2 * 8.0
+
+
+def test_preview_response_includes_absolute_times(tmp_path):
+    session, _txt = _session(tmp_path)
+    result = session.preview(
+        _all_toggles(tmp_path, session.raw_text),
+        {"type": "line", "id": "0003"},
+    )
+    assert result["target_source_s"] > 0
+    assert result["center_s"] == result["center"]
+    assert result["window_start_s"] <= result["center_s"] <= result["window_end_s"]
+    assert result["window_end_s"] > result["window_start_s"]
+
+
+def test_validate_pad_s_allows_known_values_and_default():
+    assert serve._validate_pad_s(None) == serve.PREVIEW_PAD_DEFAULT_S
+    assert serve._validate_pad_s(2) == 2.0
+    assert serve._validate_pad_s(4.0) == 4.0
+    assert serve._validate_pad_s(8) == 8.0
+
+
+@pytest.mark.parametrize("bad", [3, 0, "4", True, 4.5])
+def test_validate_pad_s_rejects_unknown_values(bad):
+    with pytest.raises(ValueError):
+        serve._validate_pad_s(bad)
+
+
+def test_preview_endpoint_rejects_invalid_pad_s(server):
+    httpd, _url, _txt = server
+    status, _h, body = _post(
+        httpd, "/preview",
+        {
+            "toggles": [],
+            "target": {"type": "line", "id": "0003"},
+            "pad_s": 3,
+        },
+    )
+    assert status == 400
+    assert "pad_s" in json.loads(body)["error"]
+
+
+def test_preview_endpoint_accepts_pad_s_and_returns_window(server):
+    httpd, _url, _txt = server
+    status, _h, body = _post(
+        httpd, "/preview",
+        {
+            "toggles": [],
+            "target": {"type": "line", "id": "0003"},
+            "pad_s": 8,
+        },
+    )
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["pad_s"] == 8
+    assert {"target_source_s", "center_s", "window_start_s", "window_end_s"} <= set(
+        payload
+    )
 
 
 # ---- save（原子的書き込み・.bak・外部変更検出） ----

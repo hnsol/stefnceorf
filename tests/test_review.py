@@ -856,7 +856,7 @@ def test_serve_script_plays_preview_immediately_on_response(tmp_path):
     run_preview_body = html.split("function runPreview(target) {")[1].split(
         "\n  }\n"
     )[0]
-    assert "previewCache[key] = url;" in run_preview_body
+    assert "previewCache[key] = entry;" in run_preview_body
     assert "preview.src = url;" in run_preview_body
     assert "preview.load();" in run_preview_body
     assert "var playing = preview.play();" in run_preview_body
@@ -885,7 +885,7 @@ def test_serve_script_clears_preview_cache_on_toggle_and_save(tmp_path):
     """任意のトグル変更時と保存成功時に previewCache を全破棄する。"""
     html, _rd = _serve_html(tmp_path)
     assert "function clearPreviewCache() {" in html
-    assert "URL.revokeObjectURL(previewCache[key]);" in html
+    assert "URL.revokeObjectURL(previewCache[key].url);" in html
     # change ハンドラ（トグル）と保存成功時の両方で呼ばれている
     assert html.count("clearPreviewCache();") >= 3
 
@@ -903,6 +903,94 @@ def test_html_has_seek_buttons_for_both_players(tmp_path):
 def test_html_controls_is_two_player_rows(tmp_path):
     html, _rd = _html(tmp_path)
     assert html.count('class="player-row"') == 2
+
+
+# ---- 試聴範囲切替・絶対時刻表示・保存ボタン移設・クリック挙動（UI改修） ----
+
+def test_serve_html_has_pad_range_buttons_default_4s(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    transcript_area = html.split('<div class="preview-panel">')[1].split(
+        "</div>"
+    )[0]
+    assert 'data-pad="2"' in transcript_area
+    assert 'data-pad="4"' in transcript_area
+    assert 'data-pad="8"' in transcript_area
+    assert 'class="padbtn active" data-pad="4"' in transcript_area
+
+
+def test_serve_html_has_absolute_time_placeholders(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    assert 'id="abs-target"' in html
+    assert 'id="abs-center"' in html
+    assert 'id="abs-window"' in html
+    assert 'id="abs-pos"' in html
+
+
+def test_serve_html_save_button_is_in_first_player_row(tmp_path):
+    """保存ボタンは3段目ではなく1段目（原音プレイヤー行）にある。"""
+    html, _rd = _serve_html(tmp_path)
+    row1 = html.split('class="player-row"')[1].split('class="player-row"')[0]
+    assert 'id="save"' in row1
+    preview_panel = html.split('<div class="preview-panel">')[1].split("</div>")[0]
+    assert 'id="save"' not in preview_panel
+
+
+def test_serve_html_save_button_default_label(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    assert '<button type="button" id="save" disabled>保存済み</button>' in html
+
+
+def test_serve_script_save_button_shows_dirty_count(tmp_path):
+    """保存ボタンの表示は dirty 件数（N件）で更新される。"""
+    html, _rd = _serve_html(tmp_path)
+    assert '"変更を保存（" + n + "件）"' in html
+    assert '"保存済み"' in html
+    assert '"保存中…"' in html
+
+
+def test_serve_script_normal_click_uses_audio_preview(tmp_path):
+    """通常クリックは3段目「現在案プレビュー」（audio-preview）を再生する。"""
+    html, _rd = _serve_html(tmp_path)
+    assert "function playCurrentPlan(target) {" in html
+    assert "preview.src = cached.url;" in html
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    assert "playCurrentPlan(target);" in serve_script
+
+
+def test_serve_script_has_shift_and_alt_shortcuts(tmp_path):
+    """Shift+クリック=保存済み編集後、Option(Alt)+クリック=原音のショートカットがある。"""
+    html, _rd = _serve_html(tmp_path)
+    assert "ev.shiftKey" in html
+    assert "ev.altKey" in html
+    assert "seekAndPlay(audioOut," in html
+    assert "seekAndPlay(audioSrc," in html
+    # Ctrl/Cmd は使わない
+    assert "ev.ctrlKey" not in html
+    assert "ev.metaKey" not in html
+
+
+def test_serve_script_playback_position_uses_window_start_plus_current_time(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    assert (
+        "absPos.textContent = formatTime(currentWindowStart + preview.currentTime);"
+        in html
+    )
+
+
+def test_serve_script_saved_player_not_updated_by_preview(tmp_path):
+    """保存済み編集後プレイヤー（audio-out）の src は保存成功時にしか更新されない。"""
+    html, _rd = _serve_html(tmp_path)
+    run_preview_body = html.split("function runPreview(target) {")[1].split(
+        "\n  }\n"
+    )[0]
+    assert "audio-out" not in run_preview_body
+    assert html.count('out.src = DATA.review_audio + "&v="') == 1
+
+
+def test_serve_html_extra_legend_mentions_shortcuts(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    assert "Shift" in html
+    assert "Option" in html
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node が見つからない")
