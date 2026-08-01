@@ -15,6 +15,7 @@ from .transcribe import DEFAULT_MODEL, PAUSE_THRESHOLD_S
 _ANNOUNCEMENTS = {
     "transcribe": "transcribing audio",
     "render": "rendering edited audio",
+    "review": "building A/B review page",
     "logic": "exporting FCPXML for Logic Pro",
     "auto": "full pipeline: transcribe -> FCPXML",
 }
@@ -93,6 +94,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_rn.add_argument("input", help="編集後の .sc.txt ファイル")
     p_rn.add_argument("-o", "--output", default=None, help="出力wavファイル")
     _add_gap_arguments(p_rn)
+
+    p_rv = sub.add_parser(
+        "review", help="編集後テキストから A/B 試聴用のレビュー音声とHTMLを生成"
+    )
+    p_rv.add_argument("input", help="編集後の .sc.txt ファイル")
+    p_rv.add_argument(
+        "--no-open",
+        dest="open_browser",
+        action="store_false",
+        default=True,
+        help="生成後にブラウザで自動オープンしない",
+    )
+    _add_gap_arguments(p_rv)
 
     p_logic = sub.add_parser("logic", help="編集後テキストから Logic Pro 用FCPXMLを生成")
     p_logic.add_argument("input", help="編集後の .sc.txt ファイル")
@@ -242,6 +256,28 @@ def main(argv: list[str] | None = None) -> int:
             print(f"エラー: {exc}", file=sys.stderr)
             return 1
         print(f"生成: {out}")
+        for line in stats_lines:
+            print(line)
+        return 0
+
+    if args.command == "review":
+        from .review import review
+
+        print(f"review: {_ANNOUNCEMENTS['review']}: {args.input}")
+        stats_lines: list[str] = []
+        try:
+            res = review(
+                args.input,
+                gap_threshold=args.gap_threshold,
+                gap_max=args.gap_max,
+                open_browser=args.open_browser,
+                stats_out=stats_lines,
+            )
+        except (RuntimeError, OSError, ValueError) as exc:
+            print(f"エラー: {exc}", file=sys.stderr)
+            return 1
+        print(f"生成: {res['wav_path']}")
+        print(f"生成: {res['html_path']}")
         for line in stats_lines:
             print(line)
         return 0

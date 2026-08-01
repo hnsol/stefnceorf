@@ -103,6 +103,23 @@ def test_parser_logic_options():
     assert args.gap_max == pytest.approx(0.75)
 
 
+def test_parser_review_defaults():
+    args = cli._build_parser().parse_args(["review", "input.sc.txt"])
+    assert args.command == "review"
+    assert args.input == "input.sc.txt"
+    assert args.open_browser is True
+    assert args.gap_threshold == GAP_THRESHOLD_S
+    assert args.gap_max == GAP_MAX_S
+
+
+def test_parser_review_no_open():
+    args = cli._build_parser().parse_args(
+        ["review", "input.sc.txt", "--no-open", "--gap-max", "0.5"]
+    )
+    assert args.open_browser is False
+    assert args.gap_max == pytest.approx(0.5)
+
+
 # ---- main() のディスパッチ ----
 
 @pytest.fixture
@@ -364,6 +381,38 @@ def test_main_render_announces_and_prints_duration(tmp_path, capsys):
     generated_idx = next(i for i, l in enumerate(lines) if l.startswith("生成:"))
     duration_idx = next(i for i, l in enumerate(lines) if l.startswith("Duration:"))
     assert duration_idx > generated_idx
+
+
+def test_main_review_announces_and_generates_both_files(tmp_path, capsys):
+    _, txt, _ = _make_real_project(tmp_path)
+    assert cli.main(["review", str(txt), "--no-open"]) == 0
+    out = capsys.readouterr().out
+    assert f"review: building A/B review page: {txt}\n" in out
+    assert f"生成: {tmp_path / 'x.review.wav'}\n" in out
+    assert f"生成: {tmp_path / 'x.review.html'}\n" in out
+    assert (tmp_path / "x.review.wav").exists()
+    assert (tmp_path / "x.review.html").exists()
+    lines = out.splitlines()
+    duration_idx = next(i for i, l in enumerate(lines) if l.startswith("Duration:"))
+    generated_idx = max(i for i, l in enumerate(lines) if l.startswith("生成:"))
+    assert duration_idx > generated_idx
+
+
+def test_main_review_no_open_does_not_launch_browser(tmp_path, monkeypatch):
+    from stefnceorf import review as review_mod
+
+    _, txt, _ = _make_real_project(tmp_path)
+
+    def _fail(url):
+        raise AssertionError("--no-open ではブラウザを開かない")
+
+    monkeypatch.setattr(review_mod.webbrowser, "open", _fail)
+    assert cli.main(["review", str(txt), "--no-open"]) == 0
+
+
+def test_main_review_missing_txt_returns_one(tmp_path, capsys):
+    assert cli.main(["review", str(tmp_path / "nope.sc.txt"), "--no-open"]) == 1
+    assert "エラー: " in capsys.readouterr().err
 
 
 def test_main_logic_announces_and_prints_duration(tmp_path, capsys):

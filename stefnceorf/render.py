@@ -1125,6 +1125,63 @@ def build_edit_plan(
     )
 
 
+def plan_chunk_bounds(
+    plan: EditPlan,
+) -> tuple[list[tuple[int, int]], list[bool], list[int]]:
+    """EditPlan の出力区間をサンプル境界へ丸め、空区間を除いて返す（純関数）。
+
+    戻り値 (サンプル境界列, クロスフェードフラグ列, 元 output_intervals index 列)。
+    フラグ列は crossfade_concat へそのまま渡せる形（長さ = 境界数 - 1）。
+
+    render_plan（実書き出し）と review の写像表がまったく同じ丸めを共有できるよう、
+    切り出し境界の計算だけをここに集約している。
+    """
+    bounds: list[tuple[int, int]] = []
+    kept_indices: list[int] = []
+    for i, (start, end) in enumerate(plan.output_intervals):
+        s0 = max(0, int(round(start * plan.samplerate)))
+        s1 = min(plan.total_samples, int(round(end * plan.samplerate)))
+        if s1 > s0:
+            bounds.append((s0, s1))
+            kept_indices.append(i)
+
+    flags: list[bool] = []
+    for j in range(1, len(kept_indices)):
+        idx = kept_indices[j] - 1
+        flags.append(
+            plan.crossfade_flags[idx]
+            if idx < len(plan.crossfade_flags) else True
+        )
+    return bounds, flags, kept_indices
+
+
+def render_plan(plan: EditPlan, output_path: str | Path) -> str:
+    """EditPlan の出力区間を元音声から切り出し・結合して wav を書き出す。
+
+    build_edit_plan を呼ばないので、同じ EditPlan からレビュー音声と写像表の
+    両方を作る用途（review）でも計画が再計算されない。警告・統計の出力は
+    呼び出し元の責務とする。
+    """
+    import numpy as np
+    import soundfile as sf
+
+    bounds, flags, _ = plan_chunk_bounds(plan)
+    chunks = [plan.audio[s0:s1] for s0, s1 in bounds]
+
+    fade_samples = int(round(FADE_S * plan.samplerate))
+    result = crossfade_concat(chunks, fade_samples, flags if flags else None)
+
+    # 出力形状を元音声のチャンネル構成へ合わせる
+    if len(result) == 0 and plan.audio.ndim == 2:
+        result = np.zeros((0, plan.audio.shape[1]), dtype=np.float64)
+
+    out_path = Path(output_path)
+    sf.write(
+        str(out_path), result, plan.samplerate, subtype=plan.audio_info.subtype
+    )
+    return str(out_path)
+
+
 def render(
     txt_path: str,
     output: str | None = None,
@@ -1138,43 +1195,14 @@ def render(
     print しない（呼び出し元が任意の位置で出力できる）。
     None の場合は警告出力の後に print する（後方互換）。
     """
-    import numpy as np
-    import soundfile as sf
-
     plan = build_edit_plan(txt_path, gap_threshold=gap_threshold, gap_max=gap_max)
-
-    chunks = []
-    kept_indices = []
-    for i, (start, end) in enumerate(plan.output_intervals):
-        s0 = max(0, int(round(start * plan.samplerate)))
-        s1 = min(plan.total_samples, int(round(end * plan.samplerate)))
-        if s1 > s0:
-            chunks.append(plan.audio[s0:s1])
-            kept_indices.append(i)
-
-    valid_flags = []
-    for j in range(1, len(kept_indices)):
-        idx = kept_indices[j] - 1
-        valid_flags.append(
-            plan.crossfade_flags[idx]
-            if idx < len(plan.crossfade_flags) else True
-        )
-
-    fade_samples = int(round(FADE_S * plan.samplerate))
-    result = crossfade_concat(chunks, fade_samples, valid_flags if valid_flags else None)
-
-    # 出力形状を元音声のチャンネル構成へ合わせる
-    if len(result) == 0 and plan.audio.ndim == 2:
-        result = np.zeros((0, plan.audio.shape[1]), dtype=np.float64)
 
     if output is None:
         out_path = plan.txt_path.parent / f"{plan.base_name}.edited.wav"
     else:
         out_path = Path(output)
 
-    sf.write(
-        str(out_path), result, plan.samplerate, subtype=plan.audio_info.subtype
-    )
+    render_plan(plan, out_path)
 
     for w in plan.warnings:
         print(f"警告: {w}", file=sys.stderr)

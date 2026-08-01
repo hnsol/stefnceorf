@@ -983,6 +983,80 @@ def test_build_edit_plan_contains_shared_render_inputs(tmp_path):
     assert isinstance(plan.warnings, list)
 
 
+# ---- render_plan 分離（sc render の回帰） ----
+
+def test_plan_chunk_bounds_rounds_and_drops_empty(tmp_path):
+    """出力区間はサンプルへ丸められ、空区間は落ちてフラグも詰められる。"""
+    _make_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あう\n", encoding="utf-8")
+
+    plan = render.build_edit_plan(str(txt))
+    bounds, flags, kept = render.plan_chunk_bounds(plan)
+
+    assert bounds == [(0, 16000), (32000, 48000)]
+    assert flags == [True]
+    assert kept == [0, 1]
+
+
+def test_plan_chunk_bounds_clamps_to_file(tmp_path):
+    """丸め結果はファイル範囲 [0, total_samples] にクランプされる。"""
+    _make_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あいう\n", encoding="utf-8")
+
+    plan = render.build_edit_plan(str(txt))
+    bounds, _flags, _kept = render.plan_chunk_bounds(plan)
+    assert bounds[0][0] >= 0
+    assert bounds[-1][1] <= plan.total_samples
+
+
+def test_render_plan_matches_render_output(tmp_path):
+    """render_plan 単体の出力は render() の出力と完全一致する（分離の回帰）。"""
+    import soundfile as sf
+
+    _make_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あう\n", encoding="utf-8")
+
+    reference = render.render(str(txt), output=str(tmp_path / "ref.wav"))
+    plan = render.build_edit_plan(str(txt))
+    direct = render.render_plan(plan, tmp_path / "direct.wav")
+
+    a, sr_a = sf.read(reference)
+    b, sr_b = sf.read(direct)
+    assert sr_a == sr_b
+    assert np.array_equal(a, b)
+
+
+def test_render_plan_preserves_subtype_and_channels(tmp_path):
+    import soundfile as sf
+
+    _make_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あいう\n", encoding="utf-8")
+
+    plan = render.build_edit_plan(str(txt))
+    out = render.render_plan(plan, tmp_path / "direct.wav")
+    info = sf.info(out)
+    assert info.subtype == "PCM_16"
+    assert info.channels == 1
+
+
+def test_render_plan_does_not_replan(tmp_path, monkeypatch):
+    """render_plan は build_edit_plan を呼ばない（計画の再計算をしない）。"""
+    _make_project(tmp_path)
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] あいう\n", encoding="utf-8")
+    plan = render.build_edit_plan(str(txt))
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("build_edit_plan を再実行してはいけない")
+
+    monkeypatch.setattr(render, "build_edit_plan", _fail)
+    render.render_plan(plan, tmp_path / "direct.wav")
+
+
 def test_render_end_to_end_delete_word(tmp_path):
     import soundfile as sf
 
