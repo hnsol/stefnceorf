@@ -179,9 +179,11 @@ def test_embed_json_keeps_japanese_raw():
 def _make_project(tmp_path, sr=16000):
     """レビュー検証用の最小プロジェクト。
 
-    0001 speech: あ[0,1)220 / えー[1.1,1.6)440(suggest) / い[1.8,2.8)660
+    0001 speech: あ[0,1)220 / えー[1.1,1.6)440(suggest) / い[1.8,2.65)660
+    （2.65〜2.8 は既知無音。0002 削除時のガード用ポーズに使う）
     0002 unrecognized(uts): [2.8,3.8)
-    0003 speech: う[3.8,4.8)880
+    （3.8〜3.95 も既知無音。ガード用ポーズの残り半分に使う）
+    0003 speech: う[3.95,4.8)880
     （長無音 4.8〜7.0 = 2.2s > gap_threshold → 無音トリム対象）
     0004 speech: え[7.0,8.0)330
     """
@@ -197,9 +199,9 @@ def _make_project(tmp_path, sr=16000):
 
     _tone(0.0, 1.0, 220.0)
     _tone(1.1, 1.6, 440.0)
-    _tone(1.8, 2.8, 660.0)
+    _tone(1.8, 2.65, 660.0)
     _tone(2.8, 3.8, 550.0)
-    _tone(3.8, 4.8, 880.0)
+    _tone(3.95, 4.8, 880.0)
     _tone(7.0, 8.0, 330.0)
 
     wav = tmp_path / "input.wav"
@@ -210,7 +212,9 @@ def _make_project(tmp_path, sr=16000):
         "language": "ja",
         "model": "test",
         "pause_threshold": 0.15,
-        "silences": [[1.0, 1.1], [1.6, 1.8], [4.8, 7.0]],
+        "silences": [
+            [1.0, 1.1], [1.6, 1.8], [2.65, 2.8], [3.8, 3.95], [4.8, 7.0],
+        ],
         "trim_silences": [[4.8, 7.0]],
         "segments": [
             {
@@ -221,7 +225,7 @@ def _make_project(tmp_path, sr=16000):
                      "probability": 0.9, "block": 0},
                     {"word": "えー", "start": 1.1, "end": 1.6,
                      "probability": 0.9, "block": 1, "suggest": True},
-                    {"word": "い", "start": 1.8, "end": 2.8,
+                    {"word": "い", "start": 1.8, "end": 2.65,
                      "probability": 0.9, "block": 2},
                 ],
             },
@@ -238,7 +242,7 @@ def _make_project(tmp_path, sr=16000):
                 "id": "0003",
                 "text": "う",
                 "words": [
-                    {"word": "う", "start": 3.8, "end": 4.8,
+                    {"word": "う", "start": 3.95, "end": 4.8,
                      "probability": 0.9, "block": 3},
                 ],
             },
@@ -676,17 +680,22 @@ def test_state_label_combinations():
     assert review.state_label(False, True) == "削除（手動編集）"
 
 
-def test_state_label_unconditional_cut_for_plain_unrecognized():
-    """無印の未認識区間（reason が uts でない）は無条件カットのため専用文言にする。"""
-    assert review.state_label(
-        True, True, kind="unrecognized", reason=None
-    ) == "削除（無条件）"
-    # UTS（reason: "uts"）は従来どおり「削除」
-    assert review.state_label(
-        True, True, kind="unrecognized", reason="uts"
-    ) == "削除"
-    # 通常発話行は従来どおり「削除」
+def test_state_label_unrecognized_effective_delete_is_just_deleted():
+    """未認識/UTS も guarded cut で削除できた場合は他の行と同じ「削除」にする。
+
+    未認識/UTS の削除は元位置ポーズ0.25秒を条件とする guarded cut になった
+    ため、無印の未認識行専用の「削除（無条件）」文言は廃止した。
+    """
+    assert review.state_label(True, True, kind="unrecognized", reason=None) == "削除"
+    assert review.state_label(True, True, kind="unrecognized", reason="uts") == "削除"
     assert review.state_label(True, True, kind="speech", reason=None) == "削除"
+
+
+def test_plain_unrecognized_uses_safety_label_when_pause_is_short():
+    assert review.state_label(
+        True, False, kind="unrecognized", reason=None,
+        unsafe_reason="pause",
+    ) == "ポーズ不足のため保持"
 
 
 def test_review_data_reports_requested_and_effective(tmp_path):
@@ -835,15 +844,27 @@ def test_serve_html_state_span_has_unsafe_class(tmp_path):
     assert 'class="state unsafe" data-i="0"' in transcript
 
 
-def test_segment_markup_shows_unconditional_label_for_plain_unrecognized():
-    """UTS でない無印の未認識行は「削除（無条件）」と表示する。"""
+def test_segment_markup_shows_deleted_label_for_plain_unrecognized():
+    """UTS でない無印の未認識行も、実際に削除できれば「削除」と表示する。"""
     seg = {
         "index": 0, "id": "0002", "kind": "unrecognized", "reason": None,
         "effective_delete": True, "requested_delete": True, "deleted": True,
         "ts": "00:02", "words": [], "label": "⚠ 未認識区間 1.0秒（音声保持）",
     }
     markup = review._segment_markup(seg, serve=True)
-    assert '<span class="state" data-i="0">削除（無条件）</span>' in markup
+    assert '<span class="state" data-i="0">削除</span>' in markup
+
+
+def test_segment_markup_shows_pause_label_when_unsafe_reason_is_pause():
+    """unsafe_reason が pause のときは「ポーズ不足のため保持」を表示する。"""
+    seg = {
+        "index": 0, "id": "0002", "kind": "unrecognized", "reason": None,
+        "effective_delete": False, "requested_delete": True, "deleted": True,
+        "unsafe_reason": "pause",
+        "ts": "00:02", "words": [], "label": "⚠ 未認識区間 1.0秒（音声保持）",
+    }
+    markup = review._segment_markup(seg, serve=True)
+    assert '<span class="state unsafe" data-i="0">ポーズ不足のため保持</span>' in markup
 
 
 def test_serve_script_plays_preview_immediately_on_response(tmp_path):

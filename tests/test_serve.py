@@ -1134,9 +1134,84 @@ def test_save_endpoint_reports_manual_edit_error(server):
 
 # ---- UTS 行のトグル ----
 
+def _uts_safe_cut_session(tmp_path, sr=16000):
+    """UTS 前後に既知無音があり guarded pause（0.25秒）が成功する最小プロジェクト。
+
+    0003 を TXT に残したまま検証する（guarded cut の直後の行が丸ごと削除される
+    構成は既存の別バグを誘発するため、この検証では避ける）。
+
+    0001 speech: あ[0,1) / い[1.8,2.65)
+    0002 unrecognized(uts): [2.8,3.8)（前後の既知無音でガード用ポーズを確保→安全カット）
+    0003 speech: う[3.95,4.8)
+    """
+    import soundfile as sf
+
+    total_s = 5.0
+    audio = np.zeros(int(round(total_s * sr)))
+
+    def _tone(start, end, freq):
+        t = np.arange(int(round((end - start) * sr))) / sr
+        a = int(round(start * sr))
+        audio[a: a + len(t)] = 0.3 * np.sin(2 * np.pi * freq * t)
+
+    _tone(0.0, 1.0, 220.0)
+    _tone(1.8, 2.65, 660.0)
+    _tone(2.8, 3.8, 550.0)
+    _tone(3.95, 4.8, 880.0)
+
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), audio, sr, subtype="PCM_16")
+
+    data = {
+        "source_wav": str(wav.resolve()),
+        "language": "ja",
+        "model": "test",
+        "pause_threshold": 0.15,
+        "silences": [[2.65, 2.8], [3.8, 3.95]],
+        "segments": [
+            {
+                "id": "0001",
+                "text": "あい",
+                "words": [
+                    {"word": "あ", "start": 0.0, "end": 1.0,
+                     "probability": 0.9, "block": 0},
+                    {"word": "い", "start": 1.8, "end": 2.65,
+                     "probability": 0.9, "block": 1},
+                ],
+            },
+            {
+                "id": "0002",
+                "kind": "unrecognized",
+                "reason": "uts",
+                "source_start": 2.8,
+                "source_end": 3.8,
+                "text": "",
+                "words": [],
+            },
+            {
+                "id": "0003",
+                "text": "う",
+                "words": [
+                    {"word": "う", "start": 3.95, "end": 4.8,
+                     "probability": 0.9, "block": 2},
+                ],
+            },
+        ],
+    }
+    (tmp_path / "input.sc.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text(
+        "[0001 0:00] あい\n[0002 0:02] 〔未転写発話 1.0秒〕\n[0003 0:03] う\n",
+        encoding="utf-8",
+    )
+    return serve.HlystSession(str(txt)), txt
+
+
 def test_uts_line_is_cut_by_default_and_kept_when_unchecked(tmp_path):
     """UTS 行は〔〕あり＝削除。チェックを外すと行を残して音声が復活する。"""
-    session, txt = _session(tmp_path)
+    session, txt = _uts_safe_cut_session(tmp_path)
     data = session.review_data(session.raw_text, session.plan)
     seg = _seg(data["segments"], "0002")
     assert seg["toggle"] == "bracket"
@@ -1172,6 +1247,107 @@ def test_unsafe_uts_is_requested_but_kept(tmp_path):
     session = serve.HlystSession(str(txt))
     seg = _seg(session.review_data(session.raw_text, session.plan)["segments"], "0002")
     assert (seg["requested_delete"], seg["effective_delete"]) == (True, False)
+
+
+# ---- ポーズ不足で保持される未認識行の状態表示（Task 3） ----
+
+def _short_pause_unrecognized_session(tmp_path, sr=16000):
+    """未認識区間の前後に既知無音が無く、guarded pause が失敗する最小プロジェクト。
+
+    0001 speech: あ[0,1)
+    0002 unrecognized: [1.0,2.0)（前後に既知無音が無く、ポーズ0.25秒を確保できない）
+    0003 speech: い[3.0,4.0)
+    """
+    import soundfile as sf
+
+    total_s = 4.0
+    audio = np.zeros(int(round(total_s * sr)))
+
+    def _tone(start, end, freq):
+        t = np.arange(int(round((end - start) * sr))) / sr
+        a = int(round(start * sr))
+        audio[a: a + len(t)] = 0.3 * np.sin(2 * np.pi * freq * t)
+
+    _tone(0.0, 1.0, 220.0)
+    _tone(1.0, 2.0, 550.0)
+    _tone(3.0, 4.0, 440.0)
+
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), audio, sr, subtype="PCM_16")
+
+    data = {
+        "source_wav": str(wav.resolve()),
+        "language": "ja",
+        "model": "test",
+        "pause_threshold": 0.15,
+        "silences": [],
+        "segments": [
+            {
+                "id": "0001",
+                "text": "あ",
+                "words": [
+                    {"word": "あ", "start": 0.0, "end": 1.0,
+                     "probability": 0.9, "block": 0},
+                ],
+            },
+            {
+                "id": "0002",
+                "kind": "unrecognized",
+                "source_start": 1.0,
+                "source_end": 2.0,
+                "text": "",
+                "words": [],
+            },
+            {
+                "id": "0003",
+                "text": "い",
+                "words": [
+                    {"word": "い", "start": 3.0, "end": 4.0,
+                     "probability": 0.9, "block": 1},
+                ],
+            },
+        ],
+    }
+    (tmp_path / "input.sc.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text(
+        "[0001 0:00] あ\n[0003 0:03] い\n", encoding="utf-8",
+    )
+    return serve.HlystSession(str(txt)), txt
+
+
+def _delete_toggle():
+    return [{"type": "line", "id": "0002", "delete": True}]
+
+
+def _target():
+    return {"type": "line", "id": "0002"}
+
+
+def _state(payload):
+    seg = _seg(payload["segments"], "0002")
+    return (seg["requested_delete"], seg["effective_delete"])
+
+
+def test_hlyst_preview_reports_requested_but_kept_for_short_pause(tmp_path):
+    session, _txt = _short_pause_unrecognized_session(tmp_path)
+    data = session.review_data(session.raw_text, session.plan)
+    seg = next(s for s in data["segments"] if s["kind"] == "unrecognized")
+    assert seg["requested_delete"] is True
+    assert seg["effective_delete"] is False
+    assert seg["state"] == "ポーズ不足のため保持"
+
+
+def test_preview_and_save_agree_on_pause_unsafe_state(tmp_path):
+    session, txt = _short_pause_unrecognized_session(tmp_path)
+    before = txt.read_bytes()
+    preview = session.preview(_delete_toggle(), _target())
+    saved = session.save(_delete_toggle())
+    assert _state(preview) == _state(saved) == (True, False)
+    # unsafe 項目（0002）は既に行が無い状態のまま。〔〕や行を勝手に復元しない。
+    assert txt.read_bytes() == before
 
 
 # ---- 画面スクリプトが期待する payload の形 ----

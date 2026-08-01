@@ -309,6 +309,8 @@ def build_review_data(
                 }
             )
 
+        requested_delete_val = bool(req_segments.get(seg_id, deleted))
+        unsafe_reason = plan.guarded_cut_reasons.get(seg_id)
         out_segments.append(
             {
                 "id": seg_id,
@@ -316,8 +318,16 @@ def build_review_data(
                 "kind": seg.get("kind", "speech"),
                 "reason": seg.get("reason"),
                 "deleted": deleted,
-                "requested_delete": bool(req_segments.get(seg_id, deleted)),
+                "requested_delete": requested_delete_val,
                 "effective_delete": effective_delete,
+                "unsafe_reason": unsafe_reason,
+                "state": state_label(
+                    requested_delete_val,
+                    effective_delete,
+                    seg.get("kind", "speech"),
+                    seg.get("reason"),
+                    unsafe_reason,
+                ),
                 "toggle": (
                     "bracket"
                     if seg.get("kind") == "unrecognized" and seg.get("reason") == "uts"
@@ -404,20 +414,27 @@ def _relative_media(target: Path, html_dir: Path) -> str:
 
 
 def state_label(
-    requested: bool, effective: bool, kind: str = "speech", reason: str | None = None
+    requested: bool,
+    effective: bool,
+    kind: str = "speech",
+    reason: str | None = None,
+    unsafe_reason: str | None = None,
 ) -> str:
     """requested / effective の組み合わせから状態表示文言を返す（純関数）。
 
-    ON かつ EditPlan でも削除 → 「削除」。ただし reason が "uts" でない
-    unrecognized 行（無印の未認識区間）は安全判定を通らない無条件カットなので
-    「削除（無条件）」と区別する。ON だが安全判定で残った → 「unsafeのため保持」。
-    OFF なのに音が無い（手でテキストを消した等）→ 「削除（手動編集）」。
+    未認識/UTS の削除も guarded cut（元位置ポーズ0.25秒の確保が条件）になった
+    ため、ON かつ EditPlan でも削除 → 常に「削除」（無条件カット専用の文言は
+    廃止）。ON だが安全判定で残った場合は unsafe_reason で文言を分ける:
+    "pause"（元位置のポーズを確保できない）→「ポーズ不足のため保持」、それ
+    以外（境界RMS等）→「unsafeのため保持」。OFF なのに音が無い（手でテキスト
+    を消した等）→「削除（手動編集）」。kind/reason は将来の分岐用に引数として
+    残すが、現状の判定には使わない。
     """
     if requested and effective:
-        if kind == "unrecognized" and reason != "uts":
-            return "削除（無条件）"
         return "削除"
     if requested and not effective:
+        if unsafe_reason == "pause":
+            return "ポーズ不足のため保持"
         return "unsafeのため保持"
     if effective:
         return "削除（手動編集）"
@@ -484,7 +501,8 @@ def _segment_markup(seg: dict, serve: bool = False) -> str:
         is_unsafe = seg["requested_delete"] and not seg["effective_delete"]
         state_classes = "state unsafe" if is_unsafe else "state"
         label = state_label(
-            seg["requested_delete"], seg["effective_delete"], seg["kind"], seg["reason"]
+            seg["requested_delete"], seg["effective_delete"], seg["kind"], seg["reason"],
+            seg.get("unsafe_reason"),
         )
         parts.append(
             f'<span class="{state_classes}" data-i="{seg["index"]}">'
@@ -979,12 +997,11 @@ _SERVE_SCRIPT = """<script>
     absPos.textContent = formatTime(entry.windowStart);
   }
 
-  function stateLabel(requested, effective, kind, reason) {
-    if (requested && effective) {
-      if (kind === "unrecognized" && reason !== "uts") { return "削除（無条件）"; }
-      return "削除";
+  function stateLabel(requested, effective, unsafeReason) {
+    if (requested && effective) { return "削除"; }
+    if (requested) {
+      return unsafeReason === "pause" ? "ポーズ不足のため保持" : "unsafeのため保持";
     }
-    if (requested) { return "unsafeのため保持"; }
     if (effective) { return "削除（手動編集）"; }
     return "保持";
   }
@@ -1001,7 +1018,7 @@ _SERVE_SCRIPT = """<script>
       var state = line.querySelector(".state");
       if (state) {
         state.textContent = stateLabel(
-          seg.requested_delete, seg.effective_delete, seg.kind, seg.reason
+          seg.requested_delete, seg.effective_delete, seg.unsafe_reason
         );
         state.classList.toggle("unsafe", isUnsafe);
       }
@@ -1049,6 +1066,8 @@ _SERVE_SCRIPT = """<script>
       if (!fresh) { return; }
       seg.requested_delete = fresh.requested_delete;
       seg.effective_delete = fresh.effective_delete;
+      seg.unsafe_reason = fresh.unsafe_reason;
+      seg.state = fresh.state;
       seg.output = fresh.output;
       seg.words.forEach(function (w) {
         var fw = findWord(fresh, w.index);

@@ -726,7 +726,12 @@ def preview_center(plan, data: dict, target: dict) -> dict:
         effective = seg["effective_delete"]
 
     if requested and not effective:
-        message = "現在案プレビュー：安全判定により保持"
+        reason = plan.guarded_cut_reasons.get(seg["id"])
+        message = (
+            "現在案プレビュー：ポーズ不足のため保持"
+            if reason == "pause"
+            else "現在案プレビュー：安全判定により保持"
+        )
     elif requested:
         message = "現在案プレビュー：削除"
     else:
