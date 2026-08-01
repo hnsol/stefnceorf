@@ -431,6 +431,12 @@ h1 { font-size: 1.2rem; margin: 0 0 .5rem; }
   font-size: .85rem; padding: .5rem .75rem; margin: 0 0 1rem;
   border-left: 3px solid #c90; background: rgba(204,153,0,.12);
 }
+/* 操作エリアはスクロールしても画面上部に固定する（Canvas は color-scheme 追従の背景色） */
+.controls {
+  position: sticky; top: 0; z-index: 10; background: Canvas;
+  padding: .5rem 0 .25rem; border-bottom: 1px solid rgba(127,127,127,.4);
+  margin-bottom: .75rem;
+}
 .players { display: flex; flex-wrap: wrap; gap: 1rem; margin-bottom: .75rem; }
 .players div { display: flex; align-items: center; gap: .5rem; }
 .players audio { height: 2rem; }
@@ -471,6 +477,7 @@ h1 { font-size: 1.2rem; margin: 0 0 .5rem; }
 <body>
 <h1>$title</h1>
 <p class="note">$note</p>
+<div class="controls">
 <div class="players">
   <div><span>原音</span><audio id="audio-src" controls preload="metadata" src="$source_audio"></audio></div>
   <div><span>編集後</span><audio id="audio-out" controls preload="metadata" src="$review_audio"></audio></div>
@@ -486,6 +493,7 @@ h1 { font-size: 1.2rem; margin: 0 0 .5rem; }
   <li><span class="trim" style="display:inline">✂ 無音トリム</span></li>
   <li>行・単語をクリックすると前後 $pad 秒を再生します</li>
 </ul>
+</div>
 <pre class="stats">$stats</pre>
 <div id="transcript">
 $transcript
