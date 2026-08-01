@@ -94,22 +94,31 @@ def _build_project(tmp_path, segments, sr=SR, subtype="PCM_16", blocks=None,
     return wav, "\n".join(default_lines) + "\n"
 
 
-def _build_unrecognized_project(tmp_path, unrecognized_dur=2.0):
-    """前後speech間に長尺の未認識有声音を持つ合成projectを作る。"""
-    durations = (1.0, unrecognized_dur, 1.0)
-    freqs = (200.0, 400.0, 600.0)
+def _build_unrecognized_project(tmp_path, unrecognized_dur=2.0, gap=0.2):
+    """前後speech間に長尺の未認識有声音を持つ合成projectを作る。
+
+    未認識行の削除は元位置の既知無音から0.25秒のポーズを確保できることが条件
+    （guarded cut）なので、未認識区間の前後に実無音と `silences` を置く。
+    """
     parts = []
-    for duration, freq in zip(durations, freqs):
+    for duration, freq in ((1.0, 200.0), (unrecognized_dur, 400.0), (1.0, 600.0)):
         t = np.arange(int(round(duration * SR))) / SR
         parts.append(0.3 * np.sin(2 * np.pi * freq * t))
+        parts.append(np.zeros(int(round(gap * SR))))
+    parts.pop()  # 末尾の無音は付けない
     wav = tmp_path / "input.wav"
     sf.write(str(wav), np.concatenate(parts), SR, subtype="PCM_16")
 
-    unrecognized_end = 1.0 + unrecognized_dur
+    unrecognized_start = 1.0 + gap
+    unrecognized_end = unrecognized_start + unrecognized_dur
+    next_start = unrecognized_end + gap
     data = {
         "source_wav": str(wav.resolve()),
         "language": "ja",
         "model": "test",
+        "silences": [
+            [1.0, unrecognized_start], [unrecognized_end, next_start]
+        ],
         "segments": [
             {
                 "id": "0001",
@@ -124,15 +133,15 @@ def _build_unrecognized_project(tmp_path, unrecognized_dur=2.0):
                 "text": "⚠ 未認識区間",
                 "words": [],
                 "kind": "unrecognized",
-                "source_start": 1.0,
+                "source_start": unrecognized_start,
                 "source_end": unrecognized_end,
             },
             {
                 "id": "0003",
                 "text": "後",
                 "words": [
-                    {"word": "後", "start": unrecognized_end,
-                     "end": unrecognized_end + 1.0, "probability": 0.9},
+                    {"word": "後", "start": next_start,
+                     "end": next_start + 1.0, "probability": 0.9},
                 ],
             },
         ],
@@ -207,7 +216,8 @@ def test_unrecognized_deleted_line_is_not_restored_as_pure_silence(tmp_path):
     audio, sr = sf.read(out)
 
     assert _freq_sequence(audio, sr, [200, 400, 600]) == [200, 600]
-    assert len(audio) <= 2 * sr
+    # 前後1秒の発話＋元位置に残す0.25秒のポーズだけが残る（未認識2秒分は消える）
+    assert len(audio) <= int(round(2.3 * sr))
 
 
 def test_unrecognized_cli_warning_explains_explicit_txt_deletion(monkeypatch, capsys):

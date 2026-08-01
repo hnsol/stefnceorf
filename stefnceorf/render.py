@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -56,10 +56,14 @@ class EditStats:
     lines_total: int               # json のセグメント（行）総数
     lines_deleted: int             # 編集で丸ごと削除された行数
     lines_moved: int               # 並べ替えられた行数
-    uts_requested: int = 0         # 削除指定された（〔〕残し）UTS 行数
-    uts_cut: int = 0               # 安全と判定し精密カットした数
-    uts_skipped_unsafe: int = 0    # 音響的に不安全で残置した数
+    uts_requested: int = 0         # 削除指定された（〔〕残し／行削除）UTS 行数
+    uts_cut: int = 0               # 安全と判定しガード付きカットした数
+    uts_skipped_unsafe: int = 0    # ポーズ不足・境界不良で残置した数
     uts_cut_removed_s: float = 0.0 # UTSカットで削った合計秒
+    unrecognized_requested: int = 0       # 削除指定された（行削除）未認識区間の数
+    unrecognized_cut: int = 0             # 安全と判定しガード付きカットした数
+    unrecognized_skipped_unsafe: int = 0  # ポーズ不足・境界不良で残置した数
+    unrecognized_cut_removed_s: float = 0.0  # 未認識カットで削った合計秒
 
 
 @dataclass(frozen=True)
@@ -98,6 +102,11 @@ class EditPlan:
     silence_trim_boundaries: frozenset[int]
     warnings: list[str]
     stats: EditStats
+    # 削除要求されたのに安全に削除できなかった未認識/UTS セグメントの理由。
+    # 値は "pause"（元位置のポーズ0.25秒を確保できない）/ "boundary"（残す側の
+    # 保持区間に音声が混じる）。安全に削除できた ID は含めない。
+    # 表示側（Hlyst）はこの dict を参照する（警告文字列の解析は禁止）。
+    guarded_cut_reasons: dict[str, str] = field(default_factory=dict)
 
 # フィラー精密カットの定数群
 FILLER_PAUSE_KEEP_S = 0.25  # フィラー削除後に残す間の合計（日本語の句間ポーズ自然域 0.2〜0.35s の下限寄り）
@@ -324,12 +333,10 @@ def snap_with_filler_exemption(
     return snapped - filler_del, extra
 
 
-def boundary_rms(
-    audio, samplerate, t: float, half_window_s: float = RMS_SAFE_WINDOW_S
-) -> float:
-    """時刻 t±half_window_s の RMS を dBFS で返す。範囲はファイル内にクランプ。
+def rms_dbfs_range(audio, samplerate, start: float, end: float) -> float:
+    """区間 [start, end) 秒の RMS を dBFS で返す。範囲はファイル内にクランプ。
 
-    stereo(2D) はチャンネル平均を取ってから RMS を計算する。全ゼロ・空窓は
+    stereo(2D) はチャンネル平均を取ってから RMS を計算する。全ゼロ・空区間は
     -inf 扱い（十分小さい値）とする。dBFS は 20*log10(rms)（フルスケール1.0基準）。
     """
     import numpy as np
@@ -337,8 +344,8 @@ def boundary_rms(
     total = len(audio)
     if total == 0 or samplerate <= 0:
         return float("-inf")
-    a = int(round((t - half_window_s) * samplerate))
-    b = int(round((t + half_window_s) * samplerate))
+    a = int(round(start * samplerate))
+    b = int(round(end * samplerate))
     a = max(0, a)
     b = min(total, b)
     if b <= a:
@@ -350,6 +357,15 @@ def boundary_rms(
     if rms <= 0.0:
         return float("-inf")
     return 20.0 * float(np.log10(rms))
+
+
+def boundary_rms(
+    audio, samplerate, t: float, half_window_s: float = RMS_SAFE_WINDOW_S
+) -> float:
+    """時刻 t±half_window_s の RMS を dBFS で返す。範囲はファイル内にクランプ。"""
+    return rms_dbfs_range(
+        audio, samplerate, t - half_window_s, t + half_window_s
+    )
 
 
 def filler_cut_is_safe(
@@ -573,6 +589,43 @@ def plan_guarded_pause(
     )
 
 
+def guarded_cut_boundaries_are_safe(
+    audio, samplerate,
+    left_keep: tuple[float, float],
+    right_keep: tuple[float, float],
+    rms_threshold_db: float,
+    window_s: float = RMS_SAFE_WINDOW_S,
+) -> bool:
+    """guarded cut の実際の切断点が「残す側から見て」無音かを検査する（純関数）。
+
+    plan_guarded_pause が返した左右の保持区間から、切断点は
+    left_keep.end（左）と right_keep.start（右）になる。ここで測るのは
+    **残す側**の音だけである（削除される対象音声は出力に現れないため、
+    その音量で判定すると再配分ケースが必ず不合格になる）。
+
+    - 左切断点 t の評価区間は [max(left_keep.start, t - window_s), t]
+    - 右切断点 t の評価区間は [t, min(right_keep.end, t + window_s)]
+
+    つまり窓幅は window_s を上限としつつ、実際に残す既知無音区間へクランプする。
+    これにより窓が隣接発話（保持区間の外側）へはみ出すことも無い。評価区間が
+    空（保持長 0）なら無音である保証が無いので不合格とする。両側とも
+    rms_threshold_db 以下のときだけ True。
+    """
+    l0, l1 = float(left_keep[0]), float(left_keep[1])
+    r0, r1 = float(right_keep[0]), float(right_keep[1])
+
+    l_start = max(l0, l1 - window_s)
+    if l1 <= l_start:
+        return False
+    if rms_dbfs_range(audio, samplerate, l_start, l1) > rms_threshold_db:
+        return False
+
+    r_end = min(r1, r0 + window_s)
+    if r_end <= r0:
+        return False
+    return rms_dbfs_range(audio, samplerate, r0, r_end) <= rms_threshold_db
+
+
 def words_to_intervals(
     words: list[dict],
     keep_indices: set[int],
@@ -660,6 +713,7 @@ def plan_output_intervals(
     filler_spans: list[tuple[float, float]] | None = None,
     filler_pause_keep: float = FILLER_PAUSE_KEEP_S,
     silence_spans: list[tuple[float, float]] | None = None,
+    exact_cut_spans: list[tuple[float, float]] | None = None,
 ) -> tuple[list[tuple[float, float]], list[bool]]:
     """出力順のソース区間列から、ギャップ保持/切り詰めを適用した出力区間列を返す。
 
@@ -667,15 +721,22 @@ def plan_output_intervals(
     g = cur.start - prev.end を次の順に評価する:
 
     1. g < 0（ソースが逆行 = 並べ替え等）: 従来どおり別区間としてクロスフェード結合
-    2. 間に単語（フィラー以外の削除単語）が挟まる: 従来どおりクロスフェード結合
-    3. filler_spans のうち (pe, ns) に重なるものがある: フィラーポーズ分岐。
+    2. exact_cut_spans のうち (pe, ns) に重なるものがある: guarded cut 分岐。
+       未認識区間/UTS の削除で、削除する区間が既に秒単位で確定している
+       （plan_guarded_pause が左右へ 0.25 秒のポーズを配分済み）ケース。
+       重なる span の [a, b] をそのまま切り落とし（前区間終端を a、次区間始端を
+       b にする）単純結合する。ここで追加のポーズ配分はしない。この分岐が
+       単語判定より先に来るのは、削除対象の未認識音声が word_spans に残って
+       いてもギャップ音声を復活させないため。
+    3. 間に単語（フィラー以外の削除単語）が挟まる: 従来どおりクロスフェード結合
+    4. filler_spans のうち (pe, ns) に重なるものがある: フィラーポーズ分岐。
        安全にカットされたフィラーが挟まる無音ギャップなので、削除後に残す間の
        合計を filler_pause_keep に収める。フィラー span の前後で使える無音量
        （pre_avail / post_avail）に応じ、片側 filler_pause_keep/2 を基本とし、
        片側で余った分は他方の avail 範囲で再配分する（合計 =
        min(pre_avail + post_avail, filler_pause_keep)）。無音中のカットなので
        単純結合（cf_flags False）。
-    4. g ≤ gap_threshold: ギャップ音声を保持（連続マージ）
+    5. g ≤ gap_threshold: ギャップ音声を保持（連続マージ）
        g > gap_threshold: silence_spans とギャップの共通部分のうち gap_max を超える
        既知無音だけを gap_max に切り詰める。旧JSON・未知区間・短い既知無音は
        発話の可能性があるため保持する。
@@ -687,6 +748,7 @@ def plan_output_intervals(
         return [], []
 
     fspans = filler_spans or []
+    espans = exact_cut_spans or []
 
     def _known_silence_overlaps(start: float, end: float) -> list[tuple[float, float]]:
         if not silence_spans or end <= start:
@@ -721,15 +783,26 @@ def plan_output_intervals(
             cf_flags.append(True)
             pending = [cur[0], cur[1]]
             continue
+        exact = [(s, e) for s, e in espans if s < ns and e > pe]
+        if exact:
+            # 2. guarded cut（未認識/UTS）→ 確定済み区間を切り落として単純結合。
+            # 前後に残すポーズは既に intervals 側へ含まれているため再配分しない。
+            a = max(pending[0], min(s for s, _e in exact))
+            b = min(cur[1], max(e for _s, e in exact))
+            pending[1] = a
+            out.append((pending[0], pending[1]))
+            cf_flags.append(False)
+            pending = [b, cur[1]]
+            continue
         if _word_in_gap(word_spans, pe, ns):
-            # 2. フィラー以外の削除単語が挟まる → クロスフェード結合
+            # 3. フィラー以外の削除単語が挟まる → クロスフェード結合
             out.append((pending[0], pending[1]))
             cf_flags.append(True)
             pending = [cur[0], cur[1]]
             continue
         overlap = [(s, e) for s, e in fspans if s < ns and e > pe]
         if overlap:
-            # 3. フィラーポーズ分岐（無音中カット → 単純結合）
+            # 4. フィラーポーズ分岐（無音中カット → 単純結合）
             f_start = min(max(s, pe) for s, e in overlap)
             f_end = max(min(e, ns) for s, e in overlap)
             pre_avail = max(0.0, f_start - pe)
@@ -748,7 +821,7 @@ def plan_output_intervals(
             cf_flags.append(False)
             pending = [ns - post_keep, cur[1]]
             continue
-        # 4. 純無音ギャップ
+        # 5. 純無音ギャップ
         if g <= gap_threshold or g <= gap_max:
             pending[1] = cur[1]
             continue
@@ -909,6 +982,7 @@ def format_stats(stats: EditStats, *, gaps_preserved: bool = False) -> list[str]
     - Lines 行は削除/移動が1件以上のとき（括弧内は該当項目のみ）
     - Fillers 行は filler_requested > 0 のとき（残置0なら括弧省略）
     - UTS 行は uts_requested > 0 のとき（残置0なら括弧省略、Fillers と同形式）
+    - Unrecognized 行は unrecognized_requested > 0 のとき（同形式）
     - Silence 行は常時（1箇所は "1 gap"）
     - Duration 行は常時（gaps_preserved=True のとき ", cuts left as gaps" を付記）
     """
@@ -942,6 +1016,19 @@ def format_stats(stats: EditStats, *, gaps_preserved: bool = False) -> list[str]
             line += f", -{stats.uts_cut_removed_s:.1f}s"
         if stats.uts_skipped_unsafe > 0:
             line += f" ({stats.uts_skipped_unsafe} kept: too close to speech)"
+        lines.append(line)
+
+    if stats.unrecognized_requested > 0:
+        line = (
+            f"Unrecognized: cut {stats.unrecognized_cut} "
+            f"of {stats.unrecognized_requested}"
+        )
+        if stats.unrecognized_cut_removed_s > 0:
+            line += f", -{stats.unrecognized_cut_removed_s:.1f}s"
+        if stats.unrecognized_skipped_unsafe > 0:
+            line += (
+                f" ({stats.unrecognized_skipped_unsafe} kept: too close to speech)"
+            )
         lines.append(line)
 
     gap_word = "gap" if stats.silence_trim_count == 1 else "gaps"
@@ -1094,21 +1181,141 @@ def build_edit_plan_from_text(
 
     plan_intervals: list[tuple[float, float]] = []
     all_warnings: list[str] = []
-    # 安全に精密カットされた区間の span（片側ポーズ残しの分岐判定に使う）。
-    # フィラーとUTSで別リストに保持しつつ、plan_output_intervals へ渡す際は
-    # 合算した precise_cut_spans として扱う（どちらも「無音中の精密カット」で
-    # 同じポーズ保持ロジックが適用できるため）。
-    # スナップ後の値を持つため、word_spans からの除外は値一致でなく (seg_id, wi)
-    # キーで行う（スナップで元 span と一致しなくなるため）。
+
+    # ---- 未認識区間 / UTS の guarded cut ----
+    # 削除要求は「元位置の検出済み無音から合計 0.25 秒のポーズを確保できる」
+    # かつ「そのポーズ（残す側）に音声が混じっていない」ときだけ実行する。
+    # 足りなければ対象音声を保持し、理由を guarded_cut_reasons へ記録する。
+    guarded_cut_reasons: dict[str, str] = {}
+
+    def _guarded_cut_span(
+        seg_id: str, start: float, end: float
+    ) -> tuple[tuple[float, float] | None, str | None]:
+        """(切り落とす区間, 保持理由) を返す。カットできるなら理由は None。"""
+        prev_end, next_start = seg_bounds.get(seg_id, (0.0, file_length_s))
+        keeps = plan_guarded_pause(start, end, prev_end, next_start, silences)
+        if keeps is None:
+            return None, "pause"
+        left_keep, right_keep = keeps
+        if not guarded_cut_boundaries_are_safe(
+            audio, samplerate, left_keep, right_keep, rms_threshold
+        ):
+            return None, "boundary"
+        # 削除するのは対象音声＋余分な周辺無音。残る元位置無音がちょうど 0.25 秒。
+        return (left_keep[1], right_keep[0]), None
+
+    def _guarded_label(seg: dict) -> str:
+        if seg.get("reason") == "uts":
+            duration = max(
+                0.0, float(seg["source_end"]) - float(seg["source_start"])
+            )
+            return f"未転写発話〔{duration:.1f}秒〕"
+        return "未認識区間"
+
+    def _guarded_keep_warning(seg_id: str, seg: dict, reason: str) -> str:
+        label = _guarded_label(seg)
+        if reason == "pause":
+            return (
+                f"[{seg_id}] {label}は元位置のポーズを"
+                "0.25秒確保できないため残しました"
+            )
+        return f"[{seg_id}] {label}は前後の音声と連続しているため残しました"
+
+    # 安全にカットされた区間の span（後段の分岐判定に使う）。
+    # フィラーは谷スナップ＋ポーズ再配分の filler_spans 経路、未認識/UTS は
+    # 秒が確定済みの exact_cut_spans 経路と、渡し先が異なるため別リストで持つ。
+    # フィラーはスナップ後の値を持つため、word_spans からの除外は値一致でなく
+    # (seg_id, wi) キーで行う（スナップで元 span と一致しなくなるため）。
     filler_cut_spans: list[tuple[float, float]] = []
     uts_cut_spans: list[tuple[float, float]] = []
     safe_filler_keys: set[tuple[str, int]] = set()
     safe_uts_ids: set[str] = set()
+    unrecognized_cut_spans: list[tuple[float, float]] = []
+    safe_unrecognized_ids: set[str] = set()
     filler_requested = 0        # 削除指定されたフィラー総数（統計用）
     filler_skipped_unsafe = 0   # 音響的に不安全で残置した数（統計用）
-    uts_requested = 0           # 削除指定された（〔〕残し）UTS総数（統計用）
-    uts_skipped_unsafe = 0      # 音響的に不安全で残置した数（統計用）
-    for seg_id, edited, brackets in parsed:
+    uts_requested = 0           # 削除指定された（〔〕残し／行削除）UTS総数（統計用）
+    uts_skipped_unsafe = 0      # 安全に削除できず残置した数（統計用）
+    unrecognized_requested = 0      # 行削除指定された未認識区間の数（統計用）
+    unrecognized_skipped_unsafe = 0 # 安全に削除できず残置した数（統計用）
+
+    # ---- 行ごと削除された未認識/UTS の guarded 判定（TXT に現れないため先に処理） ----
+    # 保持する場合の挿入位置は「JSON 元順で直前にある、TXT に残った行」の直後。
+    # 前アンカーが無ければ後アンカーの直前、どちらも無ければ末尾へ置く。
+    kept_pos = {seg_id: i for i, (seg_id, _t, _b) in enumerate(parsed)}
+    ordered_ids = [seg["id"] for seg, _s, _e in ordered]
+    insert_before: dict[int, list[tuple[float, float]]] = {}
+    insert_after: dict[int, list[tuple[float, float]]] = {}
+    trailing_intervals: list[tuple[float, float]] = []
+    guarded_line_ids: set[str] = set()          # 行削除要求された未認識/UTS
+    guarded_line_removed_s: dict[str, float] = {}  # 実際に削れた秒（保持なら 0）
+
+    def _place_kept_interval(
+        k: int, seg_id: str, interval: tuple[float, float]
+    ) -> None:
+        prev_anchor = next(
+            (ordered_ids[j] for j in range(k - 1, -1, -1)
+             if ordered_ids[j] in kept_pos),
+            None,
+        )
+        next_anchor = next(
+            (ordered_ids[j] for j in range(k + 1, len(ordered_ids))
+             if ordered_ids[j] in kept_pos),
+            None,
+        )
+        if prev_anchor is not None:
+            insert_after.setdefault(kept_pos[prev_anchor], []).append(interval)
+            if (
+                next_anchor is not None
+                and kept_pos[next_anchor] < kept_pos[prev_anchor]
+            ):
+                # 前後アンカーが並べ替えで逆転し一意に挿入できない。安全側へ倒し
+                # 前アンカーの直後へ置いたことを知らせる（音声は失わない）。
+                all_warnings.append(
+                    f"[{seg_id}] 前後の行が並べ替えられているため、"
+                    f"残した音声は [{prev_anchor}] の直後に置きました"
+                )
+        elif next_anchor is not None:
+            insert_before.setdefault(kept_pos[next_anchor], []).append(interval)
+        else:
+            trailing_intervals.append(interval)
+
+    for k, sid in enumerate(ordered_ids):
+        if sid in kept_pos:
+            continue
+        seg = seg_map[sid]
+        if seg.get("kind") != "unrecognized":
+            continue  # 通常 speech 行の削除は従来どおり無条件
+        guarded_line_ids.add(sid)
+        guarded_line_removed_s[sid] = 0.0
+        start = float(seg["source_start"])
+        end = float(seg["source_end"])
+        is_uts = seg.get("reason") == "uts"
+        if is_uts:
+            uts_requested += 1
+        else:
+            unrecognized_requested += 1
+        span, reason = _guarded_cut_span(sid, start, end)
+        if span is not None:
+            if span[1] > span[0]:
+                guarded_line_removed_s[sid] = span[1] - span[0]
+                if is_uts:
+                    uts_cut_spans.append(span)
+                else:
+                    unrecognized_cut_spans.append(span)
+            (safe_uts_ids if is_uts else safe_unrecognized_ids).add(sid)
+            continue
+        guarded_cut_reasons[sid] = reason
+        all_warnings.append(_guarded_keep_warning(sid, seg, reason))
+        if is_uts:
+            uts_skipped_unsafe += 1
+        else:
+            unrecognized_skipped_unsafe += 1
+        if end > start:
+            _place_kept_interval(k, sid, (start, end))
+
+    for i, (seg_id, edited, brackets) in enumerate(parsed):
+        plan_intervals.extend(insert_before.get(i, ()))
         seg = seg_map.get(seg_id)
         if seg is None:
             raise ValueError(f"json に存在しない ID です: [{seg_id}]")
@@ -1116,30 +1323,27 @@ def build_edit_plan_from_text(
             start = float(seg["source_start"])
             end = float(seg["source_end"])
             # UTS（reason:"uts"）で 〔〕 が編集後テキストに残っている＝削除指定。
-            # フィラーと同じ精密カット経路（谷スナップ＋安全判定＋0.25秒ポーズ保持）
-            # を UTS 島区間 [start, end] に適用する。unsafe なら自動削除せず
-            # 音声保持（従来の unrecognized 保持と同じ）に倒し警告する。
+            # 行ごと削除した場合とまったく同じ guarded cut 判定を適用する
+            # （元位置ポーズ0.25秒＋残す側の境界RMS）。確保できなければ自動削除
+            # せず音声保持（従来の unrecognized 保持と同じ）に倒し警告する。
             if seg.get("reason") == "uts" and brackets:
                 uts_requested += 1
-                duration = max(0.0, end - start)
-                lo_seg, hi_seg = seg_bounds.get(seg_id, (0.0, file_length_s))
-                cut = plan_filler_cut(
-                    audio, samplerate, {"start": start, "end": end},
-                    lo_seg, hi_seg, silences, rms_threshold,
-                )
-                if cut is not None:
-                    uts_cut_spans.append(cut)
+                span, reason = _guarded_cut_span(seg_id, start, end)
+                if span is not None:
+                    if span[1] > span[0]:
+                        uts_cut_spans.append(span)
                     safe_uts_ids.add(seg_id)
                 else:
                     if end > start:
                         plan_intervals.append((start, end))
                     uts_skipped_unsafe += 1
+                    guarded_cut_reasons[seg_id] = reason
                     all_warnings.append(
-                        f"[{seg_id}] 未転写発話〔{duration:.1f}秒〕は"
-                        "前後の音声と連続しているため残しました"
+                        _guarded_keep_warning(seg_id, seg, reason)
                     )
             elif end > start:
                 plan_intervals.append((start, end))
+            plan_intervals.extend(insert_after.get(i, ()))
             continue
         # words は json 由来の共有 dict。谷スナップで start/end を書き換えるため
         # 要素ごとにコピーして他所（後段の word_spans 構築等）への副作用を防ぐ。
@@ -1220,6 +1424,9 @@ def build_edit_plan_from_text(
             split_gap=gap_threshold,
         )
         plan_intervals.extend(intervals)
+        plan_intervals.extend(insert_after.get(i, ()))
+
+    plan_intervals.extend(trailing_intervals)
 
     # 全セグメントのコンテンツ区間（ソース時刻・生値）。未認識行が削除された場合も
     # source span を含め、純無音ギャップとして音声が復活しないようにする。安全カット
@@ -1228,7 +1435,7 @@ def build_edit_plan_from_text(
     content_spans: list[tuple[float, float]] = []
     for seg in segments:
         if seg.get("kind") == "unrecognized":
-            if seg.get("id") in safe_uts_ids:
+            if seg.get("id") in safe_uts_ids or seg.get("id") in safe_unrecognized_ids:
                 continue
             start = float(seg["source_start"])
             end = float(seg["source_end"])
@@ -1243,24 +1450,28 @@ def build_edit_plan_from_text(
             if s is not None and e is not None:
                 content_spans.append((float(s), float(e)))
 
-    # フィラーとUTSの精密カットspanは合算して渡す（どちらも無音中の精密カット
-    # として同じポーズ保持ロジックを適用する）。
-    precise_cut_spans = filler_cut_spans + uts_cut_spans
+    # フィラーの精密カットspanはポーズ再配分つきの分岐へ渡す。未認識/UTS の
+    # guarded cut は秒が確定済みなので exact_cut_spans（単純結合）へ渡す。
+    precise_cut_spans = filler_cut_spans
+    exact_cut_spans = uts_cut_spans + unrecognized_cut_spans
     out_intervals, cf_flags = plan_output_intervals(
         plan_intervals, content_spans, gap_threshold=gap_threshold, gap_max=gap_max,
         filler_spans=precise_cut_spans,
         silence_spans=trim_silences,
+        exact_cut_spans=exact_cut_spans,
     )
 
     # 無音切り詰めの集計。単純結合（cf_flags False）境界の区間間ギャップが削除秒。
-    # ただし精密カットポーズ境界（precise_cut_spans と重なる）は無音切り詰めでないため除外。
+    # ただし精密カットポーズ境界（precise_cut_spans）と guarded cut 境界
+    # （exact_cut_spans）は無音切り詰めでないため除外する。
+    non_trim_spans = precise_cut_spans + exact_cut_spans
     silence_trim_count = 0
     silence_trim_removed_s = 0.0
     silence_trim_boundaries: set[int] = set()
     for k in range(len(out_intervals) - 1):
         if k < len(cf_flags) and not cf_flags[k]:
             pe, ns = out_intervals[k][1], out_intervals[k + 1][0]
-            if not any(s < ns and e > pe for s, e in precise_cut_spans):
+            if not any(s < ns and e > pe for s, e in non_trim_spans):
                 silence_trim_boundaries.add(k)
                 silence_trim_count += 1
                 silence_trim_removed_s += ns - pe
@@ -1275,13 +1486,18 @@ def build_edit_plan_from_text(
     # 行削除で削った合計秒。各セグメントの実音源占有区間はセグメント切り出しと同じ
     # 境界ロジック（ordered: words 先頭start〜末尾end／unrecognized は source_start〜end）
     # を流用する。編集後 txt に現れない seg_id を削除行として合算する。
+    # 未認識/UTS の行削除は guarded 判定に従うので、実際に削れた秒だけを合算する
+    # （保持した行は 0 秒。lines_deleted 自体は TXT 上の削除要求数を維持する）。
     seg_span = {seg["id"]: (start, end) for seg, start, end in ordered}
     kept_ids = {seg_id for seg_id, _, _ in parsed}
-    lines_deleted_removed_s = sum(
-        end - start
-        for sid, (start, end) in seg_span.items()
-        if sid not in kept_ids
-    )
+    lines_deleted_removed_s = 0.0
+    for sid, (start, end) in seg_span.items():
+        if sid in kept_ids:
+            continue
+        if sid in guarded_line_ids:
+            lines_deleted_removed_s += guarded_line_removed_s.get(sid, 0.0)
+        else:
+            lines_deleted_removed_s += end - start
 
     stats = EditStats(
         source_duration_s=file_length_s,
@@ -1300,6 +1516,12 @@ def build_edit_plan_from_text(
         uts_cut=len(safe_uts_ids),
         uts_skipped_unsafe=uts_skipped_unsafe,
         uts_cut_removed_s=sum(e - s for s, e in uts_cut_spans),
+        unrecognized_requested=unrecognized_requested,
+        unrecognized_cut=len(safe_unrecognized_ids),
+        unrecognized_skipped_unsafe=unrecognized_skipped_unsafe,
+        unrecognized_cut_removed_s=sum(
+            e - s for s, e in unrecognized_cut_spans
+        ),
     )
 
     # 通常削除（クロスフェード結合）境界が発話に食い込んでいないかを警告のみ出す
@@ -1321,6 +1543,7 @@ def build_edit_plan_from_text(
         silence_trim_boundaries=frozenset(silence_trim_boundaries),
         warnings=all_warnings,
         stats=stats,
+        guarded_cut_reasons=guarded_cut_reasons,
     )
 
 

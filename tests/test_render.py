@@ -927,18 +927,30 @@ def _render_freq_sequence(audio, sr, known, win=0.05, tol=40.0, amp=1e-3):
 
 
 def _render_unrecognized_freqs(tmp_path, txt_body, sr=16000):
+    """前200 / 無音0.2 / 未認識400 / 無音0.2 / 後600 の project をrenderする。
+
+    未認識区間の削除は元位置の既知無音から0.25秒のポーズを確保できることが条件
+    （guarded cut）なので、前後に実無音と `silences` メタデータを置く。
+    """
     import soundfile as sf
 
-    tones = []
-    for freq in (200, 400, 600):
-        t = np.arange(sr) / sr
-        tones.append(0.3 * np.sin(2 * np.pi * freq * t))
+    gap = 0.2
+    audio = np.zeros(int(round((3.0 + 2 * gap) * sr)))
+    spans = [(0.0, 1.0, 200), (1.0 + gap, 2.0 + gap, 400),
+             (2.0 + 2 * gap, 3.0 + 2 * gap, 600)]
+    for start, end, freq in spans:
+        n = int(round((end - start) * sr))
+        t = np.arange(n) / sr
+        audio[int(round(start * sr)):int(round(start * sr)) + n] = (
+            0.3 * np.sin(2 * np.pi * freq * t)
+        )
     wav = tmp_path / "input.wav"
-    sf.write(str(wav), np.concatenate(tones), sr, subtype="PCM_16")
+    sf.write(str(wav), audio, sr, subtype="PCM_16")
     data = {
         "source_wav": str(wav.resolve()),
         "language": "ja",
         "model": "test",
+        "silences": [[1.0, 1.0 + gap], [2.0 + gap, 2.0 + 2 * gap]],
         "segments": [
             {
                 "id": "0001",
@@ -953,14 +965,14 @@ def _render_unrecognized_freqs(tmp_path, txt_body, sr=16000):
                 "text": "⚠ 未認識区間",
                 "words": [],
                 "kind": "unrecognized",
-                "source_start": 1.0,
-                "source_end": 2.0,
+                "source_start": 1.0 + gap,
+                "source_end": 2.0 + gap,
             },
             {
                 "id": "0003",
                 "text": "後",
                 "words": [
-                    {"word": "後", "start": 2.0, "end": 3.0,
+                    {"word": "後", "start": 2.0 + 2 * gap, "end": 3.0 + 2 * gap,
                      "probability": 0.9},
                 ],
             },
@@ -1570,6 +1582,11 @@ def _write_uts_project(tmp_path, gapped: bool, sr=16000):
         "source_wav": str(wav.resolve()),
         "language": "ja",
         "model": "test",
+        # gapped のときだけ UTS 島の前後に既知無音があり guarded cut が成立する。
+        **(
+            {"silences": [[1.0, uts_start], [uts_end, face_start]]}
+            if gapped else {}
+        ),
         "segments": [
             {"id": "0001", "text": "結局",
              "words": [{"word": "結局", "start": 0.0, "end": 1.0, "probability": 0.9}]},
@@ -1678,6 +1695,280 @@ def test_render_uts_unsafe_kept_with_warning(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "残しました" in err
     assert "未転写発話" in err
+
+
+# ---- guarded cut（未認識/UTS を元位置ポーズ0.25秒つきで削除する） ----
+
+def _write_guarded_project(
+    tmp_path,
+    left_silence: float,
+    right_silence: float,
+    mid_dur: float = 0.4,
+    mid_amp: float = 0.3,
+    reason: str | None = None,
+    omit_silence_metadata: bool = False,
+    noisy_left: bool = False,
+    sr: int = 16000,
+):
+    """前200Hz / 無音 / 未認識400Hz / 無音 / 後600Hz の project を書き txt パスを返す。
+
+    無音は実際に digital silence で、`silences` にも同じ区間を書く
+    （omit_silence_metadata=True なら書かない = 未知ギャップ扱い）。
+    noisy_left=True のときは左「無音」区間に 300Hz を鳴らし、メタデータだけが
+    無音を主張する（＝残す側に音声が混じる）状況を作る。
+    """
+    import soundfile as sf
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    prev_end = 1.0
+    mid_start = prev_end + left_silence
+    mid_end = mid_start + mid_dur
+    next_start = mid_end + right_silence
+    total = next_start + 1.0
+
+    audio = np.zeros(int(round(total * sr)))
+
+    def put(s, e, freq, amp=0.3):
+        n = int(round(e * sr)) - int(round(s * sr))
+        if n <= 0:
+            return
+        t = np.arange(n) / sr
+        # 端の値が 0 にならないよう cos を使う（出力の無音長を数えやすくする）
+        audio[int(round(s * sr)):int(round(s * sr)) + n] = (
+            amp * np.cos(2 * np.pi * freq * t)
+        )
+
+    put(0.0, prev_end, 200.0)
+    if noisy_left:
+        put(prev_end, mid_start, 300.0)
+    put(mid_start, mid_end, 400.0, amp=mid_amp)
+    put(next_start, total, 600.0)
+
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), audio, sr, subtype="PCM_16")
+
+    silences = [
+        [a, b]
+        for a, b in ((prev_end, mid_start), (mid_end, next_start))
+        if b > a
+    ]
+    mid_seg = {
+        "id": "0002",
+        "kind": "unrecognized",
+        "source_start": mid_start,
+        "source_end": mid_end,
+        "text": (
+            f"〔未転写発話 {mid_dur:.1f}秒〕" if reason == "uts" else "⚠ 未認識区間"
+        ),
+        "words": [],
+    }
+    if reason is not None:
+        mid_seg["reason"] = reason
+    data = {
+        "source_wav": str(wav.resolve()),
+        "language": "ja",
+        "model": "test",
+        "segments": [
+            {"id": "0001", "text": "前",
+             "words": [{"word": "前", "start": 0.0, "end": prev_end,
+                        "probability": 0.9}]},
+            mid_seg,
+            {"id": "0003", "text": "後",
+             "words": [{"word": "後", "start": next_start, "end": total,
+                        "probability": 0.9}]},
+        ],
+    }
+    if not omit_silence_metadata:
+        data["silences"] = silences
+    (tmp_path / "input.sc.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+    return tmp_path / "input.sc.txt"
+
+
+def _build_deleted_unrecognized_plan(tmp_path, left_silence, right_silence, **kw):
+    txt = _write_guarded_project(tmp_path, left_silence, right_silence, **kw)
+    txt.write_text("[0001] 前\n[0003] 後\n", encoding="utf-8")
+    return render.build_edit_plan(str(txt))
+
+
+def _build_uts_plan(tmp_path, mode: str):
+    txt = _write_guarded_project(tmp_path, 0.20, 0.20, reason="uts")
+    if mode == "line-delete":
+        body = "[0001] 前\n[0003] 後\n"
+    else:
+        body = "[0001] 前\n[0002] 〔未転写発話 0.4秒〕\n[0003] 後\n"
+    txt.write_text(body, encoding="utf-8")
+    return render.build_edit_plan(str(txt))
+
+
+def _guarded_render(plan):
+    import soundfile as sf
+
+    out = plan.txt_path.parent / "guarded.out.wav"
+    render.render_plan(plan, out)
+    audio, sr = sf.read(str(out))
+    if audio.ndim == 2:
+        audio = audio.mean(axis=1)
+    return audio, sr
+
+
+def _middle_tone_is_absent(plan):
+    audio, sr = _guarded_render(plan)
+    return 400 not in _render_freq_sequence(audio, sr, [200, 400, 600])
+
+
+def _middle_tone_is_present(plan):
+    return not _middle_tone_is_absent(plan)
+
+
+def _pause_between_outer_tones(plan):
+    """出力中の最長の無音ラン（秒）。合成音は端も非ゼロなので境界が明確。"""
+    audio, sr = _guarded_render(plan)
+    loud = np.nonzero(np.abs(audio) > 1e-3)[0]
+    if len(loud) < 2:
+        return 0.0
+    return float(np.max(np.diff(loud)) - 1) / sr
+
+
+def test_deleted_unrecognized_row_keeps_full_250ms_source_pause(tmp_path):
+    # 左0.125s + 右0.125sを元位置から残し、中間の未認識音声だけ消える。
+    plan = _build_deleted_unrecognized_plan(
+        tmp_path, left_silence=0.20, right_silence=0.20
+    )
+    assert _middle_tone_is_absent(plan)
+    assert _pause_between_outer_tones(plan) == pytest.approx(0.25, abs=1 / 16000)
+    assert plan.guarded_cut_reasons == {}
+
+
+def test_deleted_unrecognized_row_redistributes_pause(tmp_path):
+    plan = _build_deleted_unrecognized_plan(
+        tmp_path, left_silence=0.05, right_silence=0.30
+    )
+    assert _middle_tone_is_absent(plan)
+    assert _pause_between_outer_tones(plan) == pytest.approx(0.25, abs=1 / 16000)
+
+
+def test_deleted_unrecognized_row_is_kept_when_pause_is_short(tmp_path):
+    plan = _build_deleted_unrecognized_plan(
+        tmp_path, left_silence=0.10, right_silence=0.10
+    )
+    assert _middle_tone_is_present(plan)
+    assert any(
+        "ポーズを0.25秒確保できないため残しました" in w for w in plan.warnings
+    )
+    assert plan.guarded_cut_reasons == {"0002": "pause"}
+
+
+def test_deleted_uts_row_and_bracketed_uts_share_guard(tmp_path):
+    line_deleted = _build_uts_plan(tmp_path / "line", mode="line-delete")
+    bracketed = _build_uts_plan(tmp_path / "bracket", mode="bracket-delete")
+    assert line_deleted.output_intervals == bracketed.output_intervals
+    assert line_deleted.stats.uts_cut == bracketed.stats.uts_cut == 1
+
+
+def test_guarded_cut_does_not_use_unknown_gap_as_pause(tmp_path):
+    plan = _build_deleted_unrecognized_plan(
+        tmp_path,
+        left_silence=0.20,
+        right_silence=0.20,
+        omit_silence_metadata=True,
+    )
+    assert _middle_tone_is_present(plan)
+    assert plan.guarded_cut_reasons == {"0002": "pause"}
+
+
+def test_guarded_cut_redistributes_50ms_left_pause(tmp_path):
+    # 左50ms（0.125s未満）でも右200msから補って合計0.25sを確保できる。
+    plan = _build_deleted_unrecognized_plan(
+        tmp_path, left_silence=0.05, right_silence=0.20
+    )
+    assert _middle_tone_is_absent(plan)
+    assert _pause_between_outer_tones(plan) == pytest.approx(0.25, abs=1 / 16000)
+
+
+def test_guarded_cut_allows_loud_target_when_kept_side_is_silent(tmp_path):
+    # 削除対象が大音量でも、残す側（保持する無音）が静かなら削除できる。
+    plan = _build_deleted_unrecognized_plan(
+        tmp_path, left_silence=0.20, right_silence=0.20, mid_amp=0.95
+    )
+    assert _middle_tone_is_absent(plan)
+    assert plan.guarded_cut_reasons == {}
+
+
+def test_guarded_cut_keeps_row_when_kept_pause_contains_speech(tmp_path):
+    # メタデータ上は無音でも、残す側に音声が混じっていれば boundary で保持。
+    plan = _build_deleted_unrecognized_plan(
+        tmp_path, left_silence=0.20, right_silence=0.20, noisy_left=True
+    )
+    assert _middle_tone_is_present(plan)
+    assert plan.guarded_cut_reasons == {"0002": "boundary"}
+    assert any("前後の音声と連続しているため残しました" in w for w in plan.warnings)
+
+
+def test_guarded_cut_rms_window_does_not_reach_neighbor_speech(tmp_path):
+    # 左無音が20ms（RMS窓30msより短い）でも、窓は保持区間へクランプされるので
+    # 隣接発話を拾わず削除できる。
+    plan = _build_deleted_unrecognized_plan(
+        tmp_path, left_silence=0.02, right_silence=0.30
+    )
+    assert _middle_tone_is_absent(plan)
+    assert _pause_between_outer_tones(plan) == pytest.approx(0.25, abs=1 / 16000)
+
+
+def test_guarded_cut_boundaries_rejects_empty_keep_window():
+    audio = np.zeros(16000)
+    assert not render.guarded_cut_boundaries_are_safe(
+        audio, 16000, (1.0, 1.0), (1.2, 1.45), -40.0
+    )
+
+
+def test_guarded_cut_stats_for_deleted_unrecognized_rows(tmp_path):
+    cut = _build_deleted_unrecognized_plan(
+        tmp_path / "cut", left_silence=0.20, right_silence=0.20
+    )
+    assert cut.stats.unrecognized_requested == 1
+    assert cut.stats.unrecognized_cut == 1
+    assert cut.stats.unrecognized_skipped_unsafe == 0
+    # 対象0.4s＋余分な周辺無音 0.075s×2 を削り、元位置に0.25sが残る
+    assert cut.stats.unrecognized_cut_removed_s == pytest.approx(0.55)
+    assert cut.stats.lines_deleted == 1
+    assert cut.stats.lines_deleted_removed_s == pytest.approx(0.55)
+    assert cut.stats.silence_trim_count == 0
+
+    kept = _build_deleted_unrecognized_plan(
+        tmp_path / "kept", left_silence=0.10, right_silence=0.10
+    )
+    assert kept.stats.unrecognized_requested == 1
+    assert kept.stats.unrecognized_cut == 0
+    assert kept.stats.unrecognized_skipped_unsafe == 1
+    assert kept.stats.unrecognized_cut_removed_s == 0.0
+    assert kept.stats.lines_deleted == 1
+    assert kept.stats.lines_deleted_removed_s == 0.0
+
+
+def test_guarded_cut_keeps_audio_next_to_reordered_anchor(tmp_path):
+    """前後アンカーが逆転していても音声は失わず、警告を出す。"""
+    txt = _write_guarded_project(tmp_path, 0.10, 0.10)
+    txt.write_text("[0003] 後\n[0001] 前\n", encoding="utf-8")
+    plan = render.build_edit_plan(str(txt))
+    assert _middle_tone_is_present(plan)
+    assert any("並べ替えられているため" in w for w in plan.warnings)
+
+
+def test_format_stats_unrecognized_hidden_when_none_requested():
+    lines = render.format_stats(_stats())
+    assert not any(l.startswith("Unrecognized:") for l in lines)
+
+
+def test_format_stats_unrecognized_with_skip_and_seconds():
+    lines = render.format_stats(
+        _stats(unrecognized_requested=3, unrecognized_cut=2,
+               unrecognized_skipped_unsafe=1, unrecognized_cut_removed_s=0.65)
+    )
+    assert (
+        "Unrecognized: cut 2 of 3, -0.7s (1 kept: too close to speech)" in lines
+    )
 
 
 def test_format_stats_uts_hidden_when_none_requested():

@@ -170,9 +170,12 @@ def test_clip_times_are_sample_exact_with_reorder_gap_and_deterministic(tmp_path
 
 
 def test_deleted_audio_becomes_same_length_timeline_gap(tmp_path):
+    # 削除する 0002 は通常 speech 行にする（未認識行の削除は元位置ポーズの
+    # guarded cut 判定が入るため、タイムラインギャップ生成の検証には使わない）。
     segments = [
         {"id": "0001", "text": "A", "words": [], "kind": "unrecognized", "source_start": 0.0, "source_end": 1.0},
-        {"id": "0002", "text": "B", "words": [], "kind": "unrecognized", "source_start": 1.0, "source_end": 2.0},
+        {"id": "0002", "text": "B",
+         "words": [{"word": "B", "start": 1.0, "end": 2.0, "probability": 0.9}]},
         {"id": "0003", "text": "C", "words": [], "kind": "unrecognized", "source_start": 2.0, "source_end": 3.0},
     ]
     txt, _ = _write_project(tmp_path, segments=segments, txt="[0001] A\n[0003] C\n")
