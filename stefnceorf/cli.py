@@ -161,6 +161,13 @@ def _run_transcription(args: argparse.Namespace) -> tuple[int, dict | None]:
                     f"(「{sample}…」)",
                     file=sys.stderr,
                 )
+    if res.get("uts_count"):
+        print(f"未転写発話候補: {res['uts_count']}件")
+        print(
+            "ヒント: 未転写発話候補は音声保持のみです。"
+            "聞き直し、不要ならTXTの該当行を削除してください",
+            file=sys.stderr,
+        )
     if res.get("silence_cut_count"):
         print(
             f"無音切り詰め: {res['silence_cut_count']}箇所 "

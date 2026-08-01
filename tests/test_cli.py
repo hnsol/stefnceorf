@@ -425,3 +425,34 @@ def test_main_no_args_prints_help_without_running_stages(monkeypatch, capsys):
     assert cli.main([]) == 0
     assert calls == []
     assert capsys.readouterr().out.startswith("usage: stefnceorf ")
+
+
+def test_main_trans_prints_uts_count(monkeypatch, tmp_path, capsys):
+    """未転写発話候補があれば件数を表示し、扱い方をstderrで案内する。"""
+    wav = tmp_path / "x.wav"
+    wav.write_bytes(b"dummy")
+
+    def _fake(input_wav, **kwargs):
+        return {
+            "txt_path": str(tmp_path / "x.sc.txt"),
+            "json_path": str(tmp_path / "x.sc.json"),
+            "filler_count": 0,
+            "silence_cut_count": 0,
+            "silence_removed_s": 0.0,
+            "hallucination_drop_count": 0,
+            "hallucination_ranges": [],
+            "uts_count": 3,
+        }
+
+    monkeypatch.setattr("stefnceorf.transcribe.transcribe", _fake)
+    assert cli.main(["trans", str(wav)]) == 0
+    out = capsys.readouterr()
+    assert "未転写発話候補: 3件" in out.out
+    assert "TXTの該当行を削除" in out.err
+
+
+def test_main_trans_hides_uts_line_when_zero(fake_transcribe, tmp_path, capsys):
+    """候補0件（キー自体が無い場合を含む）では何も表示しない。"""
+    _calls, wav = fake_transcribe
+    cli.main(["trans", str(wav)])
+    assert "未転写発話候補" not in capsys.readouterr().out

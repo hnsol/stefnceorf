@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
 import os
@@ -12,6 +13,7 @@ from collections import Counter
 from pathlib import Path
 
 from . import fillers as fillers_mod
+from .render import RMS_SAFE_DBFS, RMS_SAFE_REL_DB, speech_median_dbfs
 
 # 低信頼マーカー ◆ を付与する probability の閾値（これ未満で付与）
 LOW_CONF_THRESHOLD = 0.5
@@ -34,6 +36,21 @@ PAUSE_THRESHOLD_S = 0.15
 
 # 無音クランプ後の単語長がこれ未満になる補正は棄却する（秒）
 CLAMP_MIN_WORD_S = 0.05
+
+# UTS（未転写発話 = Untranscribed Speech）検出の設定。
+# Whisper が転写しない 100〜150ms の短い発声（「え」「ん」「あ」、息、相槌）を
+# 音響的に見つけて候補行として提示する（自動カットはしない）。
+# しきい値は vidtighten（MIT）の実測チューニング値をそのまま用いる。
+UTS_MIN_ISLAND_S = 0.10        # 島（非無音区間）として扱う最小長
+UTS_MAX_ISLAND_S = 1.2         # これより長い島は通常の発話とみなす
+UTS_MIN_ADJACENT_LARGE = 0.25  # 前後の無音のうち長い方に要求する最小長
+UTS_MIN_ADJACENT_SMALL = 0.15  # 前後の無音のうち短い方に要求する最小長（口音・息の除外）
+
+# UTS 検出に使う短時間RMS無音検出の窓長（ms）と最小無音長（秒）。
+# ffmpeg silencedetect の粗いパス（d=0.15〜1.2s）だとフィラーが発話ブロックへ
+# 融合して島の境界が立たないため、専用の細かいパスを別に走らせる。
+UTS_RMS_WINDOW_MS = 20
+UTS_RMS_MIN_SILENCE_S = 0.10
 
 # 繰り返し幻覚セグメントの後処理除去（--verbatim の短チャンク turbo が
 # チャンク境界や静音区間でまれに出す繰り返し・定型幻覚への対策。入力側では
@@ -437,12 +454,195 @@ def _span_fully_covered(
     return False
 
 
+def detect_rms_silences(
+    audio,
+    samplerate: int,
+    word_spans: list[tuple[float, float]],
+    window_ms: int = UTS_RMS_WINDOW_MS,
+    min_silence_s: float = UTS_RMS_MIN_SILENCE_S,
+) -> list[tuple[float, float]]:
+    """短時間RMSで無音区間 [(start, end), ...] を返す（純関数）。
+
+    UTS 検出専用の細かい無音パス。ffmpeg silencedetect の粗いパスは最小無音長が
+    長くフィラー前後の短いポーズを拾えないため、フィラーが前後の発話ブロックに
+    融合してしまい「島」の境界が立たない。そこで window_ms 幅の非重複窓ごとに
+    RMS を計算し、連続して閾値を下回る区間のうち min_silence_s 以上のものを
+    無音とする。発話の減衰尾を守るための hangover は入れない（フィラー直前の
+    100ms 級ポーズを潰さないため）。
+
+    計算式:
+      frame_rms[i] = sqrt(mean(x[i*W : (i+1)*W] ** 2))   （W = 窓サンプル数）
+      is_silent[i] = 20*log10(frame_rms[i]) < threshold_db
+
+    threshold_db は render 側と同じ適応規約に従う:
+      min(RMS_SAFE_DBFS, 発話中央値 - RMS_SAFE_REL_DB)
+    絶対閾値 -40dB のみだと、発話帯域が -40dB 近辺に収まる静かな録音で発話まで
+    無音と判定されてしまう。逆に相対値だけだと大きい録音で閾値が緩みすぎるため、
+    低い（厳しい）方を採る。word_spans から有効な発話中央値が得られない場合
+    （単語なし・全て -inf）は RMS_SAFE_DBFS へフォールバックする。
+
+    audio が短すぎて1窓も取れない場合、および samplerate が不正な場合は
+    空リストを返す。stereo(2D) はチャンネル平均を取ってから評価する。
+    """
+    import numpy as np
+
+    if samplerate <= 0:
+        return []
+    window = int(samplerate * window_ms / 1000)
+    if window <= 0:
+        return []
+
+    samples = np.asarray(audio)
+    if samples.ndim == 2:
+        samples = samples.mean(axis=1)
+    n_frames = len(samples) // window
+    if n_frames == 0:
+        return []
+
+    speech_med = speech_median_dbfs(audio, samplerate, word_spans)
+    threshold_db = (
+        min(RMS_SAFE_DBFS, speech_med - RMS_SAFE_REL_DB)
+        if speech_med is not None else RMS_SAFE_DBFS
+    )
+    threshold_amp = 10.0 ** (threshold_db / 20.0)
+
+    frames = samples[: n_frames * window].astype(np.float64).reshape(
+        n_frames, window
+    )
+    rms = np.sqrt(np.mean(np.square(frames), axis=1))
+    is_silent = rms < threshold_amp
+
+    # 無音区間の抽出は np.diff の立ち上がり(+1)/立ち下がり(-1)で一括に行う。
+    # 長さ判定は秒ではなく窓数で行う（0.02 秒が二進で厳密に表せず、秒に直すと
+    # 境界ちょうどの無音が取りこぼされるため）。
+    d = np.diff(is_silent.astype(np.int8), prepend=0, append=0)
+    starts = np.where(d == 1)[0]
+    ends = np.where(d == -1)[0]
+    min_frames = max(1, math.ceil(min_silence_s * samplerate / window - 1e-9))
+    keep = (ends - starts) >= min_frames
+    frame_s = window / float(samplerate)
+    return list(
+        zip(
+            (starts[keep] * frame_s).tolist(),
+            (ends[keep] * frame_s).tolist(),
+        )
+    )
+
+
+def detect_untranscribed_speech(
+    total_duration: float,
+    silence_regions: list[tuple[float, float]],
+    transcript_segments: list[dict],
+    max_duration: float = UTS_MAX_ISLAND_S,
+    min_adjacent_large: float = UTS_MIN_ADJACENT_LARGE,
+    min_adjacent_small: float = UTS_MIN_ADJACENT_SMALL,
+    min_island_duration: float = UTS_MIN_ISLAND_S,
+    transcript_words: list[dict] | None = None,
+) -> list[tuple[float, float]]:
+    """転写に載らなかった短い発声（UTS）の候補区間を返す（純関数）。
+
+    Ported from vidtighten (MIT License, Copyright (c) matsumotoryosuke-dev)
+    src/preprod/audio.py — detect_untranscribed_speech。
+
+    Whisper はフィラー（えー、うー、hmm、uh…）を単語列にすら出さないことが
+    ある。ここでは「無音に挟まれた非無音区間（島）のうち、どの単語にも覆われて
+    いないもの」として検出する。
+
+    設計上の要点（移植元の判断をそのまま踏襲する）:
+    - silence_regions は最小無音長 0.1s・hangover なしの細かいパス
+      （detect_rms_silences）を前提とする。粗いパスだとフィラーが発話ブロックに
+      融合し、segment の時刻に丸ごと覆われてしまう。
+    - 重複判定は単語（transcript_words）時刻で行う。segment 時刻は文全体に
+      またがり、文境界のフィラーを覆ってしまうため使えない（transcript_words が
+      None のときのみ segment 時刻へフォールバックする）。
+    - 孤立条件は両側。前後の無音のうち長い方が min_adjacent_large 以上、かつ
+      短い方が min_adjacent_small 以上。狭い語間に紛れる口音・息の混入を防ぎつつ、
+      実際に間で挟まれた発声だけを拾う。ファイル先頭・末尾は無限長の無音とみなす。
+
+    戻り値: 候補ごとの (start_sec, end_sec)。
+    """
+    if total_duration <= 0 or not silence_regions:
+        return []
+
+    silences = sorted(silence_regions, key=lambda x: x[0])
+
+    # 各島について (start, end, 直前の無音長, 直後の無音長) を作る
+    islands: list[tuple[float, float, float, float]] = []
+    prev_end = 0.0
+    prev_sil_dur = float("inf")   # ファイル先頭は無限長の無音扱い
+
+    for s_start, s_end in silences:
+        # 5ms 未満の島は 20ms 窓の量子化誤差と区別できないため候補にしない。
+        if s_start > prev_end + 0.005:
+            sil_after_dur = s_end - s_start
+            islands.append((prev_end, s_start, prev_sil_dur, sil_after_dur))
+        prev_sil_dur = s_end - s_start
+        prev_end = max(prev_end, s_end)
+
+    # 最後の無音より後ろの島（末尾も同じく 5ms 下限を適用する）
+    if prev_end < total_duration - 0.005:
+        islands.append((prev_end, total_duration, prev_sil_dur, float("inf")))
+
+    if transcript_words is not None:
+        lookup = sorted(transcript_words, key=lambda w: w["start"])
+        _w_starts = [w["start"] for w in lookup]
+
+        def overlaps_transcript(start: float, end: float) -> bool:
+            # 走査範囲を島の近傍へ絞る（hi: 島の終わり以降に始まる単語は無関係、
+            # lo: 島の 1s 前から。単語長は通常 0.5s 以下なので 1s あれば足りる）。
+            hi = bisect.bisect_left(_w_starts, end)
+            lo = bisect.bisect_left(_w_starts, max(0.0, start - 1.0))
+            for i in range(lo, hi):
+                # 20ms 許容: 島へ 20ms 以内しか食い込まない単語は「覆っている」
+                # とみなさない（Whisper の時刻ジッタの範囲内のため）。
+                if lookup[i]["end"] > start + 0.02:
+                    return True
+            return False
+    else:
+        trans = sorted(transcript_segments, key=lambda s: s["start"])
+        _s_starts = [s["start"] for s in trans]
+
+        def overlaps_transcript(start: float, end: float) -> bool:  # type: ignore[misc]
+            # segment は長くなりうるので 7s 遡って走査する。
+            hi = bisect.bisect_left(_s_starts, end)
+            lo = bisect.bisect_left(_s_starts, max(0.0, start - 7.0))
+            for i in range(lo, hi):
+                if trans[i]["end"] > start + 0.02:
+                    return True
+            return False
+
+    candidates: list[tuple[float, float]] = []
+
+    # 1e-9 の許容: 窓時刻は 0.02s の整数倍だが 0.02 は二進で厳密に表せず、整数倍
+    # すると誤差が積もる（例 110*0.02 - 50*0.02 = 1.2000000000000002）。max_duration
+    # ちょうど 1.2s の島が誤って弾かれるのを防ぐ。
+    _DUR_EPS = 1e-9
+    for sp_start, sp_end, sil_before, sil_after in islands:
+        duration = sp_end - sp_start
+        if (
+            duration < min_island_duration - _DUR_EPS
+            or duration > max_duration + _DUR_EPS
+        ):
+            continue
+        if overlaps_transcript(sp_start, sp_end):
+            continue
+        # 両側の孤立条件。長い方が主しきい値、短い方が下限を満たすこと。
+        sil_large = max(sil_before, sil_after)
+        sil_small = min(sil_before, sil_after)
+        if sil_large < min_adjacent_large or sil_small < min_adjacent_small:
+            continue
+        candidates.append((sp_start, sp_end))
+
+    return candidates
+
+
 def _preserve_unrecognized_gaps(
     segments: list[dict],
     cuts: list[tuple[float, float]],
     silences: list[tuple[float, float]],
     source_duration: float,
     known_silences: list[tuple[float, float]] | None = None,
+    uts_spans: list[tuple[float, float]] | None = None,
 ) -> list[dict]:
     """主認識に無い非無音区間を未認識行として保持する（純関数）。
 
@@ -450,9 +650,26 @@ def _preserve_unrecognized_gaps(
     source_start/source_end を被覆範囲とする。中間gapは SILENCE_MIN_S より長い
     場合、先頭・末尾gapは長さを問わず、検出済み無音で完全被覆されない限り
     全体を unrecognized として追加する。部分的な無音被覆は安全側で全体保持する。
+
+    uts_spans（detect_untranscribed_speech の出力）を渡すと、gap 内に入る UTS 島
+    を `reason: "uts"` 付きの独立した unrecognized セグメントとして挿入する。挿入は
+    通常gapの長さ判定（SILENCE_MIN_S 以下は行にしない）より前に行うため、短いgapに
+    埋もれた未転写発話も候補行になる。長いgapは UTS 島と残余に分割し、残余は従来
+    どおり reason なしの unrecognized として保持する（除外するのは検出済み無音で
+    完全に説明できる部分のみ）。uts_spans が None/空なら出力は従来と完全に一致する。
     """
     duration = max(0.0, float(source_duration))
     known = silences if known_silences is None else known_silences
+    # UTS島は使う前にソート・マージし、音源範囲 [0, duration] へクランプする。
+    uts = _merge_time_spans(
+        [
+            (
+                min(max(float(start), 0.0), duration),
+                min(max(float(end), 0.0), duration),
+            )
+            for start, end in (uts_spans or [])
+        ]
+    )
     coverage: list[tuple[float, float]] = []
     positioned: list[tuple[float, int, dict]] = []
 
@@ -484,10 +701,9 @@ def _preserve_unrecognized_gaps(
     merged_coverage = _merge_time_spans(coverage)
     cursor = 0.0
 
-    def _add_gap(start: float, end: float, edge: bool) -> None:
+    def _add_residual(start: float, end: float) -> None:
+        """gap の残余（UTS島以外）を従来どおりの未認識行として追加する。"""
         if end <= start or _span_fully_covered(start, end, known):
-            return
-        if not edge and end - start <= SILENCE_MIN_S:
             return
         added.append(
             {
@@ -498,6 +714,38 @@ def _preserve_unrecognized_gaps(
                 "words": [],
             }
         )
+
+    def _add_gap(start: float, end: float, edge: bool) -> None:
+        if end <= start:
+            return
+        # UTS島の挿入は通常gapの判定より前に行う（短いgap内の候補も行にする）。
+        islands = [
+            (max(start, island_start), min(end, island_end))
+            for island_start, island_end in uts
+            if min(end, island_end) > max(start, island_start)
+        ]
+        for island_start, island_end in islands:
+            added.append(
+                {
+                    "kind": "unrecognized",
+                    "reason": "uts",
+                    "source_start": island_start,
+                    "source_end": island_end,
+                    "text": "",
+                    "words": [],
+                }
+            )
+        # 残余の扱いは従来どおり: 検出済み無音で完全被覆されるgap、および
+        # SILENCE_MIN_S 以下の中間gapは行にしない（判定は分割前のgap全体で行う）。
+        if _span_fully_covered(start, end, known):
+            return
+        if not edge and end - start <= SILENCE_MIN_S:
+            return
+        cursor = start
+        for island_start, island_end in islands:
+            _add_residual(cursor, island_start)
+            cursor = max(cursor, island_end)
+        _add_residual(cursor, end)
 
     for start, end in merged_coverage:
         _add_gap(cursor, start, edge=(cursor == 0.0))
@@ -990,6 +1238,50 @@ def _rescue_transcribe(
     return combined
 
 
+def _detect_uts_spans(
+    wav_path: str,
+    segments: list[dict],
+    cuts: list[tuple[float, float]],
+    silences: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """16kHz wav と確定済み単語時刻から UTS 候補区間（元音源時刻）を求める。
+
+    wav_path は切り詰め前の 16kHz wav（元音源と同じ時間軸）。単語は
+    _finalize_segment_words で元音源時刻へ変換したものを使い、時間軸を揃える。
+
+    音声を読めない場合は候補なし（空リスト）として扱う。UTS は候補の可視化だけを
+    行う補助機能であり、ここで文字起こし全体を失敗させる理由がないため。
+    """
+    import soundfile as sf
+
+    try:
+        audio, samplerate = sf.read(wav_path, dtype="float32", always_2d=False)
+    except (RuntimeError, OSError):
+        return []
+    if samplerate <= 0 or len(audio) == 0:
+        return []
+
+    words: list[dict] = []
+    for seg in segments:
+        if seg.get("kind") == "unrecognized":
+            continue
+        for word in _finalize_segment_words(seg, cuts, silences):
+            start = word.get("start")
+            end = word.get("end")
+            if start is None or end is None:
+                continue
+            words.append({"start": float(start), "end": float(end)})
+
+    word_spans = [(word["start"], word["end"]) for word in words]
+    rms_silences = detect_rms_silences(audio, samplerate, word_spans)
+    return detect_untranscribed_speech(
+        len(audio) / float(samplerate),
+        rms_silences,
+        [],
+        transcript_words=words,
+    )
+
+
 def _detect_silence(wav_path: str, d: float = SILENCE_MIN_S) -> str:
     """ffmpeg silencedetect を実行し stderr を返す。失敗時は空文字列。
 
@@ -1217,6 +1509,7 @@ def transcribe(
     # 生存させる必要があるため、本認識からレスキュー完了までを1つの try で囲う。
     halluc_ranges: list[dict] = []
     dropped_count = 0
+    uts_spans: list[tuple[float, float]] = []
     try:
         recog_wav_duration = _wav_duration(recog_wav)
         source_wav_end = rec_to_src(recog_wav_duration, cuts)
@@ -1398,6 +1691,11 @@ def transcribe(
                     last_kept = seg
             final_segments.extend(_process_group(group, last_kept, None))
             kept_segments = final_segments
+
+        # UTS（未転写発話）検出は 16kHz 一時wav が unlink される前に行う。
+        # --verbatim の有無に関わらず常時実行する（verbatim は「フィラーも転写
+        # する」モードであり、転写に載らない発声の検出とは別問題のため）。
+        uts_spans = _detect_uts_spans(tmp_wav, kept_segments, cuts, periods)
     finally:
         for p in {tmp_wav, trimmed_wav}:
             try:
@@ -1416,32 +1714,45 @@ def transcribe(
         periods,
         source_wav_end,
         known_silences=periods,
+        uts_spans=uts_spans,
     )
 
     segments_out = []
     lines: list[str] = []
     total_fillers = 0
+    uts_count = 0
 
     for i, seg in enumerate(kept_segments):
         seg_id = _seg_id(i)
         if seg.get("kind") == "unrecognized":
             source_start = float(seg["source_start"])
             source_end = float(seg["source_end"])
-            segments_out.append(
-                {
-                    "id": seg_id,
-                    "kind": "unrecognized",
-                    "source_start": source_start,
-                    "source_end": source_end,
-                    "text": seg.get("text", ""),
-                    "words": [],
-                }
-            )
+            reason = seg.get("reason")
+            out_seg = {
+                "id": seg_id,
+                "kind": "unrecognized",
+                "source_start": source_start,
+                "source_end": source_end,
+                "text": seg.get("text", ""),
+                "words": [],
+            }
+            # reason は UTS 候補のときだけ付ける。理由のない未認識行は従来どおりの
+            # キー構成のままにし、旧 json の読み込み互換も壊さない。
+            if reason:
+                out_seg["reason"] = reason
+            segments_out.append(out_seg)
             duration = max(0.0, source_end - source_start)
-            lines.append(
-                f"[{seg_id} {_format_time(source_start)}] "
-                f"⚠ 未認識区間 {duration:.1f}秒（音声保持）"
-            )
+            if reason == "uts":
+                uts_count += 1
+                lines.append(
+                    f"[{seg_id} {_format_time(source_start)}] "
+                    f"⚠ 未転写発話候補 {duration:.1f}秒（音声保持）"
+                )
+            else:
+                lines.append(
+                    f"[{seg_id} {_format_time(source_start)}] "
+                    f"⚠ 未認識区間 {duration:.1f}秒（音声保持）"
+                )
             continue
         words = _finalize_segment_words(seg, cuts, periods)
         # ポーズベースのブロック割当（各 word に "block" を付与）
@@ -1508,6 +1819,7 @@ def transcribe(
         "silence_removed_s": removed_s,
         "hallucination_drop_count": dropped_count,
         "hallucination_ranges": halluc_ranges,
+        "uts_count": uts_count,
         "data": data,
     }
 

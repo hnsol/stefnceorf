@@ -2,6 +2,7 @@ import json
 import sys
 import types
 
+import numpy as np
 import pytest
 
 from stefnceorf import transcribe
@@ -2904,3 +2905,429 @@ def test_transcribe_auto_lang_uses_detected_dict(tmp_path, fake_whisper_en):
     # 全語が同ブロック（ギャップなし）→ um は単独ブロックでないため〔〕なし
     assert lines[0] == "[0001 0:00]  so um yeah"
     assert res["filler_count"] == 0
+
+
+# ---- detect_rms_silences（UTS用の短時間RMS無音検出） ----
+
+_SR = 16000
+
+
+def _tone(seconds: float, dbfs: float, sr: int = _SR) -> np.ndarray:
+    """RMS が dbfs ちょうどになる疑似発話（±amp の交番波）を返す。"""
+    n = int(round(seconds * sr))
+    amp = 10.0 ** (dbfs / 20.0)
+    sig = np.empty(n, dtype=np.float32)
+    sig[0::2] = amp
+    sig[1::2] = -amp
+    return sig
+
+
+def _silence(seconds: float, sr: int = _SR) -> np.ndarray:
+    return np.zeros(int(round(seconds * sr)), dtype=np.float32)
+
+
+def test_detect_rms_silences_finds_gap_between_speech():
+    audio = np.concatenate([
+        _tone(0.5, -20.0), _silence(0.3), _tone(0.5, -20.0)
+    ])
+    out = transcribe.detect_rms_silences(
+        audio, _SR, [(0.0, 0.5), (0.8, 1.3)]
+    )
+    assert len(out) == 1
+    assert out[0][0] == pytest.approx(0.5)
+    assert out[0][1] == pytest.approx(0.8)
+
+
+def test_detect_rms_silences_ignores_silence_shorter_than_min():
+    # 0.06s（3窓）は最小無音長 0.1s に満たない
+    audio = np.concatenate([
+        _tone(0.5, -20.0), _silence(0.06), _tone(0.5, -20.0)
+    ])
+    assert transcribe.detect_rms_silences(
+        audio, _SR, [(0.0, 0.5), (0.56, 1.06)]
+    ) == []
+
+
+def test_detect_rms_silences_accepts_exactly_min_duration():
+    # 0.10s（5窓）ちょうどは検出する
+    audio = np.concatenate([
+        _tone(0.5, -20.0), _silence(0.10), _tone(0.5, -20.0)
+    ])
+    out = transcribe.detect_rms_silences(
+        audio, _SR, [(0.0, 0.5), (0.6, 1.1)]
+    )
+    assert [(pytest.approx(0.5), pytest.approx(0.6))] == out
+
+
+def test_detect_rms_silences_quantizes_to_window():
+    # 無音 0.11s → 20ms 窓の粒度に丸められ 0.10s 分だけが無音になる
+    audio = np.concatenate([
+        _tone(0.5, -20.0), _silence(0.11), _tone(0.5, -20.0)
+    ])
+    out = transcribe.detect_rms_silences(
+        audio, _SR, [(0.0, 0.5), (0.61, 1.11)]
+    )
+    assert len(out) == 1
+    assert out[0][1] - out[0][0] == pytest.approx(0.10)
+
+
+def test_detect_rms_silences_threshold_is_relative_to_speech_median():
+    # 発話が -50dBFS の静かな録音。絶対閾値 -40dB だけなら発話も無音扱いになるが、
+    # 発話中央値 -50dB からの相対閾値（-65dB）が採られるため無音は zeros のみ。
+    audio = np.concatenate([
+        _tone(0.5, -50.0), _silence(0.3), _tone(0.5, -50.0)
+    ])
+    out = transcribe.detect_rms_silences(
+        audio, _SR, [(0.0, 0.5), (0.8, 1.3)]
+    )
+    assert len(out) == 1
+    assert out[0][0] == pytest.approx(0.5)
+    assert out[0][1] == pytest.approx(0.8)
+
+
+def test_detect_rms_silences_falls_back_to_absolute_threshold():
+    # 単語が無い（＝発話中央値が取れない）と RMS_SAFE_DBFS(-40dB) が閾値になり、
+    # -50dB の音は無音側になる。
+    audio = np.concatenate([
+        _tone(0.5, -50.0), _silence(0.3), _tone(0.5, -50.0)
+    ])
+    out = transcribe.detect_rms_silences(audio, _SR, [])
+    assert len(out) == 1
+    assert out[0][0] == pytest.approx(0.0)
+    assert out[0][1] == pytest.approx(1.3)
+
+
+def test_detect_rms_silences_fallback_constant_comes_from_render():
+    from stefnceorf import render
+
+    assert transcribe.RMS_SAFE_DBFS is render.RMS_SAFE_DBFS
+    assert transcribe.RMS_SAFE_REL_DB is render.RMS_SAFE_REL_DB
+
+
+def test_detect_rms_silences_short_or_invalid_input_returns_empty():
+    assert transcribe.detect_rms_silences(_silence(0.01), _SR, []) == []
+    assert transcribe.detect_rms_silences(_silence(1.0), 0, []) == []
+
+
+def test_detect_rms_silences_accepts_stereo():
+    mono = np.concatenate([
+        _tone(0.5, -20.0), _silence(0.3), _tone(0.5, -20.0)
+    ])
+    stereo = np.stack([mono, mono], axis=1)
+    out = transcribe.detect_rms_silences(stereo, _SR, [(0.0, 0.5), (0.8, 1.3)])
+    assert out[0][0] == pytest.approx(0.5)
+
+
+# ---- detect_untranscribed_speech（vidtighten 移植） ----
+
+def _w(start: float, end: float) -> dict:
+    return {"start": start, "end": end}
+
+
+def test_uts_detects_island_between_silences():
+    assert transcribe.detect_untranscribed_speech(
+        5.0,
+        [(1.0, 1.5), (1.8, 2.3)],
+        [],
+        transcript_words=[_w(0.0, 1.0), _w(2.3, 3.0)],
+    ) == [(1.5, 1.8)]
+
+
+def test_uts_returns_empty_without_silences_or_duration():
+    assert transcribe.detect_untranscribed_speech(5.0, [], []) == []
+    assert transcribe.detect_untranscribed_speech(
+        0.0, [(1.0, 1.5), (1.8, 2.3)], []
+    ) == []
+
+
+def test_uts_excludes_island_covered_by_word():
+    assert transcribe.detect_untranscribed_speech(
+        5.0,
+        [(1.0, 1.5), (1.8, 2.3)],
+        [],
+        transcript_words=[_w(0.0, 1.0), _w(1.4, 1.75)],
+    ) == []
+
+
+def test_uts_word_overlap_tolerance_is_20ms():
+    # 島の頭へ 20ms 以内しか食い込まない単語は「覆っている」とみなさない
+    assert transcribe.detect_untranscribed_speech(
+        5.0, [(1.0, 1.5), (1.8, 2.3)], [],
+        transcript_words=[_w(0.9, 1.51)],
+    ) == [(1.5, 1.8)]
+    assert transcribe.detect_untranscribed_speech(
+        5.0, [(1.0, 1.5), (1.8, 2.3)], [],
+        transcript_words=[_w(0.9, 1.53)],
+    ) == []
+
+
+def test_uts_falls_back_to_segment_timestamps():
+    # transcript_words が None のときだけ segment 時刻で重複判定する
+    assert transcribe.detect_untranscribed_speech(
+        5.0, [(1.0, 1.5), (1.8, 2.3)], [{"start": 0.0, "end": 2.3}]
+    ) == []
+
+
+def test_uts_island_duration_boundaries():
+    words = [_w(0.0, 0.1)]
+    # 0.10s ちょうどは採用
+    assert transcribe.detect_untranscribed_speech(
+        5.0, [(1.0, 1.5), (1.6, 2.1)], [], transcript_words=words
+    ) == [(1.5, 1.6)]
+    # 0.09s は不採用
+    assert transcribe.detect_untranscribed_speech(
+        5.0, [(1.0, 1.5), (1.59, 2.1)], [], transcript_words=words
+    ) == []
+    # 1.2s ちょうどは採用（0.02 の整数倍で生じる誤差を eps が吸収する）
+    assert transcribe.detect_untranscribed_speech(
+        5.0,
+        [(0.5, 1.0), (2.2000000000000002, 2.7)],
+        [],
+        transcript_words=words,
+    ) == [(1.0, 2.2000000000000002)]
+    # 1.21s は不採用
+    assert transcribe.detect_untranscribed_speech(
+        5.0, [(0.5, 1.0), (2.21, 2.7)], [], transcript_words=words
+    ) == []
+
+
+def test_uts_adjacent_silence_boundaries():
+    words = [_w(3.0, 3.5)]
+    # 短い側 0.15s ちょうど・長い側 0.25s ちょうど → 採用
+    assert transcribe.detect_untranscribed_speech(
+        3.0, [(0.0, 0.15), (0.5, 0.75)], [], transcript_words=words
+    ) == [(0.15, 0.5)]
+    # 短い側が 0.14s → 不採用
+    assert transcribe.detect_untranscribed_speech(
+        3.0, [(0.0, 0.14), (0.5, 0.75)], [], transcript_words=words
+    ) == []
+    # 長い側が 0.24s → 不採用
+    assert transcribe.detect_untranscribed_speech(
+        3.0, [(0.0, 0.15), (0.5, 0.74)], [], transcript_words=words
+    ) == []
+
+
+def test_uts_file_edges_count_as_infinite_silence():
+    # 先頭島は「前が無限長の無音」として孤立条件を満たす
+    assert transcribe.detect_untranscribed_speech(
+        3.0, [(0.5, 1.0)], [], transcript_words=[_w(1.5, 2.0)]
+    ) == [(0.0, 0.5)]
+    # 末尾島も同様（中間島 1.0-2.5 は 1.2s 超で不採用、末尾 0.2s だけが残る）
+    assert transcribe.detect_untranscribed_speech(
+        3.0, [(0.5, 1.0), (2.5, 2.8)], [], transcript_words=[_w(0.0, 0.4)]
+    ) == [(2.8, 3.0)]
+
+
+def test_uts_ignores_sub_5ms_islands():
+    # 5ms 未満の隙間は量子化誤差と区別できないため島にしない
+    assert transcribe.detect_untranscribed_speech(
+        3.0, [(0.5, 1.0), (1.003, 1.5)], [], transcript_words=[_w(0.0, 0.5)]
+    ) == []
+
+
+def test_uts_tunables_match_reference_implementation():
+    assert transcribe.UTS_MIN_ISLAND_S == pytest.approx(0.10)
+    assert transcribe.UTS_MAX_ISLAND_S == pytest.approx(1.2)
+    assert transcribe.UTS_MIN_ADJACENT_LARGE == pytest.approx(0.25)
+    assert transcribe.UTS_MIN_ADJACENT_SMALL == pytest.approx(0.15)
+
+
+# ---- _preserve_unrecognized_gaps の UTS 拡張 ----
+
+def test_uts_island_inserted_into_short_gap():
+    # 1.0s の中間gap（SILENCE_MIN_S 以下）は従来なら行にならないが、
+    # UTS 島だけは候補行として挿入される。
+    out = transcribe._preserve_unrecognized_gaps(
+        [_speech_segment(0.0, 1.0), _speech_segment(2.0, 3.0)],
+        cuts=[],
+        silences=[],
+        source_duration=3.0,
+        uts_spans=[(1.4, 1.6)],
+    )
+
+    assert [seg.get("kind", "speech") for seg in out] == [
+        "speech", "unrecognized", "speech"
+    ]
+    assert out[1]["reason"] == "uts"
+    assert (out[1]["source_start"], out[1]["source_end"]) == (1.4, 1.6)
+
+
+def test_long_gap_is_split_into_uts_island_and_residuals():
+    out = transcribe._preserve_unrecognized_gaps(
+        [_speech_segment(0.0, 1.0), _speech_segment(5.0, 6.0)],
+        cuts=[],
+        silences=[],
+        source_duration=6.0,
+        uts_spans=[(2.0, 2.3)],
+    )
+
+    gaps = [
+        (seg["source_start"], seg["source_end"], seg.get("reason"))
+        for seg in out
+        if seg.get("kind") == "unrecognized"
+    ]
+    assert gaps == [
+        (1.0, 2.0, None),
+        (2.0, 2.3, "uts"),
+        (2.3, 5.0, None),
+    ]
+
+
+def test_uts_residual_fully_covered_by_known_silence_is_dropped():
+    # 残余のうち検出済み無音で完全に説明できる部分だけを保持対象から外す
+    out = transcribe._preserve_unrecognized_gaps(
+        [_speech_segment(0.0, 1.0), _speech_segment(5.0, 6.0)],
+        cuts=[],
+        silences=[(1.0, 2.0)],
+        source_duration=6.0,
+        uts_spans=[(2.0, 2.3)],
+    )
+
+    gaps = [
+        (seg["source_start"], seg["source_end"], seg.get("reason"))
+        for seg in out
+        if seg.get("kind") == "unrecognized"
+    ]
+    assert gaps == [(2.0, 2.3, "uts"), (2.3, 5.0, None)]
+
+
+def test_uts_spans_are_clamped_merged_and_sorted():
+    out = transcribe._preserve_unrecognized_gaps(
+        [],
+        cuts=[],
+        silences=[],
+        source_duration=3.0,
+        uts_spans=[(2.5, 9.0), (0.4, 0.8), (-1.0, 0.5), (2.0, 1.0)],
+    )
+
+    assert [
+        (seg["source_start"], seg["source_end"], seg.get("reason"))
+        for seg in out
+    ] == [
+        (0.0, 0.8, "uts"),
+        (0.8, 2.5, None),
+        (2.5, 3.0, "uts"),
+    ]
+
+
+def test_uts_island_inserted_even_when_gap_is_known_silence():
+    # 挿入は通常gapのスキップ判定より前に行う（粗い無音判定に潰されない）
+    out = transcribe._preserve_unrecognized_gaps(
+        [_speech_segment(0.0, 1.0), _speech_segment(5.0, 6.0)],
+        cuts=[],
+        silences=[(1.0, 5.0)],
+        source_duration=6.0,
+        uts_spans=[(2.0, 2.3)],
+    )
+
+    gaps = [seg for seg in out if seg.get("kind") == "unrecognized"]
+    assert [(g["source_start"], g["source_end"]) for g in gaps] == [(2.0, 2.3)]
+    assert gaps[0]["reason"] == "uts"
+
+
+@pytest.mark.parametrize("uts_spans", [None, []])
+def test_preserve_unrecognized_gaps_regression_without_uts(uts_spans):
+    # uts_spans が None/空なら出力は従来と完全一致する
+    cases = [
+        ([_speech_segment(0.0, 1.0), _speech_segment(4.0, 5.0)], [], 5.0),
+        ([_speech_segment(0.0, 1.0), _speech_segment(4.0, 5.0)],
+         [(1.0, 4.0)], 5.0),
+        ([_speech_segment(0.2, 4.8)], [], 5.0),
+        ([_speech_segment(0.0, 1.0), _speech_segment(1.5, 3.0)], [], 3.0),
+        ([], [], 10.0),
+    ]
+    for segments, silences, duration in cases:
+        baseline = transcribe._preserve_unrecognized_gaps(
+            segments, cuts=[], silences=silences, source_duration=duration
+        )
+        with_uts = transcribe._preserve_unrecognized_gaps(
+            segments,
+            cuts=[],
+            silences=silences,
+            source_duration=duration,
+            uts_spans=uts_spans,
+        )
+        assert with_uts == baseline
+        assert all("reason" not in seg for seg in with_uts)
+
+
+# ---- UTS のパイプライン結線 ----
+
+def test_transcribe_records_uts_reason_in_json(tmp_path, fake_whisper, monkeypatch):
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 5.0)
+    monkeypatch.setattr(
+        transcribe,
+        "_detect_uts_spans",
+        lambda wav, segments, cuts, silences: [(2.0, 2.3)],
+    )
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja")
+
+    data = json.loads((tmp_path / "input.sc.json").read_text(encoding="utf-8"))
+    uts = [s for s in data["segments"] if s.get("reason") == "uts"]
+    assert len(uts) == 1
+    assert uts[0]["kind"] == "unrecognized"
+    assert uts[0]["source_start"] == pytest.approx(2.0)
+    assert uts[0]["source_end"] == pytest.approx(2.3)
+    assert res["uts_count"] == 1
+    # reason を持たない未認識行のキー構成は従来どおり
+    others = [
+        s for s in data["segments"]
+        if s.get("kind") == "unrecognized" and s.get("reason") is None
+    ]
+    assert others and all("reason" not in s for s in others)
+    txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
+    assert "⚠ 未転写発話候補 0.3秒（音声保持）" in txt
+
+
+@pytest.mark.parametrize("verbatim", [False, True])
+def test_transcribe_detects_uts_regardless_of_verbatim(
+    tmp_path, fake_whisper, monkeypatch, verbatim
+):
+    calls = []
+
+    def spy(wav, segments, cuts, silences):
+        calls.append(wav)
+        return []
+
+    monkeypatch.setattr(transcribe, "_detect_uts_spans", spy)
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja", verbatim=verbatim)
+
+    assert len(calls) == 1
+    assert res["uts_count"] == 0
+
+
+def test_detect_uts_spans_returns_empty_for_unreadable_wav(tmp_path):
+    bad = tmp_path / "broken.wav"
+    bad.write_bytes(b"RIFFdummy")
+    assert transcribe._detect_uts_spans(str(bad), [], [], []) == []
+
+
+def test_detect_uts_spans_finds_untranscribed_burst(tmp_path):
+    import soundfile as sf
+
+    # 発話 / 無音 / 短い未転写発声 / 無音 / 発話
+    audio = np.concatenate([
+        _tone(1.0, -20.0),
+        _silence(0.4),
+        _tone(0.3, -20.0),
+        _silence(0.4),
+        _tone(1.0, -20.0),
+    ])
+    wav = tmp_path / "src.wav"
+    sf.write(str(wav), audio, _SR)
+
+    segments = [
+        {"text": "前", "words": [
+            {"word": "前", "start": 0.0, "end": 1.0, "probability": 0.9}
+        ]},
+        {"text": "後", "words": [
+            {"word": "後", "start": 2.1, "end": 3.1, "probability": 0.9}
+        ]},
+    ]
+    out = transcribe._detect_uts_spans(str(wav), segments, [], [])
+
+    assert len(out) == 1
+    assert out[0][0] == pytest.approx(1.4, abs=0.02)
+    assert out[0][1] == pytest.approx(1.7, abs=0.02)
