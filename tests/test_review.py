@@ -846,18 +846,23 @@ def test_segment_markup_shows_unconditional_label_for_plain_unrecognized():
     assert '<span class="state" data-i="0">削除（無条件）</span>' in markup
 
 
-def test_serve_script_does_not_autoplay_preview_on_toggle(tmp_path):
-    """トグル直後は preview.play() を呼ばず、キャッシュしてクリック時に再生する。"""
+def test_serve_script_plays_preview_immediately_on_response(tmp_path):
+    """応答受信時に audio-preview へ src 設定・load・play を試行する。
+
+    autoplay 拒否は握りつぶし、src 設定と load() までは完了させる
+    （再生ボタンを押せばすぐ聞ける状態にするため）。
+    """
     html, _rd = _serve_html(tmp_path)
-    # runPreview 内では自動再生しない（play() 呼び出しは行わずキャッシュへ格納）
     run_preview_body = html.split("function runPreview(target) {")[1].split(
         "\n  }\n"
     )[0]
-    assert "preview.play()" not in run_preview_body
-    assert "previewCache[key] = URL.createObjectURL" in run_preview_body
-    # クリック時に再生するコードパスが存在する（別ハンドラでキャッシュを再生する）
+    assert "previewCache[key] = url;" in run_preview_body
+    assert "preview.src = url;" in run_preview_body
+    assert "preview.load();" in run_preview_body
+    assert "var playing = preview.play();" in run_preview_body
+    assert "playing.catch(function () {});" in run_preview_body
+    # クリック時に再生するコードパスも維持している（別ハンドラでキャッシュを再生する）
     assert "var cached = previewCache[key];" in html
-    assert "preview.play()" in html
 
 
 def test_serve_script_disables_checkboxes_while_busy(tmp_path):

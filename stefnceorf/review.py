@@ -656,7 +656,7 @@ label.wt input { margin: 0 .1em 0 .2em; vertical-align: middle; }
 <p class="note">$note</p>
 <div class="controls">
 <div class="player-row">
-  <button type="button" class="mode active" data-mode="src">原音を再生</button>
+  <button type="button" class="mode" data-mode="src">原音を再生</button>
   <audio id="audio-src" controls preload="metadata" src="$source_audio"></audio>
   <span class="seek">
     <button type="button" class="seek-btn" data-player="src" data-seek="-10">−10s</button>
@@ -666,7 +666,7 @@ label.wt input { margin: 0 .1em 0 .2em; vertical-align: middle; }
   </span>
 </div>
 <div class="player-row">
-  <button type="button" class="mode" data-mode="out">編集後を再生</button>
+  <button type="button" class="mode active" data-mode="out">保存済み編集後を再生</button>
   <audio id="audio-out" controls preload="metadata" src="$review_audio"></audio>
   <span class="seek">
     <button type="button" class="seek-btn" data-player="out" data-seek="-10">−10s</button>
@@ -698,7 +698,7 @@ $transcript
     src: document.getElementById("audio-src"),
     out: document.getElementById("audio-out")
   };
-  var mode = "src";
+  var mode = "out";
   var stopAt = null;
   var current = null;
 
@@ -976,10 +976,17 @@ _SERVE_SCRIPT = """<script>
         mergeStates(payload.segments);
         applyStates();
         note((payload.message || "試聴") + "（クリックで再生）", false);
-        // 自動再生はせず、対象の行/単語をクリックしたときに再生できるよう
-        // 音声だけキャッシュしておく。
+        // 対象の行/単語をクリックしたときにも再生できるよう音声をキャッシュ
+        // しておく（従来どおり）。加えて、チェック変更の結果をすぐ耳で確認
+        // できるよう audio-preview へも即座に設定し load/play を試みる
+        // （autoplay 拒否は握りつぶし、src 設定と load だけは完了させる）。
         var key = previewKey(target);
-        previewCache[key] = URL.createObjectURL(toBlob(payload.audio));
+        var url = URL.createObjectURL(toBlob(payload.audio));
+        previewCache[key] = url;
+        preview.src = url;
+        preview.load();
+        var playing = preview.play();
+        if (playing && playing.catch) { playing.catch(function () {}); }
       })
       .catch(function (err) {
         if (myGeneration !== generation) { return; }

@@ -514,7 +514,7 @@ def test_preview_center_of_cut_word_is_join_boundary(tmp_path):
     )
     # えー[1.1,1.6) はカット済み。中心は「あ」の終端＝結合境界の近傍
     assert 0.9 < result["center"] < 1.3
-    assert result["message"] == "削除後の結合境界を再生"
+    assert result["message"] == "削除した場合を試聴"
 
 
 def test_preview_does_not_write_txt(tmp_path):

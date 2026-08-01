@@ -706,9 +706,9 @@ def preview_center(plan, data: dict, target: dict) -> tuple[float, str]:
     if requested and not effective:
         message = "安全判定により保持しました（対象の中央を再生）"
     elif requested:
-        message = "削除後の結合境界を再生"
+        message = "削除した場合を試聴"
     else:
-        message = "保持した音声を再生"
+        message = "保持した場合を試聴"
     return center, message
 
 
