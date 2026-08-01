@@ -403,13 +403,19 @@ def _relative_media(target: Path, html_dir: Path) -> str:
     return quote(rel.replace(os.sep, "/"))
 
 
-def state_label(requested: bool, effective: bool) -> str:
+def state_label(
+    requested: bool, effective: bool, kind: str = "speech", reason: str | None = None
+) -> str:
     """requested / effective の組み合わせから状態表示文言を返す（純関数）。
 
-    ON かつ EditPlan でも削除 → 「削除」、ON だが安全判定で残った → 「unsafeのため保持」。
+    ON かつ EditPlan でも削除 → 「削除」。ただし reason が "uts" でない
+    unrecognized 行（無印の未認識区間）は安全判定を通らない無条件カットなので
+    「削除（無条件）」と区別する。ON だが安全判定で残った → 「unsafeのため保持」。
     OFF なのに音が無い（手でテキストを消した等）→ 「削除（手動編集）」。
     """
     if requested and effective:
+        if kind == "unrecognized" and reason != "uts":
+            return "削除（無条件）"
         return "削除"
     if requested and not effective:
         return "unsafeのため保持"
@@ -475,9 +481,14 @@ def _segment_markup(seg: dict, serve: bool = False) -> str:
         parts.append(escape(seg["label"]))
     parts.append("</span>")
     if serve:
+        is_unsafe = seg["requested_delete"] and not seg["effective_delete"]
+        state_classes = "state unsafe" if is_unsafe else "state"
+        label = state_label(
+            seg["requested_delete"], seg["effective_delete"], seg["kind"], seg["reason"]
+        )
         parts.append(
-            f'<span class="state" data-i="{seg["index"]}">'
-            f'{escape(state_label(seg["requested_delete"], seg["effective_delete"]))}'
+            f'<span class="{state_classes}" data-i="{seg["index"]}">'
+            f'{escape(label)}'
             "</span>"
         )
     parts.append("</div>")
@@ -518,60 +529,110 @@ _HTML_TEMPLATE = Template("""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>$title</title>
 <style>
-:root { color-scheme: light dark; }
+/* Flexoki カラースキーム（light/dark）をカスタムプロパティで切替 */
+:root {
+  color-scheme: light dark;
+  --bg: #FFFCF0;           /* paper */
+  --surface: #F2F0E5;      /* base-50 */
+  --border: #DAD8CE;       /* base-150 */
+  --text: #100F0F;         /* black */
+  --text-muted: #6F6E69;   /* base-600 */
+  --accent: #205EA6;       /* blue-600 */
+  --accent-tint-weak: rgba(32,94,166,.10);
+  --accent-tint-strong: rgba(32,94,166,.22);
+  --on-accent: #FFFCF0;
+  --magenta: #A02F6F;      /* magenta-600 */
+  --magenta-tint: rgba(160,47,111,.14);
+  --orange: #BC5215;       /* orange-600 */
+  --orange-tint: rgba(188,82,21,.14);
+  --green: #66800B;        /* green-600 */
+  --red: #AF3029;          /* red-600 */
+  --yellow: #AD8301;       /* yellow-600 */
+  --yellow-tint: rgba(173,131,1,.14);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #100F0F;
+    --surface: #1C1B1A;    /* base-950 */
+    --border: #403E3C;     /* base-800 */
+    --text: #CECDC3;       /* base-200 */
+    --text-muted: #B7B5AC; /* base-300 */
+    --accent: #4385BE;     /* blue-400 */
+    --accent-tint-weak: rgba(67,133,190,.16);
+    --accent-tint-strong: rgba(67,133,190,.30);
+    --magenta: #CE5D97;    /* magenta-400 */
+    --magenta-tint: rgba(206,93,151,.20);
+    --orange: #DA702C;     /* orange-400 */
+    --orange-tint: rgba(218,112,44,.20);
+    --green: #879A39;      /* green-400 */
+    --red: #D14D41;        /* red-400 */
+  }
+}
 body {
   font-family: -apple-system, "Hiragino Sans", sans-serif;
   margin: 0 auto; padding: 1rem; max-width: 60rem; line-height: 1.7;
+  background: var(--bg); color: var(--text);
 }
 h1 { font-size: 1.2rem; margin: 0 0 .1rem; }
-.subtitle { font-size: .85rem; opacity: .7; margin: 0 0 .5rem; }
+.subtitle { font-size: .85rem; color: var(--text-muted); margin: 0 0 .5rem; }
 .note {
   font-size: .85rem; padding: .5rem .75rem; margin: 0 0 1rem;
-  border-left: 3px solid #c90; background: rgba(204,153,0,.12);
+  border-left: 3px solid var(--yellow); background: var(--yellow-tint);
 }
-/* 操作エリアはスクロールしても画面上部に固定する（Canvas は color-scheme 追従の背景色） */
+/* 操作エリアはスクロールしても画面上部に固定する */
 .controls {
-  position: sticky; top: 0; z-index: 10; background: Canvas;
-  padding: .5rem 0 .25rem; border-bottom: 1px solid rgba(127,127,127,.4);
+  position: sticky; top: 0; z-index: 10; background: var(--surface);
+  padding: .5rem 0 .25rem; border-bottom: 1px solid var(--border);
   margin-bottom: .75rem;
 }
-.players { display: flex; flex-wrap: wrap; gap: 1rem; margin-bottom: .75rem; }
-.players div { display: flex; align-items: center; gap: .5rem; }
-.players audio { height: 2rem; }
-.modes { margin-bottom: .75rem; }
-.modes button {
-  font: inherit; padding: .25rem .75rem; margin-right: .5rem; cursor: pointer;
+.player-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
+  margin-bottom: .5rem;
+}
+.player-row audio { height: 2rem; }
+.seek { display: flex; gap: .25rem; }
+.mode {
+  font: inherit; padding: .25rem .75rem; cursor: pointer;
   border: 1px solid currentColor; background: transparent; border-radius: .25rem;
 }
-.modes button.active { background: #0a64c8; color: #fff; border-color: #0a64c8; }
+.mode.active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.seek-btn {
+  font: inherit; font-size: .75rem; padding: .15rem .5rem; cursor: pointer;
+  border: 1px solid var(--border); background: transparent; border-radius: .25rem;
+  color: var(--text);
+}
+.seek-btn:hover { border-color: var(--accent); }
 .legend { font-size: .8rem; margin: 0 0 1rem; padding: 0; list-style: none; }
 .legend li { display: inline-block; margin-right: 1rem; }
 .stats {
   font-size: .8rem; margin: 0 0 1rem; padding: .5rem .75rem;
-  background: rgba(127,127,127,.12); white-space: pre-wrap;
+  background: var(--surface); border: 1px solid var(--border); white-space: pre-wrap;
 }
-#transcript { border-top: 1px solid rgba(127,127,127,.4); }
+#transcript { border-top: 1px solid var(--border); }
 .line, .trim {
   display: flex; gap: .5rem; align-items: baseline; cursor: pointer;
-  padding: .15rem .25rem; border-bottom: 1px solid rgba(127,127,127,.15);
+  padding: .15rem .25rem; border-bottom: 1px solid var(--border);
 }
-.line:hover, .trim:hover { background: rgba(10,100,200,.1); }
-.line.active, .trim.active { background: rgba(10,100,200,.22); }
-.ts { font-variant-numeric: tabular-nums; opacity: .6; font-size: .8rem; min-width: 3.5rem; }
-.sid { opacity: .4; font-size: .75rem; min-width: 3.5rem; }
+.line:hover, .trim:hover { background: var(--accent-tint-weak); }
+.line.active, .trim.active { background: var(--accent-tint-strong); }
+.ts { font-variant-numeric: tabular-nums; color: var(--text-muted); font-size: .8rem; min-width: 3.5rem; }
+.sid { color: var(--text-muted); font-size: .75rem; min-width: 3.5rem; opacity: .7; }
 .text { flex: 1; }
 /* 削除済み行（.sc.txt に無い行）は取消線 */
 .line.deleted .text { text-decoration: line-through; opacity: .55; }
-.line.unrec .text { color: #b06000; }
-.line.uts { background: rgba(255,160,0,.14); }
+.line.unrec .text { color: var(--orange); }
+.line.uts { background: var(--orange-tint); }
 .w { padding: 0 .05em; border-radius: .15em; }
-.w:hover { outline: 1px solid rgba(10,100,200,.6); }
+.w:hover { outline: 1px solid var(--accent); }
 /* フィラー提案単語（suggest）とカットされた単語 */
-.w.suggest { background: rgba(200,0,140,.16); }
+.w.suggest { background: var(--magenta-tint); }
 .w.cut { text-decoration: line-through; opacity: .5; }
-/* 削除指定したが安全判定で保持された状態（.line.uts より後に置き優先させる） */
-.w.unsafe, .line.unsafe { background: rgba(220,60,40,.18); }
-.trim { color: #0a7d50; font-size: .85rem; }
+/* 削除指定したが安全判定で保持された状態は破線アウトライン＋状態ラベル赤太字で示す
+   （フィラー提案の塗りつぶしと表現チャネルを分け、.line.uts より後に置き優先させる） */
+.w.unsafe, .line.unsafe {
+  outline: 1px dashed var(--red); outline-offset: 1px; background: none;
+}
+.trim { color: var(--green); font-size: .85rem; }
 /* --serve（Hlyst 対話モード）専用 */
 .save { display: flex; align-items: center; gap: .75rem; margin-bottom: .75rem; }
 .save button {
@@ -579,10 +640,11 @@ h1 { font-size: 1.2rem; margin: 0 0 .1rem; }
   border: 1px solid currentColor; background: transparent;
 }
 .save button:disabled { opacity: .4; cursor: default; }
-.save button.dirty { background: #0a7d50; color: #fff; border-color: #0a7d50; }
+.save button.dirty { background: var(--green); color: var(--on-accent); border-color: var(--green); }
 .save .msg { font-size: .8rem; }
-.save .msg.error { color: #c02020; }
-.state { font-size: .75rem; opacity: .65; min-width: 8rem; text-align: right; }
+.save .msg.error { color: var(--red); }
+.state { font-size: .75rem; color: var(--text-muted); min-width: 8rem; text-align: right; }
+.state.unsafe { color: var(--red); font-weight: 700; }
 label.wt { display: inline; }
 label.wt input { margin: 0 .1em 0 .2em; vertical-align: middle; }
 .line > input.del { margin: 0; align-self: center; }
@@ -593,20 +655,32 @@ label.wt input { margin: 0 .1em 0 .2em; vertical-align: middle; }
 <p class="subtitle">$subtitle</p>
 <p class="note">$note</p>
 <div class="controls">
-<div class="players">
-  <div><span>原音</span><audio id="audio-src" controls preload="metadata" src="$source_audio"></audio></div>
-  <div><span>編集後</span><audio id="audio-out" controls preload="metadata" src="$review_audio"></audio></div>
-</div>
-<div class="modes">
+<div class="player-row">
   <button type="button" class="mode active" data-mode="src">原音を再生</button>
+  <audio id="audio-src" controls preload="metadata" src="$source_audio"></audio>
+  <span class="seek">
+    <button type="button" class="seek-btn" data-player="src" data-seek="-10">−10s</button>
+    <button type="button" class="seek-btn" data-player="src" data-seek="-5">−5s</button>
+    <button type="button" class="seek-btn" data-player="src" data-seek="5">＋5s</button>
+    <button type="button" class="seek-btn" data-player="src" data-seek="10">＋10s</button>
+  </span>
+</div>
+<div class="player-row">
   <button type="button" class="mode" data-mode="out">編集後を再生</button>
+  <audio id="audio-out" controls preload="metadata" src="$review_audio"></audio>
+  <span class="seek">
+    <button type="button" class="seek-btn" data-player="out" data-seek="-10">−10s</button>
+    <button type="button" class="seek-btn" data-player="out" data-seek="-5">−5s</button>
+    <button type="button" class="seek-btn" data-player="out" data-seek="5">＋5s</button>
+    <button type="button" class="seek-btn" data-player="out" data-seek="10">＋10s</button>
+  </span>
 </div>
 $save_area
 <ul class="legend">
   <li><span class="w suggest">フィラー提案</span></li>
   <li><span class="w cut">カット済み</span></li>
   <li><span class="line uts" style="display:inline">未転写発話候補</span></li>
-  <li><span class="w unsafe">削除指定→安全判定で保持</span></li>
+  <li><span class="state unsafe" style="display:inline">削除指定→安全判定で保持</span></li>
   <li><span class="trim" style="display:inline">✂ 無音トリム</span></li>
   <li>行・単語をクリックすると前後 $pad 秒を再生します</li>
 </ul>
@@ -674,15 +748,29 @@ $transcript
   });
 
   Array.prototype.forEach.call(
-    document.querySelectorAll(".modes button"),
+    document.querySelectorAll(".mode"),
     function (btn) {
       btn.addEventListener("click", function () {
         Array.prototype.forEach.call(
-          document.querySelectorAll(".modes button"),
+          document.querySelectorAll(".mode"),
           function (b) { b.classList.remove("active"); }
         );
         btn.classList.add("active");
         mode = btn.dataset.mode;
+      });
+    }
+  );
+
+  // シークボタン（原音・編集後それぞれの currentTime を加減、0〜duration にクランプ）
+  Array.prototype.forEach.call(
+    document.querySelectorAll(".seek-btn"),
+    function (btn) {
+      btn.addEventListener("click", function () {
+        var audio = players[btn.dataset.player];
+        if (!audio) { return; }
+        var dur = isFinite(audio.duration) ? audio.duration : Infinity;
+        var next = audio.currentTime + Number(btn.dataset.seek);
+        audio.currentTime = Math.min(Math.max(0, next), dur);
       });
     }
   );
@@ -715,6 +803,15 @@ _SERVE_SCRIPT = """<script>
   var dirty = false;
   var busy = false;
   var baseline = snapshot();
+  // トグル直後は自動再生せず、取得した音声をキャッシュして
+  // 対象の行/単語をクリックしたときに再生する（key -> object URL）。
+  var previewCache = {};
+
+  function previewKey(target) {
+    return target.type === "word"
+      ? "W" + target.id + ":" + target.word
+      : "L" + target.id;
+  }
 
   function snapshot() {
     var s = {};
@@ -754,8 +851,11 @@ _SERVE_SCRIPT = """<script>
     msg.classList.toggle("error", !!isError);
   }
 
-  function stateLabel(requested, effective) {
-    if (requested && effective) { return "削除"; }
+  function stateLabel(requested, effective, kind, reason) {
+    if (requested && effective) {
+      if (kind === "unrecognized" && reason !== "uts") { return "削除（無条件）"; }
+      return "削除";
+    }
     if (requested) { return "unsafeのため保持"; }
     if (effective) { return "削除（手動編集）"; }
     return "保持";
@@ -765,13 +865,17 @@ _SERVE_SCRIPT = """<script>
     DATA.segments.forEach(function (seg) {
       var line = document.querySelector('.line[data-i="' + seg.index + '"]');
       if (!line) { return; }
+      var isUnsafe = seg.requested_delete && !seg.effective_delete;
       line.classList.toggle("deleted", seg.effective_delete);
-      line.classList.toggle("unsafe", seg.requested_delete && !seg.effective_delete);
+      line.classList.toggle("unsafe", isUnsafe);
       var box = line.querySelector("input.del");
       if (box) { box.checked = seg.requested_delete; }
       var state = line.querySelector(".state");
       if (state) {
-        state.textContent = stateLabel(seg.requested_delete, seg.effective_delete);
+        state.textContent = stateLabel(
+          seg.requested_delete, seg.effective_delete, seg.kind, seg.reason
+        );
+        state.classList.toggle("unsafe", isUnsafe);
       }
       seg.words.forEach(function (w) {
         var span = line.querySelector('.w[data-w="' + w.index + '"]');
@@ -844,16 +948,37 @@ _SERVE_SCRIPT = """<script>
       .then(function (payload) {
         mergeStates(payload.segments);
         applyStates();
-        note(payload.message || "試聴", false);
-        if (preview.dataset.blob) { URL.revokeObjectURL(preview.dataset.blob); }
-        preview.dataset.blob = URL.createObjectURL(toBlob(payload.audio));
-        preview.src = preview.dataset.blob;
-        var playing = preview.play();
-        if (playing && playing.catch) { playing.catch(function () {}); }
+        note((payload.message || "試聴") + "（クリックで再生）", false);
+        // 自動再生はせず、対象の行/単語をクリックしたときに再生できるよう
+        // 音声だけキャッシュしておく（key 単位で古い URL は破棄する）。
+        var key = previewKey(target);
+        if (previewCache[key]) { URL.revokeObjectURL(previewCache[key]); }
+        previewCache[key] = URL.createObjectURL(toBlob(payload.audio));
       })
       .catch(function (err) { note(err.message, true); })
       .then(function () { busy = false; setDirty(); });
   }
+
+  // キャッシュされた試聴音声があれば、その行/単語のクリックで再生する
+  // （まだ保存前のため、原音/編集後プレイヤーの再生位置は最新状態を反映しない）。
+  // capture フェーズで先取りし、通常のクリック再生（本文スクリプト側）より優先させる。
+  document.getElementById("transcript").addEventListener("click", function (ev) {
+    if (ev.target.closest("input, label.wt")) { return; }
+    var word = ev.target.closest(".w");
+    var line = ev.target.closest(".line");
+    if (!line) { return; }
+    var seg = DATA.segments[Number(line.dataset.i)];
+    if (!seg) { return; }
+    var key = word
+      ? previewKey({ type: "word", id: seg.id, word: Number(word.dataset.w) })
+      : previewKey({ type: "line", id: seg.id });
+    var cached = previewCache[key];
+    if (!cached) { return; }
+    ev.stopPropagation();
+    preview.src = cached;
+    var playing = preview.play();
+    if (playing && playing.catch) { playing.catch(function () {}); }
+  }, true);
 
   document.getElementById("transcript").addEventListener("change", function (ev) {
     var box = ev.target;
@@ -909,7 +1034,7 @@ def render_html(review: dict) -> str:
     return _HTML_TEMPLATE.substitute(
         title=escape(f"Hlyst — {review['base']}"),
         subtitle=escape(
-            "A/B試聴・編集（チェックで削除ON/OFF→即試聴→保存）"
+            "A/B試聴・編集（チェックで削除ON/OFF→クリックで試聴→保存）"
             if serve else "A/B試聴"
         ),
         save_area=_SAVE_AREA if serve else "",

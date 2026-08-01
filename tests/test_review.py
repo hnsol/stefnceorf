@@ -1,4 +1,7 @@
 import json
+import re
+import shutil
+import subprocess
 
 import numpy as np
 import pytest
@@ -673,6 +676,19 @@ def test_state_label_combinations():
     assert review.state_label(False, True) == "削除（手動編集）"
 
 
+def test_state_label_unconditional_cut_for_plain_unrecognized():
+    """無印の未認識区間（reason が uts でない）は無条件カットのため専用文言にする。"""
+    assert review.state_label(
+        True, True, kind="unrecognized", reason=None
+    ) == "削除（無条件）"
+    # UTS（reason: "uts"）は従来どおり「削除」
+    assert review.state_label(
+        True, True, kind="unrecognized", reason="uts"
+    ) == "削除"
+    # 通常発話行は従来どおり「削除」
+    assert review.state_label(True, True, kind="speech", reason=None) == "削除"
+
+
 def test_review_data_reports_requested_and_effective(tmp_path):
     """既定（requested 未指定）では TXT の行の有無と写像の被覆から推定する。"""
     _plan, rd = _build(tmp_path, "[0001] あえーい\n[0003] う\n")
@@ -787,3 +803,93 @@ def test_serve_html_embeds_token(tmp_path):
     assert rd["token"] == "t"
     assert _payload_json(html)["serve"] is True
     assert _payload_json(html)["token"] == "t"
+
+
+# ---- UI 改善（Flexoki 配色 / unsafe 表現 / トグル時の再生方式 / シーク / 2行レイアウト） ----
+
+def test_html_uses_flexoki_custom_properties(tmp_path):
+    html, _rd = _html(tmp_path)
+    assert "--bg: #FFFCF0" in html
+    assert "--red: #AF3029" in html
+    assert "prefers-color-scheme: dark" in html
+    assert "--accent: #4385BE" in html
+    # 直書きの rgba/hex はカスタムプロパティ参照に置き換わっている
+    assert "rgba(10,100,200" not in html
+    assert "rgba(220,60,40" not in html
+    assert "#0a64c8" not in html
+
+
+def test_unsafe_is_outline_not_background_fill(tmp_path):
+    """削除指定→安全判定で保持は塗りつぶしではなく破線アウトライン＋赤太字ラベル。"""
+    html, _rd = _html(tmp_path)
+    assert ".w.unsafe, .line.unsafe {" in html
+    assert "outline: 1px dashed var(--red)" in html
+    assert ".state.unsafe { color: var(--red); font-weight: 700; }" in html
+
+
+def test_serve_html_state_span_has_unsafe_class(tmp_path):
+    html, _rd = _serve_html(
+        tmp_path, _FULL_TXT, requested={"segments": {"0001": True}, "words": {}}
+    )
+    transcript = _transcript_html(html)
+    assert 'class="state unsafe" data-i="0"' in transcript
+
+
+def test_segment_markup_shows_unconditional_label_for_plain_unrecognized():
+    """UTS でない無印の未認識行は「削除（無条件）」と表示する。"""
+    seg = {
+        "index": 0, "id": "0002", "kind": "unrecognized", "reason": None,
+        "effective_delete": True, "requested_delete": True, "deleted": True,
+        "ts": "00:02", "words": [], "label": "⚠ 未認識区間 1.0秒（音声保持）",
+    }
+    markup = review._segment_markup(seg, serve=True)
+    assert '<span class="state" data-i="0">削除（無条件）</span>' in markup
+
+
+def test_serve_script_does_not_autoplay_preview_on_toggle(tmp_path):
+    """トグル直後は preview.play() を呼ばず、キャッシュしてクリック時に再生する。"""
+    html, _rd = _serve_html(tmp_path)
+    # runPreview 内では自動再生しない（play() 呼び出しは行わずキャッシュへ格納）
+    run_preview_body = html.split("function runPreview(target) {")[1].split(
+        "\n  }\n"
+    )[0]
+    assert "preview.play()" not in run_preview_body
+    assert "previewCache[key] = URL.createObjectURL" in run_preview_body
+    # クリック時に再生するコードパスが存在する（別ハンドラでキャッシュを再生する）
+    assert "var cached = previewCache[key];" in html
+    assert "preview.play()" in html
+
+
+def test_html_has_seek_buttons_for_both_players(tmp_path):
+    html, _rd = _html(tmp_path)
+    assert html.count('data-player="src"') == 4
+    assert html.count('data-player="out"') == 4
+    assert 'data-seek="-10"' in html
+    assert 'data-seek="-5"' in html
+    assert 'data-seek="5"' in html
+    assert 'data-seek="10"' in html
+
+
+def test_html_controls_is_two_player_rows(tmp_path):
+    html, _rd = _html(tmp_path)
+    assert html.count('class="player-row"') == 2
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node が見つからない")
+def test_generated_scripts_are_valid_javascript(tmp_path):
+    """生成 HTML 内の <script> はどちらも node --check で構文検証できる。"""
+    html, _rd = _serve_html(tmp_path)
+    checked = 0
+    for match in re.finditer(r'<script(?:\s[^>]*)?>(.*?)</script>', html, re.S):
+        attrs_body = match.group(0)
+        if 'type="application/json"' in attrs_body:
+            continue
+        code = match.group(1)
+        js_path = tmp_path / f"script_{checked}.js"
+        js_path.write_text(code, encoding="utf-8")
+        proc = subprocess.run(
+            ["node", "--check", str(js_path)], capture_output=True, text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+        checked += 1
+    assert checked == 2
