@@ -54,19 +54,24 @@ def test_parser_trans_alias_defaults():
 
 
 def test_parser_verbatim_filler_default_on():
-    """引数なしで verbatim / filler_suggest が既定 True になる。"""
+    """引数なしで verbatim / filler_suggest / auto_uts が既定 True になる。"""
     args = cli._build_parser().parse_args(["transcribe", "x.wav"])
     assert args.verbatim is True
     assert args.filler_suggest is True
+    assert args.auto_uts is True
 
 
 def test_parser_no_verbatim_no_filler_disable():
-    """--no-verbatim / --no-filler-suggest で False になる。"""
+    """--no-verbatim / --no-filler-suggest / --no-auto-uts で False になる。"""
     args = cli._build_parser().parse_args(
-        ["transcribe", "x.wav", "--no-verbatim", "--no-filler-suggest"]
+        [
+            "transcribe", "x.wav",
+            "--no-verbatim", "--no-filler-suggest", "--no-auto-uts",
+        ]
     )
     assert args.verbatim is False
     assert args.filler_suggest is False
+    assert args.auto_uts is False
 
 
 def test_parser_transcribe_still_works():
@@ -230,6 +235,7 @@ def test_main_direct_wav_transcribes_then_exports_logic(monkeypatch, tmp_path, c
             "filler_suggest": False,
             "pause_threshold": 0.2,
             "verbatim": False,
+            "auto_uts": True,
         }
         return {
             "txt_path": str(txt),
@@ -476,11 +482,7 @@ def test_main_no_args_prints_help_without_running_stages(monkeypatch, capsys):
     assert capsys.readouterr().out.startswith("usage: stefnceorf ")
 
 
-def test_main_trans_prints_uts_count(monkeypatch, tmp_path, capsys):
-    """未転写発話候補があれば件数を表示し、扱い方をstderrで案内する。"""
-    wav = tmp_path / "x.wav"
-    wav.write_bytes(b"dummy")
-
+def _fake_transcribe_with_uts(tmp_path):
     def _fake(input_wav, **kwargs):
         return {
             "txt_path": str(tmp_path / "x.sc.txt"),
@@ -493,8 +495,32 @@ def test_main_trans_prints_uts_count(monkeypatch, tmp_path, capsys):
             "uts_count": 3,
         }
 
-    monkeypatch.setattr("stefnceorf.transcribe.transcribe", _fake)
+    return _fake
+
+
+def test_main_trans_prints_uts_count_auto_cut(monkeypatch, tmp_path, capsys):
+    """既定（--auto-uts）: 件数を表示し、〔〕を外せば保持できることを案内する。"""
+    wav = tmp_path / "x.wav"
+    wav.write_bytes(b"dummy")
+
+    monkeypatch.setattr(
+        "stefnceorf.transcribe.transcribe", _fake_transcribe_with_uts(tmp_path)
+    )
     assert cli.main(["trans", str(wav)]) == 0
+    out = capsys.readouterr()
+    assert "未転写発話: 3件を自動カット指定" in out.out
+    assert "〔〕を外して" in out.err
+
+
+def test_main_trans_prints_uts_count_no_auto_uts(monkeypatch, tmp_path, capsys):
+    """--no-auto-uts: 従来どおり候補提示のみ（音声保持）の文言になる。"""
+    wav = tmp_path / "x.wav"
+    wav.write_bytes(b"dummy")
+
+    monkeypatch.setattr(
+        "stefnceorf.transcribe.transcribe", _fake_transcribe_with_uts(tmp_path)
+    )
+    assert cli.main(["trans", str(wav), "--no-auto-uts"]) == 0
     out = capsys.readouterr()
     assert "未転写発話候補: 3件" in out.out
     assert "TXTの該当行を削除" in out.err
@@ -504,4 +530,6 @@ def test_main_trans_hides_uts_line_when_zero(fake_transcribe, tmp_path, capsys):
     """候補0件（キー自体が無い場合を含む）では何も表示しない。"""
     _calls, wav = fake_transcribe
     cli.main(["trans", str(wav)])
-    assert "未転写発話候補" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "未転写発話候補" not in out
+    assert "未転写発話:" not in out

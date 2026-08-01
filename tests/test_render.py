@@ -1478,6 +1478,175 @@ def test_render_snap_rescues_decay_tail_filler(tmp_path, capsys):
     assert "残しました" not in err
 
 
+# ---- UTS（未転写発話）の既定自動削除: build_edit_plan / render 統合 ----
+
+def _write_uts_project(tmp_path, gapped: bool, sr=16000):
+    """結局[0,1]220 / (UTS島) / 面倒[...]660 の3チャンク音声+jsonを書く。
+
+    gapped=True: UTS島の前後に実無音（安全にカット可能）。
+    gapped=False: 全区間が連続音（無音なし・不安全→残置）。
+    戻り値: (wav, uts_duration, total_duration)。
+    """
+    import soundfile as sf
+
+    if gapped:
+        # 結局[0,1]220 / 無音[1,1.2] / UTS島[1.2,1.5]880 / 無音[1.5,1.7] / 面倒[1.7,2.7]660
+        uts_start, uts_end = 1.2, 1.5
+        face_start, face_end = 1.7, 2.7
+    else:
+        # 全区間連続音（無音なし）
+        uts_start, uts_end = 1.0, 2.0
+        face_start, face_end = 2.0, 3.0
+
+    total = face_end
+    audio = np.zeros(int(round(total * sr)))
+
+    def put(s, e, fr):
+        t = np.arange(int(round((e - s) * sr))) / sr
+        a = int(round(s * sr))
+        audio[a:a + len(t)] = 0.3 * np.sin(2 * np.pi * fr * t)
+
+    put(0.0, 1.0, 220.0)
+    put(uts_start, uts_end, 880.0)
+    put(face_start, face_end, 660.0)
+
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), audio, sr, subtype="PCM_16")
+
+    duration = uts_end - uts_start
+    data = {
+        "source_wav": str(wav.resolve()),
+        "language": "ja",
+        "model": "test",
+        "segments": [
+            {"id": "0001", "text": "結局",
+             "words": [{"word": "結局", "start": 0.0, "end": 1.0, "probability": 0.9}]},
+            {"id": "0002", "kind": "unrecognized", "reason": "uts",
+             "source_start": uts_start, "source_end": uts_end,
+             "text": "", "words": []},
+            {"id": "0003", "text": "面倒",
+             "words": [{"word": "面倒", "start": face_start, "end": face_end,
+                        "probability": 0.9}]},
+        ],
+    }
+    (tmp_path / "input.sc.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+    return wav, duration, total
+
+
+def test_render_uts_bracket_present_safe_cuts_and_shrinks(tmp_path, capsys):
+    """UTS〔〕を残す（削除指定）＋安全なら精密カットされ、統計・警告が正しい。"""
+    import soundfile as sf
+
+    _write_uts_project(tmp_path, gapped=True)
+    duration = 0.3
+    total = 2.7
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text(
+        f"[0001] 結局\n[0002] 〔未転写発話 {duration:.1f}秒〕\n[0003] 面倒\n",
+        encoding="utf-8",
+    )
+
+    plan = render.build_edit_plan(str(txt))
+    assert plan.stats.uts_requested == 1
+    assert plan.stats.uts_cut == 1
+    assert plan.stats.uts_skipped_unsafe == 0
+    assert plan.stats.uts_cut_removed_s > 0
+
+    out = render.render(str(txt))
+    o_audio, sr = sf.read(out)
+    dur = len(o_audio) / sr
+    # UTS島＋周辺無音の大半がカットされ、未編集尺（2.7s）より明確に短くなる。
+    assert dur < total - 0.3
+    err = capsys.readouterr().err
+    assert "残しました" not in err
+
+
+def test_render_uts_bracket_removed_keeps_audio(tmp_path):
+    """UTS〔〕を外す（保持指定）→ 従来どおり音声保持、カットされない。"""
+    import soundfile as sf
+
+    _write_uts_project(tmp_path, gapped=True)
+    total = 2.7
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text(
+        "[0001] 結局\n[0002] 未転写発話（保持）\n[0003] 面倒\n",
+        encoding="utf-8",
+    )
+
+    plan = render.build_edit_plan(str(txt))
+    assert plan.stats.uts_requested == 0
+    assert plan.stats.uts_cut == 0
+
+    out = render.render(str(txt))
+    o_audio, sr = sf.read(out)
+    dur = len(o_audio) / sr
+    assert dur == pytest.approx(total, abs=0.05)
+
+
+def test_render_uts_line_deleted_removes_audio(tmp_path):
+    """行ごと削除も従来どおりカットされる。"""
+    import soundfile as sf
+
+    _write_uts_project(tmp_path, gapped=True)
+    total = 2.7
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] 結局\n[0003] 面倒\n", encoding="utf-8")
+
+    out = render.render(str(txt))
+    o_audio, sr = sf.read(out)
+    dur = len(o_audio) / sr
+    assert dur < total - 0.3
+
+
+def test_render_uts_unsafe_kept_with_warning(tmp_path, capsys):
+    """UTS〔〕を残しても音響的に unsafe なら自動削除せず保持し警告する。"""
+    import soundfile as sf
+
+    _write_uts_project(tmp_path, gapped=False)
+    duration = 1.0
+    total = 3.0
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text(
+        f"[0001] 結局\n[0002] 〔未転写発話 {duration:.1f}秒〕\n[0003] 面倒\n",
+        encoding="utf-8",
+    )
+
+    plan = render.build_edit_plan(str(txt))
+    assert plan.stats.uts_requested == 1
+    assert plan.stats.uts_cut == 0
+    assert plan.stats.uts_skipped_unsafe == 1
+    assert plan.stats.uts_cut_removed_s == 0.0
+
+    out = render.render(str(txt))
+    o_audio, sr = sf.read(out)
+    dur = len(o_audio) / sr
+    assert dur == pytest.approx(total, abs=0.1)
+    err = capsys.readouterr().err
+    assert "残しました" in err
+    assert "未転写発話" in err
+
+
+def test_format_stats_uts_hidden_when_none_requested():
+    lines = render.format_stats(_stats())
+    assert not any(l.startswith("UTS:") for l in lines)
+
+
+def test_format_stats_uts_no_skip_omits_paren():
+    lines = render.format_stats(_stats(uts_requested=2, uts_cut=2))
+    assert "UTS: cut 2 of 2" in lines
+    assert not any("UTS:" in l and "kept:" in l for l in lines)
+
+
+def test_format_stats_uts_with_skip_and_seconds():
+    lines = render.format_stats(
+        _stats(uts_requested=3, uts_cut=2, uts_skipped_unsafe=1,
+               uts_cut_removed_s=0.65)
+    )
+    assert "UTS: cut 2 of 3, -0.7s (1 kept: too close to speech)" in lines
+
+
 # ---- CLI end-to-end ----
 
 def _make_multiseg_project(tmp_path, sr=16000):

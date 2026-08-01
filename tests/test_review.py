@@ -353,7 +353,7 @@ def test_review_data_marks_uts_and_label(tmp_path):
     seg = _seg(rd, "0002")
     assert seg["kind"] == "unrecognized"
     assert seg["reason"] == "uts"
-    assert "未転写発話候補" in seg["label"]
+    assert "〔未転写発話" in seg["label"]
 
 
 def test_review_data_keeps_suggest_flag(tmp_path):

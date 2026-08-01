@@ -49,6 +49,16 @@ def _add_transcription_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--auto-uts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "未転写発話（UTS）候補を既定でカット指定する（〔〕付きで提示し、"
+            "精密カットが安全な場合に自動削除。〔〕を外せば保持。"
+            "既定: 有効。--no-auto-uts で無効化すると候補提示のみ（音声保持）に戻る）"
+        ),
+    )
+    parser.add_argument(
         "--pause-threshold",
         type=float,
         default=PAUSE_THRESHOLD_S,
@@ -141,6 +151,7 @@ def _run_transcription(args: argparse.Namespace) -> tuple[int, dict | None]:
             filler_suggest=args.filler_suggest,
             pause_threshold=args.pause_threshold,
             verbatim=args.verbatim,
+            auto_uts=args.auto_uts,
         )
     except (RuntimeError, FileNotFoundError) as exc:
         print(f"エラー: {exc}", file=sys.stderr)
@@ -176,12 +187,19 @@ def _run_transcription(args: argparse.Namespace) -> tuple[int, dict | None]:
                     file=sys.stderr,
                 )
     if res.get("uts_count"):
-        print(f"未転写発話候補: {res['uts_count']}件")
-        print(
-            "ヒント: 未転写発話候補は音声保持のみです。"
-            "聞き直し、不要ならTXTの該当行を削除してください",
-            file=sys.stderr,
-        )
+        if args.auto_uts:
+            print(f"未転写発話: {res['uts_count']}件を自動カット指定（〔〕）")
+            print(
+                "ヒント: 聞き直して保持したい場合はTXTの〔〕を外してください",
+                file=sys.stderr,
+            )
+        else:
+            print(f"未転写発話候補: {res['uts_count']}件")
+            print(
+                "ヒント: 未転写発話候補は音声保持のみです。"
+                "聞き直し、不要ならTXTの該当行を削除してください",
+                file=sys.stderr,
+            )
     if res.get("silence_cut_count"):
         print(
             f"無音切り詰め: {res['silence_cut_count']}箇所 "

@@ -26,6 +26,8 @@ from urllib.parse import quote
 
 from .render import (
     FADE_S,
+    FILLER_CLOSE,
+    FILLER_OPEN,
     GAP_MAX_S,
     GAP_THRESHOLD_S,
     BLOCK_SEP,
@@ -195,9 +197,13 @@ def _deleted_boundary(
 
 
 def _unrecognized_label(seg: dict, duration: float) -> str:
-    """未認識/未転写発話候補セグメントの表示ラベル（transcribe の txt 行と同文言）。"""
+    """未認識/未転写発話セグメントの表示ラベル（transcribe の既定 txt 行と同文言）。
+
+    UTS（reason:"uts"）は既定でカット指定の 〔〕 付き表示にする
+    （--no-auto-uts 時の旧文言は json に区別情報が無いため反映しない）。
+    """
     if seg.get("reason") == "uts":
-        return f"⚠ 未転写発話候補 {duration:.1f}秒（音声保持）"
+        return f"{FILLER_OPEN}未転写発話 {duration:.1f}秒{FILLER_CLOSE}"
     return f"⚠ 未認識区間 {duration:.1f}秒（音声保持）"
 
 

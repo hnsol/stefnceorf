@@ -1436,6 +1436,7 @@ def transcribe(
     filler_suggest: bool = False,
     pause_threshold: float = PAUSE_THRESHOLD_S,
     verbatim: bool = False,
+    auto_uts: bool = True,
 ) -> dict:
     """入力wavを文字起こしし、.sc.json / .sc.txt を生成する。
 
@@ -1446,6 +1447,13 @@ def transcribe(
     verbatim=True のときはフィラーを転写するため各 30s チャンクに
     initial_prompt を渡す。condition_on_previous_text は False（短チャンク方式で
     繰り返し幻覚を断つ。非verbatim時もプロンプトなし・False）。
+
+    auto_uts=True（既定）のときは UTS（未転写発話）候補行を〔〕付きで出力し、
+    render 側でフィラーと同じ精密カット経路により既定でカットされる（行の
+    〔〕を外せば保持、行削除でも従来どおりカットされる）。auto_uts=False では
+    旧来の「⚠ 未転写発話候補 N.N秒（音声保持）」表示に戻り、音声は常に保持
+    される（render 側は 〔〕 の有無だけを見るため、この引数は txt 出力の
+    文言のみに影響し .sc.json の内容には影響しない）。
 
     戻り値: {"json_path", "txt_path", "filler_count", "data"}
     """
@@ -1744,10 +1752,18 @@ def transcribe(
             duration = max(0.0, source_end - source_start)
             if reason == "uts":
                 uts_count += 1
-                lines.append(
-                    f"[{seg_id} {_format_time(source_start)}] "
-                    f"⚠ 未転写発話候補 {duration:.1f}秒（音声保持）"
-                )
+                if auto_uts:
+                    # 既定: フィラー提案と同じ「〔〕はカット」規約。
+                    # 〔〕を外せば保持、行削除でも従来どおりカットされる。
+                    lines.append(
+                        f"[{seg_id} {_format_time(source_start)}] "
+                        f"{FILLER_OPEN}未転写発話 {duration:.1f}秒{FILLER_CLOSE}"
+                    )
+                else:
+                    lines.append(
+                        f"[{seg_id} {_format_time(source_start)}] "
+                        f"⚠ 未転写発話候補 {duration:.1f}秒（音声保持）"
+                    )
             else:
                 lines.append(
                     f"[{seg_id} {_format_time(source_start)}] "

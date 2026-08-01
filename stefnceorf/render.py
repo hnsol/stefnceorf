@@ -56,6 +56,10 @@ class EditStats:
     lines_total: int               # json のセグメント（行）総数
     lines_deleted: int             # 編集で丸ごと削除された行数
     lines_moved: int               # 並べ替えられた行数
+    uts_requested: int = 0         # 削除指定された（〔〕残し）UTS 行数
+    uts_cut: int = 0               # 安全と判定し精密カットした数
+    uts_skipped_unsafe: int = 0    # 音響的に不安全で残置した数
+    uts_cut_removed_s: float = 0.0 # UTSカットで削った合計秒
 
 
 @dataclass(frozen=True)
@@ -799,6 +803,7 @@ def format_stats(stats: EditStats, *, gaps_preserved: bool = False) -> list[str]
     出し分け:
     - Lines 行は削除/移動が1件以上のとき（括弧内は該当項目のみ）
     - Fillers 行は filler_requested > 0 のとき（残置0なら括弧省略）
+    - UTS 行は uts_requested > 0 のとき（残置0なら括弧省略、Fillers と同形式）
     - Silence 行は常時（1箇所は "1 gap"）
     - Duration 行は常時（gaps_preserved=True のとき ", cuts left as gaps" を付記）
     """
@@ -824,6 +829,14 @@ def format_stats(stats: EditStats, *, gaps_preserved: bool = False) -> list[str]
             line += f", -{stats.filler_cut_removed_s:.1f}s"
         if stats.filler_skipped_unsafe > 0:
             line += f" ({stats.filler_skipped_unsafe} kept: too close to speech)"
+        lines.append(line)
+
+    if stats.uts_requested > 0:
+        line = f"UTS: cut {stats.uts_cut} of {stats.uts_requested}"
+        if stats.uts_cut_removed_s > 0:
+            line += f", -{stats.uts_cut_removed_s:.1f}s"
+        if stats.uts_skipped_unsafe > 0:
+            line += f" ({stats.uts_skipped_unsafe} kept: too close to speech)"
         lines.append(line)
 
     gap_word = "gap" if stats.silence_trim_count == 1 else "gaps"
@@ -934,13 +947,20 @@ def build_edit_plan(
 
     plan_intervals: list[tuple[float, float]] = []
     all_warnings: list[str] = []
-    # 安全にカットされたフィラー単語の span（片側ポーズ残しの分岐判定に使う）。
+    # 安全に精密カットされた区間の span（片側ポーズ残しの分岐判定に使う）。
+    # フィラーとUTSで別リストに保持しつつ、plan_output_intervals へ渡す際は
+    # 合算した precise_cut_spans として扱う（どちらも「無音中の精密カット」で
+    # 同じポーズ保持ロジックが適用できるため）。
     # スナップ後の値を持つため、word_spans からの除外は値一致でなく (seg_id, wi)
     # キーで行う（スナップで元 span と一致しなくなるため）。
     filler_cut_spans: list[tuple[float, float]] = []
+    uts_cut_spans: list[tuple[float, float]] = []
     safe_filler_keys: set[tuple[str, int]] = set()
+    safe_uts_ids: set[str] = set()
     filler_requested = 0        # 削除指定されたフィラー総数（統計用）
     filler_skipped_unsafe = 0   # 音響的に不安全で残置した数（統計用）
+    uts_requested = 0           # 削除指定された（〔〕残し）UTS総数（統計用）
+    uts_skipped_unsafe = 0      # 音響的に不安全で残置した数（統計用）
     for seg_id, edited, brackets in parsed:
         seg = seg_map.get(seg_id)
         if seg is None:
@@ -948,7 +968,30 @@ def build_edit_plan(
         if seg.get("kind") == "unrecognized":
             start = float(seg["source_start"])
             end = float(seg["source_end"])
-            if end > start:
+            # UTS（reason:"uts"）で 〔〕 が編集後テキストに残っている＝削除指定。
+            # フィラーと同じ精密カット経路（谷スナップ＋安全判定＋0.25秒ポーズ保持）
+            # を UTS 島区間 [start, end] に適用する。unsafe なら自動削除せず
+            # 音声保持（従来の unrecognized 保持と同じ）に倒し警告する。
+            if seg.get("reason") == "uts" and brackets:
+                uts_requested += 1
+                duration = max(0.0, end - start)
+                lo_seg, hi_seg = seg_bounds.get(seg_id, (0.0, file_length_s))
+                cut = plan_filler_cut(
+                    audio, samplerate, {"start": start, "end": end},
+                    lo_seg, hi_seg, silences, rms_threshold,
+                )
+                if cut is not None:
+                    uts_cut_spans.append(cut)
+                    safe_uts_ids.add(seg_id)
+                else:
+                    if end > start:
+                        plan_intervals.append((start, end))
+                    uts_skipped_unsafe += 1
+                    all_warnings.append(
+                        f"[{seg_id}] 未転写発話〔{duration:.1f}秒〕は"
+                        "前後の音声と連続しているため残しました"
+                    )
+            elif end > start:
                 plan_intervals.append((start, end))
             continue
         # words は json 由来の共有 dict。谷スナップで start/end を書き換えるため
@@ -1038,6 +1081,8 @@ def build_edit_plan(
     content_spans: list[tuple[float, float]] = []
     for seg in segments:
         if seg.get("kind") == "unrecognized":
+            if seg.get("id") in safe_uts_ids:
+                continue
             start = float(seg["source_start"])
             end = float(seg["source_end"])
             if end > start:
@@ -1051,21 +1096,24 @@ def build_edit_plan(
             if s is not None and e is not None:
                 content_spans.append((float(s), float(e)))
 
+    # フィラーとUTSの精密カットspanは合算して渡す（どちらも無音中の精密カット
+    # として同じポーズ保持ロジックを適用する）。
+    precise_cut_spans = filler_cut_spans + uts_cut_spans
     out_intervals, cf_flags = plan_output_intervals(
         plan_intervals, content_spans, gap_threshold=gap_threshold, gap_max=gap_max,
-        filler_spans=filler_cut_spans,
+        filler_spans=precise_cut_spans,
         silence_spans=trim_silences,
     )
 
     # 無音切り詰めの集計。単純結合（cf_flags False）境界の区間間ギャップが削除秒。
-    # ただしフィラーポーズ境界（filler_cut_spans と重なる）は無音切り詰めでないため除外。
+    # ただし精密カットポーズ境界（precise_cut_spans と重なる）は無音切り詰めでないため除外。
     silence_trim_count = 0
     silence_trim_removed_s = 0.0
     silence_trim_boundaries: set[int] = set()
     for k in range(len(out_intervals) - 1):
         if k < len(cf_flags) and not cf_flags[k]:
             pe, ns = out_intervals[k][1], out_intervals[k + 1][0]
-            if not any(s < ns and e > pe for s, e in filler_cut_spans):
+            if not any(s < ns and e > pe for s, e in precise_cut_spans):
                 silence_trim_boundaries.add(k)
                 silence_trim_count += 1
                 silence_trim_removed_s += ns - pe
@@ -1101,6 +1149,10 @@ def build_edit_plan(
         lines_total=len(segments),
         lines_deleted=len(segments) - len(parsed),
         lines_moved=_count_moved_lines(edited_indices),
+        uts_requested=uts_requested,
+        uts_cut=len(safe_uts_ids),
+        uts_skipped_unsafe=uts_skipped_unsafe,
+        uts_cut_removed_s=sum(e - s for s, e in uts_cut_spans),
     )
 
     # 通常削除（クロスフェード結合）境界が発話に食い込んでいないかを警告のみ出す

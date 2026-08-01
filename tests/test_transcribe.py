@@ -3277,7 +3277,27 @@ def test_transcribe_records_uts_reason_in_json(tmp_path, fake_whisper, monkeypat
     ]
     assert others and all("reason" not in s for s in others)
     txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
+    # 既定（auto_uts=True）: フィラー提案と同じ「〔〕はカット」規約の行になる
+    assert "〔未転写発話 0.3秒〕" in txt
+
+
+def test_transcribe_no_auto_uts_keeps_legacy_line_text(
+    tmp_path, fake_whisper, monkeypatch
+):
+    """--no-auto-uts 相当（auto_uts=False）: 従来の候補提示文言（音声保持）のまま。"""
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 5.0)
+    monkeypatch.setattr(
+        transcribe,
+        "_detect_uts_spans",
+        lambda wav, segments, cuts, silences: [(2.0, 2.3)],
+    )
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja", auto_uts=False)
+
+    assert res["uts_count"] == 1
+    txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
     assert "⚠ 未転写発話候補 0.3秒（音声保持）" in txt
+    assert "〔未転写発話" not in txt
 
 
 @pytest.mark.parametrize("verbatim", [False, True])
