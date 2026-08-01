@@ -236,9 +236,28 @@ def test_unsupported_sequence_audio_rate_is_omitted(tmp_path):
     assert "audioRate" not in sequence.attrib
 
 
-@pytest.mark.parametrize("case", ["delete", "reorder", "filler", "long-silence"])
+@pytest.mark.parametrize(
+    "case", ["delete", "reorder", "filler", "long-silence", "guarded"]
+)
 def test_exporter_uses_shared_planned_intervals(tmp_path, case):
-    if case == "reorder":
+    if case == "guarded":
+        segments = [
+            {"id": "0001", "text": "あ",
+             "words": [{"word": "あ", "start": 0.0, "end": 1.0}]},
+            {
+                "id": "0002",
+                "text": "⚠ 未認識区間",
+                "words": [],
+                "kind": "unrecognized",
+                "source_start": 1.2,
+                "source_end": 1.6,
+            },
+            {"id": "0003", "text": "う",
+             "words": [{"word": "う", "start": 1.8, "end": 2.8}]},
+        ]
+        txt_body = "[0001] あ\n[0003] う\n"
+        extra = {"silences": [[1.0, 1.2], [1.6, 1.8]]}
+    elif case == "reorder":
         segments = [
             {"id": "0001", "text": "あ", "words": [{"word": "あ", "start": 0.0, "end": 1.0}]},
             {"id": "0002", "text": "い", "words": [{"word": "い", "start": 1.0, "end": 2.0}]},

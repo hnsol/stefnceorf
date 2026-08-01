@@ -79,6 +79,10 @@ stefnceorf は削除候補（フィラー・未転写発話候補・無音トリ
   プランを作れるようにする（既存 `build_edit_plan(path)` はそれを呼ぶ）
 - **状態モデル**: `requested_delete`（TXT上の指定）と `effective_delete`（安全判定後の実際）を
   分離。チェックは requested、表示・再生中心は effective
+  - 表示文言: `requested=false/effective=false`→「保持」、`requested=true/effective=true`→「削除」、
+    `requested=true/effective=false`→ 理由付き保持（`unsafe_reason="pause"` なら
+    「ポーズ不足のため保持」、`"boundary"` など他理由は従来どおり別文言）。
+    plain unrecognized 行の「削除（無条件）」表示は廃止した
 - **サーバー保護**: 起動毎トークン（URL＋POSTヘッダ）、Host/Origin 完全一致検証、
   配信は原音・review.wav の allowlist のみ、POST サイズ上限、preview/save の直列化
 

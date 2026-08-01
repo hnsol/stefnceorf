@@ -733,6 +733,21 @@ def test_plan_filler_both_short_caps_at_available():
     assert flags == [False]
 
 
+def test_guarded_unrecognized_policy_does_not_change_filler_short_pause_behavior():
+    """未認識/UTS用の「0.25秒未満なら保持」guarded cut方針をフィラー分岐へ
+    誤適用していないことの回帰固定（test_plan_filler_both_short_caps_at_availableと等価）。
+    """
+    out, flags = render.plan_output_intervals(
+        [(0.0, 1.0), (1.15, 2.15)],
+        [],
+        filler_spans=[(1.05, 1.10)],
+        filler_pause_keep=0.25,
+    )
+    kept = (out[0][1] - 1.0) + (1.15 - out[1][0])
+    assert kept == pytest.approx(0.10)
+    assert flags == [False]
+
+
 def test_plan_filler_with_normal_delete_prefers_crossfade():
     # フィラー span と通常削除語が同 gap → 分岐2（単語挟まり）優先でクロスフェード
     ivs = [(0.0, 1.0), (4.0, 5.0)]
@@ -2726,4 +2741,20 @@ def test_window_matches_real_project_render(tmp_path):
 
     window, start = render.render_plan_window(plan, 1.0, 0.5)
     # wav は PCM_16 へ量子化されるので許容誤差つきで比較する
+    assert np.allclose(window, full[start:start + len(window)], atol=1e-4)
+
+
+def test_window_matches_guarded_cut_boundary(tmp_path):
+    """guarded cut 境界（元位置0.25秒ポーズの結合点）を跨ぐ窓が
+    render_plan の全体出力とサンプル一致する。"""
+    import soundfile as sf
+
+    txt = _write_guarded_project(tmp_path, left_silence=0.20, right_silence=0.20)
+    txt.write_text("[0001] 前\n[0003] 後\n", encoding="utf-8")
+    plan = render.build_edit_plan(str(txt))
+    out = render.render_plan(plan, tmp_path / "ref.wav")
+    full, _sr = sf.read(out, dtype="float64")
+
+    # 単純結合（cf_flags=False）の境界は出力側 t=1.125（左保持ポーズ終端）
+    window, start = render.render_plan_window(plan, 1.125, 0.2)
     assert np.allclose(window, full[start:start + len(window)], atol=1e-4)
