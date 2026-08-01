@@ -427,6 +427,10 @@ def _segment_markup(seg: dict, serve: bool = False) -> str:
     classes = ["line"]
     if seg["effective_delete"]:
         classes.append("deleted")
+    # 削除指定したが安全判定で保持された状態は専用色で示す（チェックだけでは
+    # 「自分で外した保持」と区別できないため）
+    if seg["requested_delete"] and not seg["effective_delete"]:
+        classes.append("unsafe")
     if seg["kind"] == "unrecognized":
         classes.append("unrec")
     if seg["reason"] == "uts":
@@ -453,6 +457,8 @@ def _segment_markup(seg: dict, serve: bool = False) -> str:
                 wclasses.append("suggest")
             if word["cut"]:
                 wclasses.append("cut")
+            if word.get("requested_delete") and not word["cut"]:
+                wclasses.append("unsafe")
             span = (
                 f'<span class="{" ".join(wclasses)}" data-w="{wi}">'
                 f'{escape(word["text"])}</span>'
@@ -563,6 +569,8 @@ h1 { font-size: 1.2rem; margin: 0 0 .1rem; }
 /* フィラー提案単語（suggest）とカットされた単語 */
 .w.suggest { background: rgba(200,0,140,.16); }
 .w.cut { text-decoration: line-through; opacity: .5; }
+/* 削除指定したが安全判定で保持された状態（.line.uts より後に置き優先させる） */
+.w.unsafe, .line.unsafe { background: rgba(220,60,40,.18); }
 .trim { color: #0a7d50; font-size: .85rem; }
 /* --serve（Hlyst 対話モード）専用 */
 .save { display: flex; align-items: center; gap: .75rem; margin-bottom: .75rem; }
@@ -598,6 +606,7 @@ $save_area
   <li><span class="w suggest">フィラー提案</span></li>
   <li><span class="w cut">カット済み</span></li>
   <li><span class="line uts" style="display:inline">未転写発話候補</span></li>
+  <li><span class="w unsafe">削除指定→安全判定で保持</span></li>
   <li><span class="trim" style="display:inline">✂ 無音トリム</span></li>
   <li>行・単語をクリックすると前後 $pad 秒を再生します</li>
 </ul>
@@ -757,6 +766,7 @@ _SERVE_SCRIPT = """<script>
       var line = document.querySelector('.line[data-i="' + seg.index + '"]');
       if (!line) { return; }
       line.classList.toggle("deleted", seg.effective_delete);
+      line.classList.toggle("unsafe", seg.requested_delete && !seg.effective_delete);
       var box = line.querySelector("input.del");
       if (box) { box.checked = seg.requested_delete; }
       var state = line.querySelector(".state");
@@ -765,7 +775,10 @@ _SERVE_SCRIPT = """<script>
       }
       seg.words.forEach(function (w) {
         var span = line.querySelector('.w[data-w="' + w.index + '"]');
-        if (span) { span.classList.toggle("cut", w.effective_delete); }
+        if (span) {
+          span.classList.toggle("cut", w.effective_delete);
+          span.classList.toggle("unsafe", w.requested_delete && !w.effective_delete);
+        }
         var wbox = line.querySelector('input.delw[data-w="' + w.index + '"]');
         if (wbox) { wbox.checked = w.requested_delete; }
       });
