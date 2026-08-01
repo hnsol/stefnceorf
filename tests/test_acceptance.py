@@ -119,6 +119,9 @@ def _build_unrecognized_project(tmp_path, unrecognized_dur=2.0, gap=0.2):
         "silences": [
             [1.0, unrecognized_start], [unrecognized_end, next_start]
         ],
+        "rms_silences": [
+            [1.0, unrecognized_start], [unrecognized_end, next_start]
+        ],
         "segments": [
             {
                 "id": "0001",

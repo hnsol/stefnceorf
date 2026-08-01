@@ -48,6 +48,9 @@ def _make_project(tmp_path, sr=16000):
         "model": "test",
         "pause_threshold": 0.15,
         "silences": [[1.0, 1.1], [1.6, 1.8], [2.8, 2.9], [3.7, 3.8], [4.8, 7.0]],
+        "rms_silences": [
+            [1.0, 1.1], [1.6, 1.8], [2.8, 2.9], [3.7, 3.8], [4.8, 7.0],
+        ],
         "trim_silences": [[4.8, 7.0]],
         "segments": [
             {
@@ -1168,6 +1171,7 @@ def _uts_safe_cut_session(tmp_path, sr=16000):
         "model": "test",
         "pause_threshold": 0.15,
         "silences": [[2.65, 2.8], [3.8, 3.95]],
+        "rms_silences": [[2.65, 2.8], [3.8, 3.95]],
         "segments": [
             {
                 "id": "0001",
@@ -1233,6 +1237,7 @@ def test_unsafe_uts_is_requested_but_kept(tmp_path):
     data = _data(tmp_path)
     # 島の前後の無音を消して「発話と連続」状態にする
     data["silences"] = [[1.0, 1.1], [1.6, 1.8], [4.8, 7.0]]
+    data["rms_silences"] = [[1.0, 1.1], [1.6, 1.8], [4.8, 7.0]]
     (tmp_path / "input.sc.json").write_text(
         json.dumps(data, ensure_ascii=False), encoding="utf-8"
     )

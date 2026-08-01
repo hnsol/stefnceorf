@@ -1243,11 +1243,16 @@ def _detect_uts_spans(
     segments: list[dict],
     cuts: list[tuple[float, float]],
     silences: list[tuple[float, float]],
-) -> list[tuple[float, float]]:
-    """16kHz wav と確定済み単語時刻から UTS 候補区間（元音源時刻）を求める。
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """16kHz wav と確定済み単語時刻から (UTS候補区間, 細かいRMS無音) を返す。
 
     wav_path は切り詰め前の 16kHz wav（元音源と同じ時間軸）。単語は
     _finalize_segment_words で元音源時刻へ変換したものを使い、時間軸を揃える。
+
+    RMS無音（detect_rms_silences の結果）は UTS 検出の入力そのもので、render 側の
+    guarded cut（未認識/UTS 削除時に元位置へ残すポーズの計算）でも必要になる。
+    同じ音声を二度解析して値がずれるのを避けるため、ここで計算した結果を
+    そのまま返して .sc.json へ保存する（呼び出し側で再計算しない）。
 
     音声を読めない場合は候補なし（空リスト）として扱う。UTS は候補の可視化だけを
     行う補助機能であり、ここで文字起こし全体を失敗させる理由がないため。
@@ -1257,9 +1262,9 @@ def _detect_uts_spans(
     try:
         audio, samplerate = sf.read(wav_path, dtype="float32", always_2d=False)
     except (RuntimeError, OSError):
-        return []
+        return [], []
     if samplerate <= 0 or len(audio) == 0:
-        return []
+        return [], []
 
     words: list[dict] = []
     for seg in segments:
@@ -1274,12 +1279,13 @@ def _detect_uts_spans(
 
     word_spans = [(word["start"], word["end"]) for word in words]
     rms_silences = detect_rms_silences(audio, samplerate, word_spans)
-    return detect_untranscribed_speech(
+    uts_spans = detect_untranscribed_speech(
         len(audio) / float(samplerate),
         rms_silences,
         [],
         transcript_words=words,
     )
+    return uts_spans, rms_silences
 
 
 def _detect_silence(wav_path: str, d: float = SILENCE_MIN_S) -> str:
@@ -1703,7 +1709,9 @@ def transcribe(
         # UTS（未転写発話）検出は 16kHz 一時wav が unlink される前に行う。
         # --verbatim の有無に関わらず常時実行する（verbatim は「フィラーも転写
         # する」モードであり、転写に載らない発声の検出とは別問題のため）。
-        uts_spans = _detect_uts_spans(tmp_wav, kept_segments, cuts, periods)
+        uts_spans, rms_silences = _detect_uts_spans(
+            tmp_wav, kept_segments, cuts, periods
+        )
     finally:
         for p in {tmp_wav, trimmed_wav}:
             try:
@@ -1809,6 +1817,11 @@ def transcribe(
         "silences": [[round(s, 3), round(e, 3)] for s, e in block_silences],
         "trim_silences": [
             [round(s, 3), round(e, 3)] for s, e in cut_periods
+        ],
+        # UTS 検出で使った細かいRMS無音。render の guarded cut 専用
+        # （粗い silences ではフィラー前後の短いポーズを拾えないため）。
+        "rms_silences": [
+            [round(s, 3), round(e, 3)] for s, e in rms_silences
         ],
         "segments": segments_out,
     }

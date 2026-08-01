@@ -510,66 +510,65 @@ UNRECOGNIZED_PAUSE_KEEP_S = 0.25  # 未認識区間/UTS削除後に元位置で�
 def plan_guarded_pause(
     cut_start: float,
     cut_end: float,
-    previous_end: float,
-    next_start: float,
     silence_spans: list[tuple[float, float]] | None,
     pause_keep: float = UNRECOGNIZED_PAUSE_KEEP_S,
 ) -> tuple[tuple[float, float], tuple[float, float]] | None:
-    """元位置で発話境界に連続する既知無音を pause_keep 秒残す（純関数）。
+    """削除区間の両端に接する既知無音から pause_keep 秒を残す（純関数）。
 
     未認識区間・UTS行の削除は、デジタル無音の挿入や別位置のルームトーン借用、
     長いクロスフェードに頼らず「元の録音でその位置が本当に無音だった分だけ」
-    残すという方針の一部。したがって容量に数えてよいのは previous_end から
-    連続する既知無音（左）と next_start まで連続する既知無音（右）だけであり、
-    発話境界と無音区間の間に未知区間（silence_spans に含まれない隙間）が
-    あればそこから先は数えない。
+    残すという方針の一部。容量に数えてよいのは cut_start / cut_end を含む
+    （または端で接する）既知無音スパンだけで、対象から離れた位置の無音や、
+    間に未知音声を挟んだ先の無音は数えない。
 
-    左は previous_end から、右は next_start までを残すことで、残す区間は
-    常に発話側へ接続したままになる（cut_start/cut_end でクランプし、削除
-    対象の内側にある無音は数えない）。
+    silence_spans には UTS 検出と同じ細かいRMS無音（.sc.json の rms_silences）を
+    渡す。前後のセグメント境界（発話の端）ではなく無音スパン自体を基準にするのは、
+    対象の隣に残余の未認識行がある場合でも、その内部にある無音を使えるように
+    するため。
+
+    残す区間は無音スパンの外側端へ接続する:
+      左 = [左スパン開始, 左スパン開始 + left_keep]
+      右 = [右スパン終端 - right_keep, 右スパン終端]
+    その間（余剰の無音＋対象音声）が呼び出し側の exact cut 対象になる。
 
     配分は pause_keep を半分ずつ割り当て、片側の容量が不足していればその
-    不足分をもう片方へ回す。左右の既知無音容量の合計が pause_keep に満た
-    なければ安全に残せないので None を返す（呼び出し側はカットを諦めるか
-    別の扱いをする）。
+    不足分をもう片方へ回す。左右の容量合計が pause_keep に満たない場合、
+    または左右スパンの外側端の距離が pause_keep 未満（残す間の方が長い）の
+    場合は安全に残せないので None を返す。
     """
     if not silence_spans:
         return None
 
     # 隣接・重複する区間を先にマージしておく（SILENCE_EDGE_TOL_S 以内の隙間は結合）
     spans = sorted((float(s), float(e)) for s, e in silence_spans if e > s)
-    merged: list[list[float]] = []
+    merged: list[tuple[float, float]] = []
     for s, e in spans:
         if merged and s <= merged[-1][1] + SILENCE_EDGE_TOL_S:
-            merged[-1][1] = max(merged[-1][1], e)
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
         else:
-            merged.append([s, e])
+            merged.append((s, e))
 
-    # 左容量: previous_end に接する既知無音の連続部分（cut_start でクランプ）
-    left_capacity = 0.0
-    left_edge = previous_end
-    for s, e in merged:
-        if s <= left_edge + SILENCE_EDGE_TOL_S:
-            e_clamped = min(e, cut_start)
-            if e_clamped > left_edge:
-                left_capacity += e_clamped - left_edge
-                left_edge = e
-        else:
-            break
+    def _span_at(t: float) -> tuple[float, float] | None:
+        """時刻 t を含む（端で接する）無音スパン。無ければ None。"""
+        for s, e in merged:
+            if s <= t + SILENCE_EDGE_TOL_S and e >= t - SILENCE_EDGE_TOL_S:
+                return (s, e)
+        return None
 
-    # 右容量: next_start に接する既知無音の連続部分（cut_end でクランプ）
-    right_capacity = 0.0
-    right_edge = next_start
-    for s, e in reversed(merged):
-        if e >= right_edge - SILENCE_EDGE_TOL_S:
-            s_clamped = max(s, cut_end)
-            if s_clamped < right_edge:
-                right_capacity += right_edge - s_clamped
-                right_edge = s
-        else:
-            break
+    left_span = _span_at(cut_start)
+    right_span = _span_at(cut_end)
+    if left_span is None or right_span is None:
+        return None
+
+    left_edge = left_span[0]
+    right_edge = right_span[1]
+    left_capacity = left_span[1] - left_span[0]
+    right_capacity = right_span[1] - right_span[0]
 
     if left_capacity + right_capacity < pause_keep - 1e-6:
+        return None
+    if right_edge - left_edge < pause_keep - 1e-6:
+        # 左右が同じ（または近接した）無音スパンで、残す間より短い。
         return None
 
     half = pause_keep / 2.0
@@ -584,8 +583,8 @@ def plan_guarded_pause(
             right_keep = min(right_capacity, right_keep + deficit)
 
     return (
-        (previous_end, previous_end + left_keep),
-        (next_start - right_keep, next_start),
+        (left_edge, left_edge + left_keep),
+        (right_edge - right_keep, right_edge),
     )
 
 
@@ -689,6 +688,46 @@ def words_to_intervals(
         if end > start:
             intervals.append((start, end))
     return intervals
+
+
+def subtract_spans(
+    intervals: list[tuple[float, float]],
+    spans: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """intervals から spans と重なる部分を取り除く（必要なら分割する・純関数）。
+
+    guarded cut（未認識/UTS）の削除区間は、対象音声だけでなく「残す 0.25 秒を
+    超えた余剰の無音」も含む。その余剰無音は前後の保持区間（残余の未認識行や
+    マージンを伸ばした発話行）の**内部**に入り込むことがあり、区間と区間の
+    ギャップを見るだけの plan_output_intervals では削れない。そこで計画区間
+    そのものから削除区間を差し引く。
+
+    出力順は入力順を保つ（並べ替え済みの計画にも使える）。空になった区間は落とす。
+    """
+    if not spans:
+        return list(intervals)
+
+    merged: list[tuple[float, float]] = []
+    for s, e in sorted((float(s), float(e)) for s, e in spans if e > s):
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+
+    out: list[tuple[float, float]] = []
+    for start, end in intervals:
+        cursor = start
+        for s, e in merged:
+            if e <= cursor or s >= end:
+                continue
+            if s > cursor:
+                out.append((cursor, min(s, end)))
+            cursor = max(cursor, e)
+            if cursor >= end:
+                break
+        if cursor < end:
+            out.append((cursor, end))
+    return [(s, e) for s, e in out if e > s]
 
 
 def _word_in_gap(spans: list[tuple[float, float]], pe: float, ns: float,
@@ -1171,13 +1210,20 @@ def build_edit_plan_from_text(
     """
     data = context.data
     segments = data.get("segments", [])
-    # 音響安全判定用の無音区間（旧 json は None → RMS のみで判定）
+    # 無音リストは用途ごとに使い分ける（混ぜると別機能の挙動が変わる）。
+    # - block_silences: フィラーの音響安全判定用（粗い silencedetect パス）
+    # - trim_silences: 出力の長無音短縮用（認識用切り詰めと同じ元音源区間）
+    # - guard_silences: 未認識/UTS の guarded cut 専用（UTS 検出と同じ細かい
+    #   RMS パス）。粗いパスは最小無音長が長く、対象の直近ポーズを拾えない。
     silences = data.get("silences")
-    # 出力の長無音短縮には認識用切り詰めと同じ元音源区間を使う。
     # trim_silences 追加前の旧 json だけ block 用 silences へfallbackする。
     trim_silences = (
         data["trim_silences"] if "trim_silences" in data else silences
     )
+    # rms_silences を持たない旧 json は粗い silences へ fallback しない
+    # （粗いパスで代用すると誤った位置・長さのポーズを根拠にカットしてしまう）。
+    # guarded cut は成立せず reason="pause" の保持になる。再 transcribe で解消する。
+    guard_silences = data.get("rms_silences")
     seg_map: dict[str, dict] = {}
     for seg in segments:
         seg_map[seg["id"]] = seg
@@ -1242,11 +1288,10 @@ def build_edit_plan_from_text(
     guarded_cut_reasons: dict[str, str] = {}
 
     def _guarded_cut_span(
-        seg_id: str, start: float, end: float
+        start: float, end: float
     ) -> tuple[tuple[float, float] | None, str | None]:
         """(切り落とす区間, 保持理由) を返す。カットできるなら理由は None。"""
-        prev_end, next_start = seg_bounds.get(seg_id, (0.0, file_length_s))
-        keeps = plan_guarded_pause(start, end, prev_end, next_start, silences)
+        keeps = plan_guarded_pause(start, end, guard_silences)
         if keeps is None:
             return None, "pause"
         left_keep, right_keep = keeps
@@ -1348,7 +1393,7 @@ def build_edit_plan_from_text(
             uts_requested += 1
         else:
             unrecognized_requested += 1
-        span, reason = _guarded_cut_span(sid, start, end)
+        span, reason = _guarded_cut_span(start, end)
         if span is not None:
             if span[1] > span[0]:
                 guarded_line_removed_s[sid] = span[1] - span[0]
@@ -1381,7 +1426,7 @@ def build_edit_plan_from_text(
             # せず音声保持（従来の unrecognized 保持と同じ）に倒し警告する。
             if seg.get("reason") == "uts" and brackets:
                 uts_requested += 1
-                span, reason = _guarded_cut_span(seg_id, start, end)
+                span, reason = _guarded_cut_span(start, end)
                 if span is not None:
                     if span[1] > span[0]:
                         uts_cut_spans.append(span)
@@ -1507,6 +1552,10 @@ def build_edit_plan_from_text(
     # guarded cut は秒が確定済みなので exact_cut_spans（単純結合）へ渡す。
     precise_cut_spans = filler_cut_spans
     exact_cut_spans = uts_cut_spans + unrecognized_cut_spans
+    # guarded cut の削除区間は保持区間の内部（残余の未認識行や、マージンを
+    # 伸ばした発話行の中）へ食い込みうるので、計画区間から先に差し引く。
+    # ギャップ側の処理（plan_output_intervals の分岐2）だけでは削れない。
+    plan_intervals = subtract_spans(plan_intervals, exact_cut_spans)
     out_intervals, cf_flags = plan_output_intervals(
         plan_intervals, content_spans, gap_threshold=gap_threshold, gap_max=gap_max,
         filler_spans=precise_cut_spans,

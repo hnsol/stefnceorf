@@ -3253,12 +3253,49 @@ def test_preserve_unrecognized_gaps_regression_without_uts(uts_spans):
 
 # ---- UTS のパイプライン結線 ----
 
+def test_transcribe_saves_rms_silences_computed_once_for_uts(
+    tmp_path, fake_whisper, monkeypatch
+):
+    """UTS 検出で計算した RMS 無音をそのまま .sc.json へ保存する（再計算しない）。"""
+    import soundfile as sf
+
+    sr = 16000
+    # 発話[0,1.2] / 無音[1.2,1.5] / 発話[1.5,1.8]（fake_whisper の単語時刻に合わせる）
+    audio = np.zeros(int(round(1.8 * sr)))
+    for start, end in ((0.0, 1.2), (1.5, 1.8)):
+        n = int(round(end * sr)) - int(round(start * sr))
+        t = np.arange(n) / sr
+        audio[int(round(start * sr)):int(round(start * sr)) + n] = (
+            0.3 * np.sin(2 * np.pi * 220.0 * t)
+        )
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), audio, sr, subtype="PCM_16")
+
+    calls = []
+    real_detect = transcribe.detect_rms_silences
+
+    def spy(*args, **kwargs):
+        result = real_detect(*args, **kwargs)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(transcribe, "detect_rms_silences", spy)
+    transcribe.transcribe(str(wav), lang="ja")
+
+    data = json.loads((tmp_path / "input.sc.json").read_text(encoding="utf-8"))
+    assert len(calls) == 1  # 検出時の1回だけ（render 用に作り直さない）
+    assert calls[0]  # 実際に無音が見つかっている
+    assert data["rms_silences"] == [
+        [round(s, 3), round(e, 3)] for s, e in calls[0]
+    ]
+
+
 def test_transcribe_records_uts_reason_in_json(tmp_path, fake_whisper, monkeypatch):
     monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 5.0)
     monkeypatch.setattr(
         transcribe,
         "_detect_uts_spans",
-        lambda wav, segments, cuts, silences: [(2.0, 2.3)],
+        lambda wav, segments, cuts, silences: ([(2.0, 2.3)], []),
     )
     wav = _make_input(tmp_path)
     res = transcribe.transcribe(str(wav), lang="ja")
@@ -3289,7 +3326,7 @@ def test_transcribe_no_auto_uts_keeps_legacy_line_text(
     monkeypatch.setattr(
         transcribe,
         "_detect_uts_spans",
-        lambda wav, segments, cuts, silences: [(2.0, 2.3)],
+        lambda wav, segments, cuts, silences: ([(2.0, 2.3)], []),
     )
     wav = _make_input(tmp_path)
     res = transcribe.transcribe(str(wav), lang="ja", auto_uts=False)
@@ -3308,7 +3345,7 @@ def test_transcribe_detects_uts_regardless_of_verbatim(
 
     def spy(wav, segments, cuts, silences):
         calls.append(wav)
-        return []
+        return [], []
 
     monkeypatch.setattr(transcribe, "_detect_uts_spans", spy)
     wav = _make_input(tmp_path)
@@ -3321,7 +3358,7 @@ def test_transcribe_detects_uts_regardless_of_verbatim(
 def test_detect_uts_spans_returns_empty_for_unreadable_wav(tmp_path):
     bad = tmp_path / "broken.wav"
     bad.write_bytes(b"RIFFdummy")
-    assert transcribe._detect_uts_spans(str(bad), [], [], []) == []
+    assert transcribe._detect_uts_spans(str(bad), [], [], []) == ([], [])
 
 
 def test_detect_uts_spans_finds_untranscribed_burst(tmp_path):
@@ -3346,8 +3383,10 @@ def test_detect_uts_spans_finds_untranscribed_burst(tmp_path):
             {"word": "後", "start": 2.1, "end": 3.1, "probability": 0.9}
         ]},
     ]
-    out = transcribe._detect_uts_spans(str(wav), segments, [], [])
+    out, rms_silences = transcribe._detect_uts_spans(str(wav), segments, [], [])
 
+    # RMS無音は検出時の計算結果をそのまま返す（json 保存値と同一にするため）
+    assert rms_silences and all(e > s for s, e in rms_silences)
     assert len(out) == 1
     assert out[0][0] == pytest.approx(1.4, abs=0.02)
     assert out[0][1] == pytest.approx(1.7, abs=0.02)
