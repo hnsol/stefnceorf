@@ -9,6 +9,7 @@
 - `GET /audio/...`   : 原音・review.wav の2本だけ（allowlist、Range 対応）
 - `POST /preview`    : トグル反映済みの計画から窓 wav を返す
 - `POST /save`       : .sc.txt へ局所パッチして review.wav を作り直す
+- `POST /export`     : （必要なら保存してから）Logic 用 FCPXML を書き出す
 
 **TXT は再構成しない**。起動時の raw 行をそのまま保持し、トグル対象の行の
 削除/復活と 〔〕 の付与/解除だけを局所適用する（手編集した句読点・単語削除・
@@ -33,6 +34,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
 from . import fillers as fillers_mod
+from .fcpxml import export_fcpxml
 from .render import (
     _FILLER_RE,
     _LINE_RE,
@@ -95,6 +97,39 @@ class AudioRenderError(Exception):
     TXT は既にディスクへ保存済みなので、呼び出し側は「保存失敗」ではなく
     「TXT は保存済み・音声の更新のみ失敗」と分かる文言/フラグで応答する。
     """
+
+
+class FcpxmlExportError(Exception):
+    """FCPXML の生成に失敗した場合のエラー（clean export でも起きる）。
+
+    HTTP handler がレスポンスを組み立てられるよう、今回 TXT を書いたか・
+    今回 review.wav を再生成したか・確定済み review データを保持する
+    （review_updated が無いと stale 再生成成功→FCPXML 失敗のレスポンスで
+    音源更新済みかを判定できない）。
+    """
+
+    def __init__(
+        self, message: str, *,
+        txt_saved: bool, review_updated: bool, review_data: dict,
+    ) -> None:
+        super().__init__(message)
+        self.txt_saved = txt_saved
+        self.review_updated = review_updated
+        self.review_data = review_data
+
+
+class ExportRefreshError(Exception):
+    """/export 中の review.wav 再生成失敗（export 専用）。
+
+    /save の AudioRenderError レスポンス契約（既存 {"error": ..., "txt_saved": true}）
+    は一切変更しない。export() は AudioRenderError を捕捉してこの例外へ変換し、
+    「今回実際に TXT を書いたか」を保持する（stale 再試行では txt_saved=False に
+    なる。true 固定にしない）。
+    """
+
+    def __init__(self, message: str, *, txt_saved: bool) -> None:
+        super().__init__(message)
+        self.txt_saved = txt_saved
 
 
 # ---------------------------------------------------------------- raw TXT 操作
@@ -548,6 +583,9 @@ class HlystSession:
         )
         self.version = 0
         self.plan = None
+        # review.wav が現在の raw TXT より古いか（再生成が必要か）。
+        # False へ戻すのは render_plan 成功後だけ（refresh に責務を集約）。
+        self.review_stale = True
         self.refresh()
 
     # -- 計画とレビュー音声
@@ -559,9 +597,15 @@ class HlystSession:
         )
 
     def refresh(self) -> None:
-        """現在の raw TXT から計画を作り直し review.wav を書き出す。"""
+        """現在の raw TXT から計画を作り直し review.wav を書き出す。
+
+        review_stale を False へ戻すのは render_plan が成功した後だけ。
+        計画を作り直した時点で戻すと、書き出しに失敗したまま「最新」とみなされ
+        次回以降に再試行されなくなる。
+        """
         self.plan = self.plan_for(self.raw_text)
         render_plan(self.plan, self.review_wav)
+        self.review_stale = False
         self.version += 1
 
     def audio_url(self, name: str) -> str:
@@ -629,51 +673,136 @@ class HlystSession:
                 "stats": data["stats"],
             }
 
-    # -- 保存
+    # -- 保存（save / export が共用する部品。ロックは呼び出し側で取る）
+
+    def _check_external_change(self) -> None:
+        """起動後に .sc.txt が外部で変更されていたら ExternalChangeError。"""
+        # 判定は hash 不一致だけを基準にする（mtime は偽装され得るため
+        # 「mtime 一致＝無検査で信頼してよい」とはしない）。mtime 一致なら
+        # hash 計算を省略してよいという高速化はここでは採用しない。
+        current = self.context.txt_path.read_text(encoding="utf-8")
+        if _sha256(current) != self.digest:
+            raise ExternalChangeError(
+                "起動後に .sc.txt が外部で変更されています。"
+                "画面を閉じて `sc review --serve` をやり直してください"
+            )
+
+    def _apply_toggles_text(self, toggles: list[dict]) -> str:
+        """トグルを raw TXT へ局所適用した新しいテキストを返す。"""
+        return apply_toggles(
+            self.raw_text, self.context.data, self.fillers, toggles
+        )
+
+    def _write_if_changed(self, text: str) -> bool:
+        """内容が変わっていれば .sc.txt を書き換える（書いたら True）。"""
+        path = self.context.txt_path
+        if text == self.raw_text:
+            return False
+        backup = path.with_name(path.name + ".bak")
+        if not backup.exists():
+            backup.write_text(self.raw_text, encoding="utf-8")
+        _atomic_write(path, text)
+        # 保存基準を更新する（さもないと2回目の保存が外部変更扱いになる）
+        self.raw_text = text
+        self.digest = _sha256(text)
+        self.mtime_ns = path.stat().st_mtime_ns
+        # 書いた時点で review.wav は古い。再生成成功まで True のままにする。
+        self.review_stale = True
+        return True
+
+    def _refresh_after_save(self) -> None:
+        """TXT 書き込み後の review.wav 再生成（失敗は AudioRenderError）。
+
+        呼ばれる時点で TXT の書き込みは既に完了しているので、失敗しても
+        「保存失敗」ではなく「TXT は保存済み・音声の更新のみ失敗」と
+        呼び出し側に伝える（TxtEditError/ExternalChangeError と違い、
+        ロールバックすべきディスク上の状態が既に無いため）。
+        """
+        try:
+            self.refresh()
+        except Exception as exc:
+            raise AudioRenderError(
+                "TXT は保存済みです。review.wav の更新に失敗しました: "
+                f"{exc}"
+            ) from exc
 
     def save(self, toggles: list[dict]) -> dict:
         """トグル状態を .sc.txt へ局所パッチし、review.wav を作り直す。"""
         with self.lock:
-            path = self.context.txt_path
-            mtime_ns = path.stat().st_mtime_ns
-            # 判定は hash 不一致だけを基準にする（mtime は偽装され得るため
-            # 「mtime 一致＝無検査で信頼してよい」とはしない）。mtime 一致なら
-            # hash 計算を省略してよいという高速化はここでは採用しない。
-            current = path.read_text(encoding="utf-8")
-            if _sha256(current) != self.digest:
-                raise ExternalChangeError(
-                    "起動後に .sc.txt が外部で変更されています。"
-                    "画面を閉じて `sc review --serve` をやり直してください"
-                )
-
-            text = apply_toggles(
-                self.raw_text, self.context.data, self.fillers, toggles
-            )
-            if text != self.raw_text:
-                backup = path.with_name(path.name + ".bak")
-                if not backup.exists():
-                    backup.write_text(self.raw_text, encoding="utf-8")
-                _atomic_write(path, text)
-                # 保存基準を更新する（さもないと2回目の保存が外部変更扱いになる）
-                self.raw_text = text
-                self.digest = _sha256(text)
-            self.mtime_ns = path.stat().st_mtime_ns
-
-            # ここまでで TXT の書き込みは既に完了している。以降で失敗しても
-            # 「保存失敗」ではなく「TXT は保存済み・音声の更新のみ失敗」と
-            # 呼び出し側に伝える（TxtEditError/ExternalChangeError と違い、
-            # ロールバックすべきディスク上の状態が既に無いため）。
-            try:
-                self.refresh()
-            except Exception as exc:
-                raise AudioRenderError(
-                    "TXT は保存済みです。review.wav の更新に失敗しました: "
-                    f"{exc}"
-                ) from exc
+            self._check_external_change()
+            self._write_if_changed(self._apply_toggles_text(toggles))
+            self._refresh_after_save()
             data = self.review_data(self.raw_text, self.plan)
             return {
                 "version": self.version,
-                "txt_path": str(path),
+                "txt_path": str(self.context.txt_path),
+                "segments": data["segments"],
+                "stats": data["stats"],
+                "warnings": data["warnings"],
+            }
+
+    # -- FCPXML 書き出し
+
+    @property
+    def fcpxml_path(self) -> Path:
+        """書き出し先（sc logic の既定出力名と同一）。"""
+        return (
+            self.context.txt_path.parent
+            / f"{self.context.base_name}.logic.fcpxml"
+        )
+
+    def export(self, toggles: list[dict]) -> dict:
+        """未保存変更があれば保存してから Logic 用 FCPXML を書き出す。
+
+        変更が無く review.wav も最新なら TXT・review.wav・version を触らず
+        FCPXML だけを作り直す。前回の export で review.wav の再生成に失敗して
+        いた場合（review_stale）は、TXT を書き直さずに再生成だけ再試行する。
+        """
+        with self.lock:
+            self._check_external_change()
+            saved = self._write_if_changed(self._apply_toggles_text(toggles))
+
+            review_updated = False
+            if saved or self.review_stale:
+                try:
+                    self._refresh_after_save()
+                except AudioRenderError as exc:
+                    # review.wav が古いままなので FCPXML は作らない。
+                    # txt_saved は「今回実際に書いたか」（stale 再試行では False）。
+                    raise ExportRefreshError(str(exc), txt_saved=saved) from exc
+                review_updated = True
+
+            data = self.review_data(self.raw_text, self.plan)
+            final_path = self.fcpxml_path
+            stats_lines: list[str] = []  # 標準出力抑止専用。レスポンスへは返さない
+            tmp = final_path.with_name(f".{final_path.name}.hlyst.tmp")
+            try:
+                export_fcpxml(
+                    str(self.context.txt_path),
+                    output=str(tmp),
+                    gap_threshold=self.gap_threshold,
+                    gap_max=self.gap_max,
+                    stats_out=stats_lines,
+                )
+                os.replace(tmp, final_path)
+            except Exception as exc:
+                try:
+                    tmp.unlink(missing_ok=True)  # 一時ファイルを残さない
+                except OSError:
+                    pass  # cleanup 失敗で元例外を隠さない
+                raise FcpxmlExportError(
+                    f"FCPXMLの生成に失敗しました: {exc}",
+                    txt_saved=saved,
+                    review_updated=review_updated,
+                    review_data=data,
+                ) from exc  # 既存の正常な .logic.fcpxml は不変
+
+            return {
+                "fcpxml_path": str(final_path),
+                "fcpxml_generated": True,
+                "txt_saved": saved,
+                "review_updated": review_updated,
+                "version": self.version,
                 "segments": data["segments"],
                 "stats": data["stats"],
                 "warnings": data["warnings"],
@@ -943,7 +1072,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if not self._check_token(query, header=True):
             return
-        if parsed.path not in ("/preview", "/save"):
+        if parsed.path not in ("/preview", "/save", "/export"):
             self._error(404, "見つかりません")
             return
 
@@ -990,8 +1119,41 @@ class _Handler(BaseHTTPRequestHandler):
                     self._error(400, str(exc))
                     return
                 self._send_json(200, self.session.preview(toggles, target, pad_s))
-            else:
+            elif parsed.path == "/save":
                 self._send_json(200, self.session.save(toggles))
+            else:
+                self._send_json(200, self.session.export(toggles))
+        except ExportRefreshError as exc:
+            # review.wav が古いままなので plan 由来のデータは返さない。
+            # txt_saved は「今回実際に TXT を書いたか」。
+            self._send_json(
+                500,
+                {
+                    "error": str(exc),
+                    "txt_saved": exc.txt_saved,
+                    "fcpxml_generated": False,
+                    "review_updated": False,
+                },
+                close=True,
+            )
+        except FcpxmlExportError as exc:
+            # TXT 保存・review.wav 再生成の成否は 2軸で伝える（画面は
+            # txt_saved で保存基準、review_updated で音源を同期する）。
+            data = exc.review_data
+            self._send_json(
+                500,
+                {
+                    "error": str(exc),
+                    "txt_saved": exc.txt_saved,
+                    "fcpxml_generated": False,
+                    "review_updated": exc.review_updated,
+                    "version": self.session.version,
+                    "segments": data["segments"],
+                    "stats": data["stats"],
+                    "warnings": data["warnings"],
+                },
+                close=True,
+            )
         except AudioRenderError as exc:
             # TXT の書き込みは成功しているので "保存失敗" とは区別する
             # （txt_saved フラグと文言の両方で伝える）。

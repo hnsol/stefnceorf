@@ -1486,3 +1486,375 @@ def test_preview_and_save_are_serialized_by_one_lock(tmp_path, monkeypatch):
     session.preview(toggles, {"type": "line", "id": "0003"})
     session.save(toggles)
     assert seen == [True, True]
+
+
+# ---- FCPXML 書き出し（/export） ----
+
+def _fcpxml_path(tmp_path):
+    return tmp_path / "input.logic.fcpxml"
+
+
+def _tmp_files(tmp_path):
+    return [p.name for p in tmp_path.iterdir() if p.name.endswith(".hlyst.tmp")]
+
+
+def _cut_0003_toggles(tmp_path, session):
+    """0003 を削除指定にしたトグル列（他は現状のまま）。"""
+    toggles = _all_toggles(tmp_path, session.raw_text)
+    for t in toggles:
+        if t["type"] == "line" and t["id"] == "0003":
+            t["delete"] = True
+    return toggles
+
+
+def test_export_dirty_saves_txt_and_generates_fcpxml(tmp_path):
+    """未保存変更つきの export は TXT 保存＋review.wav 再生成＋FCPXML 生成。"""
+    session, txt = _session(tmp_path)
+    version_before = session.version
+    review_before = session.review_wav.read_bytes()
+
+    result = session.export(_cut_0003_toggles(tmp_path, session))
+
+    assert result["txt_saved"] is True
+    assert result["review_updated"] is True
+    assert result["fcpxml_generated"] is True
+    assert result["version"] == version_before + 1
+    assert "[0003" not in txt.read_text(encoding="utf-8")
+    assert (tmp_path / "input.sc.txt.bak").read_text(encoding="utf-8") == _TXT
+    assert session.review_wav.read_bytes() != review_before
+    assert result["fcpxml_path"] == str(_fcpxml_path(tmp_path))
+    assert _fcpxml_path(tmp_path).read_text(encoding="utf-8").startswith("<?xml")
+    assert _tmp_files(tmp_path) == []
+
+
+def test_export_clean_generates_fcpxml_only(tmp_path):
+    """変更なしの export は TXT・.bak・review.wav・version を一切触らない。"""
+    session, txt = _session(tmp_path)
+    txt_before = txt.read_bytes()
+    review_before = session.review_wav.read_bytes()
+    review_mtime = session.review_wav.stat().st_mtime_ns
+    version_before = session.version
+
+    result = session.export(_all_toggles(tmp_path, session.raw_text))
+
+    assert result["txt_saved"] is False
+    assert result["review_updated"] is False
+    assert result["fcpxml_generated"] is True
+    assert result["version"] == version_before
+    assert txt.read_bytes() == txt_before
+    assert not (tmp_path / "input.sc.txt.bak").exists()
+    assert session.review_wav.read_bytes() == review_before
+    assert session.review_wav.stat().st_mtime_ns == review_mtime
+    assert _fcpxml_path(tmp_path).exists()
+    assert result["segments"] and result["stats"]
+    assert "warnings" in result
+
+
+def test_export_passes_session_gap_arguments(tmp_path, monkeypatch):
+    """セッションの gap 設定と stats_out がそのまま export_fcpxml へ渡る。"""
+    _make_project(tmp_path)
+    txt = _write_txt(tmp_path)
+    session = serve.HlystSession(str(txt), gap_threshold=0.35, gap_max=1.25)
+    seen = {}
+
+    def _spy(txt_path, output=None, gap_threshold=None, gap_max=None,
+             stats_out=None):
+        seen.update({
+            "txt_path": txt_path, "output": output,
+            "gap_threshold": gap_threshold, "gap_max": gap_max,
+            "stats_out": stats_out,
+        })
+        from pathlib import Path as _P
+
+        _P(output).write_text("<?xml?>", encoding="utf-8")
+        if stats_out is not None:
+            stats_out.append("Duration: 0.0s")
+        return output
+
+    monkeypatch.setattr(serve, "export_fcpxml", _spy)
+    session.export([])
+
+    assert seen["txt_path"] == str(txt)
+    assert seen["gap_threshold"] == 0.35
+    assert seen["gap_max"] == 1.25
+    assert isinstance(seen["stats_out"], list)
+    assert seen["output"] != str(_fcpxml_path(tmp_path))
+    assert _fcpxml_path(tmp_path).read_text(encoding="utf-8") == "<?xml?>"
+
+
+def test_export_does_not_print_stats_to_stdout(tmp_path, capsys):
+    session, _txt = _session(tmp_path)
+    capsys.readouterr()
+    session.export([])
+    assert capsys.readouterr().out == ""
+
+
+def test_export_matches_sc_logic_output(tmp_path):
+    """生成 FCPXML は同じ gap 引数の sc logic 出力とバイト一致する。"""
+    from stefnceorf.fcpxml import export_fcpxml
+
+    session, txt = _session(tmp_path)
+    result = session.export(_cut_0003_toggles(tmp_path, session))
+    reference = tmp_path / "reference.fcpxml"
+    export_fcpxml(
+        str(txt), output=str(reference),
+        gap_threshold=session.gap_threshold, gap_max=session.gap_max,
+        stats_out=[],
+    )
+    assert _fcpxml_path(tmp_path).read_bytes() == reference.read_bytes()
+    assert result["fcpxml_path"] == str(_fcpxml_path(tmp_path))
+
+
+def test_export_requires_token_and_origin(server):
+    httpd, _url, _txt = server
+    status, _h, _b = _post(
+        httpd, "/export", {"toggles": []}, headers={"X-Hlyst-Token": "wrong"}
+    )
+    assert status == 403
+    status, _h, _b = _post(
+        httpd, "/export", {"toggles": []}, origin="http://evil.example"
+    )
+    assert status == 403
+    token = _token(httpd)
+    status, _h, _b = _request(
+        httpd, "POST", f"/export?token={token}", b"{}",
+        {"Content-Type": "application/json", "X-Hlyst-Token": token},
+    )
+    assert status == 403
+
+
+def test_export_rejects_oversized_body(server):
+    httpd, _url, _txt = server
+    token = _token(httpd)
+    conn = http.client.HTTPConnection(
+        "127.0.0.1", httpd.server_address[1], timeout=10
+    )
+    try:
+        conn.putrequest("POST", f"/export?token={token}")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("X-Hlyst-Token", token)
+        conn.putheader("Origin", f"http://127.0.0.1:{httpd.server_address[1]}")
+        conn.putheader("Content-Length", str(serve.MAX_POST_BYTES + 1))
+        conn.endheaders()
+        res = conn.getresponse()
+        assert res.status == 413
+    finally:
+        conn.close()
+
+
+def test_export_blocked_on_external_change_keeps_fcpxml(server, tmp_path):
+    """外部変更があれば 409。FCPXML は作らず txt_saved も立てない。"""
+    httpd, _url, txt = server
+    txt.write_text(_TXT + "[0005 0:09] 外部編集\n", encoding="utf-8")
+    status, _h, body = _post(httpd, "/export", {"toggles": []})
+    assert status == 409
+    payload = json.loads(body)
+    assert "外部" in payload["error"]
+    assert payload.get("txt_saved", False) is False
+    assert not _fcpxml_path(tmp_path).exists()
+
+
+def test_export_dirty_fcpxml_failure_reports_txt_saved_true(
+    server, tmp_path, monkeypatch
+):
+    """dirty export の FCPXML 失敗は保存済み・音源更新済みとして返す。"""
+    httpd, _url, txt = server
+    session = httpd.session
+    status, _h, _b = _post(httpd, "/export", {"toggles": []})
+    assert status == 200
+    fcpxml_before = _fcpxml_path(tmp_path).read_bytes()
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(serve, "export_fcpxml", _boom)
+    toggles = _cut_0003_toggles(tmp_path, session)
+    status, _h, body = _post(httpd, "/export", {"toggles": toggles})
+
+    assert status == 500
+    payload = json.loads(body)
+    assert payload["txt_saved"] is True
+    assert payload["review_updated"] is True
+    assert payload["fcpxml_generated"] is False
+    assert "boom" in payload["error"]
+    assert payload["version"] == session.version
+    assert _seg(payload["segments"], "0003")["effective_delete"] is True
+    assert isinstance(payload["stats"], list)
+    assert "warnings" in payload
+    assert _fcpxml_path(tmp_path).read_bytes() == fcpxml_before
+    assert _tmp_files(tmp_path) == []
+
+
+def test_export_clean_fcpxml_failure_reports_txt_saved_false(
+    server, tmp_path, monkeypatch
+):
+    """clean export の FCPXML 失敗は UI 状態を変えないフラグで返す。"""
+    httpd, _url, txt = server
+    session = httpd.session
+    status, _h, _b = _post(httpd, "/export", {"toggles": []})
+    assert status == 200
+    fcpxml_before = _fcpxml_path(tmp_path).read_bytes()
+    version_before = session.version
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(serve, "export_fcpxml", _boom)
+    status, _h, body = _post(httpd, "/export", {"toggles": []})
+
+    assert status == 500
+    payload = json.loads(body)
+    assert payload["txt_saved"] is False
+    assert payload["review_updated"] is False
+    assert payload["fcpxml_generated"] is False
+    assert payload["version"] == version_before
+    assert payload["segments"] and isinstance(payload["stats"], list)
+    assert "warnings" in payload
+    assert _fcpxml_path(tmp_path).read_bytes() == fcpxml_before
+    assert _tmp_files(tmp_path) == []
+
+
+def test_export_dirty_refresh_failure_states(tmp_path, monkeypatch):
+    """TXT 保存後に review.wav 再生成が失敗したら stale のまま FCPXML を作らない。"""
+    session, txt = _session(tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(serve, "render_plan", _boom)
+    with pytest.raises(serve.ExportRefreshError) as exc:
+        session.export(_cut_0003_toggles(tmp_path, session))
+
+    assert exc.value.txt_saved is True
+    assert session.review_stale is True
+    assert "[0003" not in txt.read_text(encoding="utf-8")
+    assert not _fcpxml_path(tmp_path).exists()
+
+
+def test_export_stale_retry_refresh_failure_states(tmp_path, monkeypatch):
+    """stale 再試行で再び失敗した場合 txt_saved は False（true 固定にしない）。"""
+    session, _txt = _session(tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(serve, "render_plan", _boom)
+    with pytest.raises(serve.ExportRefreshError):
+        session.export(_cut_0003_toggles(tmp_path, session))
+
+    with pytest.raises(serve.ExportRefreshError) as exc:
+        session.export(_all_toggles(tmp_path, session.raw_text))
+
+    assert exc.value.txt_saved is False
+    assert session.review_stale is True
+    assert not _fcpxml_path(tmp_path).exists()
+
+
+def test_export_stale_retry_success_generates_fcpxml(tmp_path, monkeypatch):
+    """stale 再試行が成功したら保存なしでも音源が更新され FCPXML が出る。"""
+    session, _txt = _session(tmp_path)
+    review_before = session.review_wav.read_bytes()
+
+    def _boom(*args, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(serve, "render_plan", _boom)
+    with pytest.raises(serve.ExportRefreshError):
+        session.export(_cut_0003_toggles(tmp_path, session))
+    version_after_fail = session.version
+    monkeypatch.undo()
+
+    result = session.export(_all_toggles(tmp_path, session.raw_text))
+
+    assert result["txt_saved"] is False
+    assert result["review_updated"] is True
+    assert result["fcpxml_generated"] is True
+    assert result["version"] == version_after_fail + 1
+    assert session.review_stale is False
+    assert session.review_wav.read_bytes() != review_before
+    assert _fcpxml_path(tmp_path).exists()
+
+
+def test_export_stale_retry_success_fcpxml_failure(tmp_path, monkeypatch):
+    """stale 再生成成功→FCPXML 失敗でも最新の音源データを返す。"""
+    session, _txt = _session(tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(serve, "render_plan", _boom)
+    with pytest.raises(serve.ExportRefreshError):
+        session.export(_cut_0003_toggles(tmp_path, session))
+    version_after_fail = session.version
+    monkeypatch.undo()
+
+    def _fcpxml_boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(serve, "export_fcpxml", _fcpxml_boom)
+    with pytest.raises(serve.FcpxmlExportError) as exc:
+        session.export(_all_toggles(tmp_path, session.raw_text))
+
+    assert exc.value.txt_saved is False
+    assert exc.value.review_updated is True
+    assert session.version == version_after_fail + 1
+    assert session.review_stale is False
+    data = exc.value.review_data
+    assert _seg(data["segments"], "0003")["effective_delete"] is True
+    assert data["stats"] and "warnings" in data
+    assert not _fcpxml_path(tmp_path).exists()
+    assert _tmp_files(tmp_path) == []
+
+
+def test_save_audio_render_error_contract_unchanged(server, tmp_path, monkeypatch):
+    """/save の AudioRenderError レスポンスは既存契約のまま（export で変えない）。"""
+    httpd, _url, _txt = server
+    session = httpd.session
+    toggles = _cut_0003_toggles(tmp_path, session)
+
+    def _boom(*args, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(serve, "render_plan", _boom)
+    status, _h, body = _post(httpd, "/save", {"toggles": toggles})
+
+    assert status == 500
+    payload = json.loads(body)
+    assert set(payload) == {"error", "txt_saved"}
+    assert payload["txt_saved"] is True
+    assert "保存済み" in payload["error"]
+
+
+def test_review_stale_cleared_only_after_render_plan(tmp_path, monkeypatch):
+    """review_stale を False に戻すのは render_plan 成功後だけ。"""
+    session, _txt = _session(tmp_path)
+    assert session.review_stale is False
+    plan_before = session.plan
+
+    def _boom(*args, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(serve, "render_plan", _boom)
+    with pytest.raises(serve.AudioRenderError):
+        session.save(_cut_0003_toggles(tmp_path, session))
+
+    assert session.plan is not plan_before  # 計画は更新されている
+    assert session.review_stale is True
+
+
+def test_export_serialized_with_preview_and_save(tmp_path, monkeypatch):
+    """preview / save / export は同じロックで直列化される。"""
+    session, _txt = _session(tmp_path)
+    seen = []
+    original = serve.apply_toggles
+
+    def _spy(*args, **kwargs):
+        seen.append(session.lock.locked())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(serve, "apply_toggles", _spy)
+    toggles = _all_toggles(tmp_path, session.raw_text)
+    session.preview(toggles, {"type": "line", "id": "0003"})
+    session.save(toggles)
+    session.export(toggles)
+    assert seen == [True, True, True]
