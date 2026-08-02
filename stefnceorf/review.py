@@ -886,8 +886,8 @@ _SAVE_AREA = Template("""<span class="save-area">
     </select>
     <button type="button" class="speed-toggle" id="speed-toggle">OFF</button>
   </span>
-  <button type="button" id="save" disabled>保存済み</button>
   <span class="msg" id="save-msg"></span>
+  <button type="button" id="save" disabled>保存済み</button>
 </span>""")
 
 # --serve 時だけ差し込む FCPXML 書き出しボタン（2段目右端。インタフェースを
@@ -1147,25 +1147,21 @@ _SERVE_SCRIPT = """<script>
     previewMsg.classList.remove("error");
   }
 
-  function noteSave(text, isError) {
-    saveMsg.textContent = text;
-    saveMsg.classList.toggle("error", !!isError);
+  // 保存・書き出しの通知は同じ振る舞い: 各ボタンの左隣に出し、成功メッセージは
+  // 数秒で自動的に消す（エラーは操作されるまで残す）。
+  function makeNotice(el) {
+    var timer = null;
+    return function (text, isError) {
+      if (timer) { clearTimeout(timer); timer = null; }
+      el.textContent = text;
+      el.classList.toggle("error", !!isError);
+      if (!isError) {
+        timer = setTimeout(function () { el.textContent = ""; }, 5000);
+      }
+    };
   }
-
-  // 書き出し結果は2段目のFCPXMLボタン横へ。成功メッセージは数秒で自動的に
-  // 消す（エラーは操作されるまで残す）。
-  var exportMsg = document.getElementById("export-msg");
-  var exportMsgTimer = null;
-  function noteExport(text, isError) {
-    if (exportMsgTimer) { clearTimeout(exportMsgTimer); exportMsgTimer = null; }
-    exportMsg.textContent = text;
-    exportMsg.classList.toggle("error", !!isError);
-    if (!isError) {
-      exportMsgTimer = setTimeout(function () {
-        exportMsg.textContent = "";
-      }, 5000);
-    }
-  }
+  var noteSave = makeNotice(saveMsg);
+  var noteExport = makeNotice(document.getElementById("export-msg"));
 
   // 秒 → "M:SS.d" 形式（等幅数字表示欄で使う）。
   function formatTime(t) {
@@ -1573,7 +1569,7 @@ _SERVE_SCRIPT = """<script>
           },
           { commitBaseline: true }
         );
-        noteSave("保存しました: " + payload.txt_path, false);
+        noteSave("保存しました: " + basename(payload.txt_path), false);
       })
       .catch(function (err) {
         if (myGeneration !== generation) { return; }

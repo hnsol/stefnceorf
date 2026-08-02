@@ -1015,7 +1015,8 @@ def test_control_order_speed_save_export_notice(tmp_path):
     speed_i = row1.index("speed-select")
     save_i = row1.index('id="save"')
     msg_i = row1.index('id="save-msg"')
-    assert speed_i < save_i < msg_i
+    # 通知はボタンの左隣（XML出力の通知と同じ配置規則）
+    assert speed_i < msg_i < save_i
     assert 'id="export"' not in row1
     assert 'id="export"' in row2
 
