@@ -667,10 +667,15 @@ h1 { font-size: 1.2rem; margin: 0 0 .1rem; }
 }
 .trim { color: var(--green); font-size: .85rem; }
 /* --serve（Hlyst 対話モード）専用 */
-/* 保存ボタンは1段目右端に、余白/区切りで原音プレイヤーと分離する */
+/* 保存ボタン（と速度コントロール）は1段目右端に、余白/区切りで原音プレイヤーと分離する */
 .save-area {
-  display: flex; align-items: center; gap: .5rem; margin-left: auto;
+  display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-left: auto;
   padding-left: .75rem; border-left: 1px solid var(--border);
+}
+/* 再生速度: pad 範囲と同じ中立色 segmented control（保存ボタンの左） */
+.speed-select {
+  display: flex; align-items: center; gap: .25rem; font-size: .8rem;
+  color: var(--text-muted); white-space: nowrap;
 }
 #save {
   font: inherit; padding: .25rem 1rem; cursor: pointer; border-radius: .25rem;
@@ -850,8 +855,17 @@ $serve_script
 """)
 
 
-# --serve 時だけ差し込む保存ボタン（1段目右端、原音プレイヤーと余白/区切りで分離）
+# --serve 時だけ差し込む速度コントロール＋保存ボタン
+# （1段目右端、原音プレイヤーと余白/区切りで分離。速度は保存ボタンの左）
 _SAVE_AREA = """<span class="save-area">
+  <span class="speed-select" id="speed-select">
+    速度
+    <button type="button" class="padbtn speedbtn active" data-speed="1">x1.0</button>
+    <button type="button" class="padbtn speedbtn" data-speed="1.25">x1.25</button>
+    <button type="button" class="padbtn speedbtn" data-speed="1.5">x1.5</button>
+    <button type="button" class="padbtn speedbtn" data-speed="1.75">x1.75</button>
+    <button type="button" class="padbtn speedbtn" data-speed="2">x2.0</button>
+  </span>
   <button type="button" id="save" disabled>保存済み</button>
   <span class="msg" id="save-msg"></span>
 </span>"""
@@ -924,6 +938,36 @@ _SERVE_SCRIPT = """<script>
   allPlayers.forEach(function (player) {
     player.addEventListener("play", function () { pauseOtherPlayers(player); });
   });
+
+  // 再生速度（x1.0/x1.25/x1.5/x1.75/x2.0）。3プレイヤー全てに適用する。
+  // audio-preview は src を差し替えるたび playbackRate がリセットされるため、
+  // 単純に一度適用するだけでは足りない。各 audio の "play"／"loadedmetadata"
+  // イベントで現在速度を再適用し、src 差し替え後の再生でも速度を保つ。
+  var currentSpeed = 1;
+
+  function applyPlaybackSpeed() {
+    allPlayers.forEach(function (p) { p.playbackRate = currentSpeed; });
+  }
+
+  allPlayers.forEach(function (player) {
+    player.addEventListener("play", applyPlaybackSpeed);
+    player.addEventListener("loadedmetadata", applyPlaybackSpeed);
+  });
+
+  Array.prototype.forEach.call(
+    document.querySelectorAll(".speedbtn"),
+    function (btn) {
+      btn.addEventListener("click", function () {
+        currentSpeed = Number(btn.dataset.speed);
+        Array.prototype.forEach.call(
+          document.querySelectorAll(".speedbtn"),
+          function (b) { b.classList.remove("active"); }
+        );
+        btn.classList.add("active");
+        applyPlaybackSpeed();
+      });
+    }
+  );
 
   // 行/単語の対象（{type, id, word}）から savedPositions / previewCache の
   // キー（L<id> / W<id>:<word>）を作る。

@@ -985,6 +985,50 @@ def test_serve_html_save_button_default_label(tmp_path):
     assert '<button type="button" id="save" disabled>保存済み</button>' in html
 
 
+# ---- 再生速度コントロール（Hlyst UX 改修） ----
+
+def test_serve_html_has_speed_buttons_in_first_row_left_of_save(tmp_path):
+    """速度ボタンは1段目、保存ボタンの左に置かれる（余白で分離）。"""
+    html, _rd = _serve_html(tmp_path)
+    row1 = html.split('class="player-row"')[1].split('class="player-row"')[0]
+    assert row1.index('data-speed="1"') < row1.index('id="save"')
+    for speed in ("1", "1.25", "1.5", "1.75", "2"):
+        assert f'data-speed="{speed}"' in row1
+    assert 'class="padbtn speedbtn active" data-speed="1"' in row1
+
+
+def test_static_html_has_no_speed_buttons(tmp_path):
+    """静的モードは速度コントロールを持たない（ブラウザ標準メニューで足りる）。"""
+    html, _rd = _html(tmp_path)
+    assert "speedbtn" not in html
+
+
+def test_serve_script_applies_speed_to_all_three_players(tmp_path):
+    """速度ボタンのクリックで src/out/preview の3プレイヤー全てへ適用する。"""
+    html, _rd = _serve_html(tmp_path)
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    assert "allPlayers.forEach(function (p) { p.playbackRate = currentSpeed; });" \
+        in serve_script or "p.playbackRate = currentSpeed;" in serve_script
+    assert "var currentSpeed = 1;" in serve_script
+    assert "speedbtn" in serve_script
+
+
+def test_serve_script_reapplies_speed_after_src_swap(tmp_path):
+    """audio-preview の src 差し替え（playbackRate リセット）後も、play/loadedmetadata
+    で現在速度を再適用する。"""
+    html, _rd = _serve_html(tmp_path)
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    assert '"play"' in serve_script and '"loadedmetadata"' in serve_script
+    assert "applyPlaybackSpeed" in serve_script
+
+
+def test_serve_script_speed_button_click_reapplies_immediately(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    speed_wiring = serve_script.split('querySelectorAll(".speedbtn")')[-1]
+    assert "applyPlaybackSpeed();" in speed_wiring
+
+
 def test_serve_script_save_button_shows_dirty_count(tmp_path):
     """保存ボタンの表示は dirty 件数（N件）で更新される。"""
     html, _rd = _serve_html(tmp_path)
