@@ -667,11 +667,26 @@ h1 { font-size: 1.2rem; margin: 0 0 .1rem; }
   display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-left: auto;
   padding-left: .75rem; border-left: 1px solid var(--border);
 }
-/* 再生速度: pad 範囲と同じ中立色 segmented control（保存ボタンの左） */
-.speed-select {
+/* 再生速度: select（速度値）＋ toggle（OFF x1.0 / ON x選択値）（保存ボタンの左）。
+   .padbtn は付けない（試聴範囲ボタンの誤反応バグの再発防止のため selector を分離）。 */
+.speed-controls {
   display: flex; align-items: center; gap: .25rem; font-size: .8rem;
   color: var(--text-muted); white-space: nowrap;
 }
+.speed-select {
+  font: inherit; font-size: .75rem; padding: .1rem .3rem; cursor: pointer;
+  border: 1px solid var(--border); background: transparent; border-radius: .25rem;
+  color: var(--text);
+}
+.speed-toggle {
+  font: inherit; font-size: .75rem; padding: .15rem .6rem; cursor: pointer;
+  border: 1px solid var(--border); background: transparent; border-radius: .25rem;
+  color: var(--text);
+}
+.speed-toggle.active {
+  border-color: var(--text); background: var(--surface); font-weight: 700;
+}
+.speed-select:disabled, .speed-toggle:disabled { opacity: .5; cursor: default; }
 #save {
   font: inherit; padding: .25rem 1rem; cursor: pointer; border-radius: .25rem;
   border: 1px solid currentColor; background: transparent;
@@ -853,13 +868,15 @@ $serve_script
 # （1段目右端、原音プレイヤーと余白/区切りで分離。配置順は
 # 速度→保存→FCPXML書き出し→通知で固定する）
 _SAVE_AREA = Template("""<span class="save-area">
-  <span class="speed-select" id="speed-select">
+  <span class="speed-controls" id="speed-controls">
     速度
-    <button type="button" class="padbtn speedbtn active" data-speed="1">x1.0</button>
-    <button type="button" class="padbtn speedbtn" data-speed="1.25">x1.25</button>
-    <button type="button" class="padbtn speedbtn" data-speed="1.5">x1.5</button>
-    <button type="button" class="padbtn speedbtn" data-speed="1.75">x1.75</button>
-    <button type="button" class="padbtn speedbtn" data-speed="2">x2.0</button>
+    <select class="speed-select" id="speed-select">
+      <option value="1.25">x1.25</option>
+      <option value="1.5" selected>x1.5</option>
+      <option value="1.75">x1.75</option>
+      <option value="2">x2.0</option>
+    </select>
+    <button type="button" class="speed-toggle" id="speed-toggle">x1.0</button>
   </span>
   <button type="button" id="save" disabled>保存済み</button>
   <button type="button" id="export" title="$export_title">FCPXML書き出し</button>
@@ -936,10 +953,21 @@ _SERVE_SCRIPT = """<script>
     player.addEventListener("play", function () { pauseOtherPlayers(player); });
   });
 
-  // 再生速度（x1.0/x1.25/x1.5/x1.75/x2.0）。3プレイヤー全てに適用する。
+  // 再生速度（select で選択した値 ＋ OFF/ON toggle）。3プレイヤー全てに適用する。
   // audio-preview は src を差し替えるたび playbackRate がリセットされるため、
   // 単純に一度適用するだけでは足りない。各 audio の "play"／"loadedmetadata"
   // イベントで現在速度を再適用し、src 差し替え後の再生でも速度を保つ。
+  //
+  // 状態モデル: selectedSpeed（select の値）／speedEnabled（toggle の状態）／
+  // currentSpeed = speedEnabled ? selectedSpeed : 1。速度ハンドラは
+  // playbackRate と表示更新だけを行い、currentPad/currentTarget/lastPlayer・
+  // play/pause/load/src/currentTime・試聴範囲の active には一切触れない
+  // （padbtn を共有していた旧速度ボタンが試聴範囲ハンドラに誤反応していた
+  // バグの再発防止のため、クラスも selector も完全に分離する）。
+  var speedSelect = document.getElementById("speed-select");
+  var speedToggle = document.getElementById("speed-toggle");
+  var selectedSpeed = 1.5;
+  var speedEnabled = false;
   var currentSpeed = 1;
 
   function applyPlaybackSpeed() {
@@ -951,20 +979,27 @@ _SERVE_SCRIPT = """<script>
     player.addEventListener("loadedmetadata", applyPlaybackSpeed);
   });
 
-  Array.prototype.forEach.call(
-    document.querySelectorAll(".speedbtn"),
-    function (btn) {
-      btn.addEventListener("click", function () {
-        currentSpeed = Number(btn.dataset.speed);
-        Array.prototype.forEach.call(
-          document.querySelectorAll(".speedbtn"),
-          function (b) { b.classList.remove("active"); }
-        );
-        btn.classList.add("active");
-        applyPlaybackSpeed();
-      });
+  function updateSpeedToggleLabel() {
+    speedToggle.textContent = speedEnabled ? ("x" + selectedSpeed) : "x1.0";
+    speedToggle.classList.toggle("active", speedEnabled);
+  }
+
+  speedSelect.addEventListener("change", function () {
+    selectedSpeed = Number(speedSelect.value);
+    // OFF 中の select 変更は選択値の更新のみ（適用しない）。ON 中は即適用する。
+    if (speedEnabled) {
+      currentSpeed = selectedSpeed;
+      applyPlaybackSpeed();
     }
-  );
+    updateSpeedToggleLabel();
+  });
+
+  speedToggle.addEventListener("click", function () {
+    speedEnabled = !speedEnabled;
+    currentSpeed = speedEnabled ? selectedSpeed : 1;
+    updateSpeedToggleLabel();
+    applyPlaybackSpeed();
+  });
 
   // 行/単語の対象（{type, id, word}）から savedPositions / previewCache の
   // キー（L<id> / W<id>:<word>）を作る。
@@ -1045,8 +1080,9 @@ _SERVE_SCRIPT = """<script>
     exportBtn.textContent = "FCPXML書き出し";
   }
 
-  // busy 中は全チェックボックスと保存/書き出しボタン・pad切替ボタン（.padbtn）
-  // を操作不能にする（見た目にも分かるようにする）。busy を素通しして黙って
+  // busy 中は全チェックボックスと保存/書き出しボタン・pad切替ボタン
+  // （.padbtn[data-pad]）・速度コントロール（.speed-select/.speed-toggle）を
+  // 操作不能にする（見た目にも分かるようにする）。busy を素通しして黙って
   // 古い操作を捨てる経路を作らないため。kind は "preview" / "save" /
   // "export" / 省略（解除時）。
   function setControlsBusy(value, kind) {
@@ -1057,8 +1093,12 @@ _SERVE_SCRIPT = """<script>
       function (box) { box.disabled = value; }
     );
     Array.prototype.forEach.call(
-      document.querySelectorAll(".padbtn"),
+      document.querySelectorAll(".padbtn[data-pad]"),
       function (btn) { btn.disabled = value; }
+    );
+    Array.prototype.forEach.call(
+      document.querySelectorAll(".speed-select, .speed-toggle"),
+      function (el) { el.disabled = value; }
     );
     updateSaveButton();
     updateExportButton();
@@ -1417,15 +1457,17 @@ _SERVE_SCRIPT = """<script>
   }, true);
 
   // 試聴範囲（±2/±4/±8秒）の切替。現在選択中の対象があれば再生成する。
+  // selector は .padbtn[data-pad] に限定する（速度UIは .padbtn を持たないが、
+  // 万一クラスが共有されても誤反応しないよう data-pad の有無で明示的に絞る）。
   Array.prototype.forEach.call(
-    document.querySelectorAll(".padbtn"),
+    document.querySelectorAll(".padbtn[data-pad]"),
     function (btn) {
       btn.addEventListener("click", function () {
         var pad = Number(btn.dataset.pad);
         if (pad === currentPad) { return; }
         currentPad = pad;
         Array.prototype.forEach.call(
-          document.querySelectorAll(".padbtn"),
+          document.querySelectorAll(".padbtn[data-pad]"),
           function (b) { b.classList.remove("active"); }
         );
         btn.classList.add("active");

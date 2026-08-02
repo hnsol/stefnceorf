@@ -1094,32 +1094,30 @@ def test_js_refresh_failure_commits_baseline_only(tmp_path):
     )
 
 
-# ---- 再生速度コントロール（Hlyst UX 改修） ----
+# ---- 再生速度コントロール（Hlyst UX 改修・Commit3でコンパクト化） ----
 
 def test_serve_html_has_speed_buttons_in_first_row_left_of_save(tmp_path):
-    """速度ボタンは1段目、保存ボタンの左に置かれる（余白で分離）。"""
+    """速度コントロール（select + toggle）は1段目、保存ボタンの左に置かれる。"""
     html, _rd = _serve_html(tmp_path)
     row1 = html.split('class="player-row"')[1].split('class="player-row"')[0]
-    assert row1.index('data-speed="1"') < row1.index('id="save"')
-    for speed in ("1", "1.25", "1.5", "1.75", "2"):
-        assert f'data-speed="{speed}"' in row1
-    assert 'class="padbtn speedbtn active" data-speed="1"' in row1
+    assert row1.index('class="speed-select"') < row1.index('id="save"')
+    assert row1.index('class="speed-toggle"') < row1.index('id="save"')
 
 
 def test_static_html_has_no_speed_buttons(tmp_path):
     """静的モードは速度コントロールを持たない（ブラウザ標準メニューで足りる）。"""
     html, _rd = _html(tmp_path)
-    assert "speedbtn" not in html
+    assert 'id="speed-select"' not in html
+    assert 'id="speed-toggle"' not in html
 
 
 def test_serve_script_applies_speed_to_all_three_players(tmp_path):
-    """速度ボタンのクリックで src/out/preview の3プレイヤー全てへ適用する。"""
+    """速度切替で src/out/preview の3プレイヤー全てへ playbackRate を適用する。"""
     html, _rd = _serve_html(tmp_path)
     serve_script = html.split("if (!DATA.serve) { return; }")[1]
     assert "allPlayers.forEach(function (p) { p.playbackRate = currentSpeed; });" \
         in serve_script or "p.playbackRate = currentSpeed;" in serve_script
     assert "var currentSpeed = 1;" in serve_script
-    assert "speedbtn" in serve_script
 
 
 def test_serve_script_reapplies_speed_after_src_swap(tmp_path):
@@ -1131,11 +1129,101 @@ def test_serve_script_reapplies_speed_after_src_swap(tmp_path):
     assert "applyPlaybackSpeed" in serve_script
 
 
-def test_serve_script_speed_button_click_reapplies_immediately(tmp_path):
+def test_serve_script_speed_toggle_reapplies_immediately(tmp_path):
+    """toggle クリックは即座に playbackRate を適用する。"""
     html, _rd = _serve_html(tmp_path)
     serve_script = html.split("if (!DATA.serve) { return; }")[1]
-    speed_wiring = serve_script.split('querySelectorAll(".speedbtn")')[-1]
-    assert "applyPlaybackSpeed();" in speed_wiring
+    toggle_wiring = serve_script.split('speedToggle.addEventListener("click"')[1]
+    assert "applyPlaybackSpeed();" in toggle_wiring.split("});")[0]
+
+
+# ---- 速度UIコンパクト化＋padbtn バグ根本修正（Commit3） ----
+
+def test_speed_controls_have_no_padbtn_class(tmp_path):
+    """速度UI（select/toggle）は試聴範囲ボタンの .padbtn クラスを持たない。"""
+    html, _rd = _serve_html(tmp_path)
+    row1 = html.split('class="player-row"')[1].split('class="player-row"')[0]
+    assert 'class="padbtn' not in row1
+
+
+def test_pad_handler_targets_only_data_pad_elements(tmp_path):
+    """試聴範囲ハンドラは .padbtn[data-pad] だけを対象にする（速度UIに誤反応しない）。"""
+    html, _rd = _serve_html(tmp_path)
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    assert '.padbtn[data-pad]' in serve_script
+
+
+def test_speed_handlers_do_not_touch_playback_or_pad_state(tmp_path):
+    """速度ハンドラ本体は再生制御・現在案対象・範囲状態に触らない。"""
+    html, _rd = _serve_html(tmp_path)
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    select_body = serve_script.split(
+        'speedSelect.addEventListener("change"'
+    )[1].split("});")[0]
+    toggle_body = serve_script.split(
+        'speedToggle.addEventListener("click"'
+    )[1].split("});")[0]
+    for body in (select_body, toggle_body):
+        assert "playCurrentPlan" not in body
+        assert "primeComparisonPlayers" not in body
+        assert "currentPad =" not in body
+        assert "currentTarget =" not in body
+        assert ".play()" not in body
+        assert ".pause()" not in body
+        assert ".load()" not in body
+        assert ".currentTime" not in body
+
+
+def test_speed_handlers_do_not_modify_pad_active(tmp_path):
+    """速度ハンドラは試聴範囲（pad-select）の active 表示を触らない。"""
+    html, _rd = _serve_html(tmp_path)
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    select_body = serve_script.split(
+        'speedSelect.addEventListener("change"'
+    )[1].split("});")[0]
+    toggle_body = serve_script.split(
+        'speedToggle.addEventListener("click"'
+    )[1].split("});")[0]
+    for body in (select_body, toggle_body):
+        assert "pad-select" not in body
+        assert ".padbtn" not in body
+
+
+def test_speed_select_and_toggle_defaults(tmp_path):
+    """候補値 x1.25/x1.5/x1.75/x2.0・既定 x1.5・OFF 表示 x1.0。"""
+    html, _rd = _serve_html(tmp_path)
+    row1 = html.split('class="player-row"')[1].split('class="player-row"')[0]
+    select_markup = row1.split('class="speed-select"')[1].split("</select>")[0]
+    for speed in ("1.25", "1.5", "1.75", "2"):
+        assert f'value="{speed}"' in select_markup
+    assert 'value="1.5" selected' in select_markup
+    toggle_markup = row1.split('class="speed-toggle"')[1].split("</button>")[0]
+    assert toggle_markup.endswith(">x1.0")
+
+
+def test_speed_state_model_paths(tmp_path):
+    """OFF中select=保持のみ／ON中select=即適用／toggle=即適用／再適用が揃っている。"""
+    html, _rd = _serve_html(tmp_path)
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    assert "var selectedSpeed = 1.5;" in serve_script
+    assert "var speedEnabled = false;" in serve_script
+    select_body = serve_script.split(
+        'speedSelect.addEventListener("change"'
+    )[1].split("});")[0]
+    assert "selectedSpeed = Number(speedSelect.value);" in select_body
+    assert "if (speedEnabled) {" in select_body
+    toggle_body = serve_script.split(
+        'speedToggle.addEventListener("click"'
+    )[1].split("});")[0]
+    assert "speedEnabled = !speedEnabled;" in toggle_body
+    assert "applyPlaybackSpeed();" in toggle_body
+
+
+def test_speed_controls_disabled_while_busy(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    body = html.split("function setControlsBusy(value")[1].split("\n  }")[0]
+    assert ".speed-select" in body
+    assert ".speed-toggle" in body
 
 
 def test_serve_script_save_button_shows_dirty_count(tmp_path):
