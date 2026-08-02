@@ -1192,7 +1192,7 @@ def test_speed_handlers_do_not_modify_pad_active(tmp_path):
 
 
 def test_speed_select_and_toggle_defaults(tmp_path):
-    """候補値 x1.25/x1.5/x1.75/x2.0・既定 x1.5・OFF 表示 x1.0。"""
+    """候補値 x1.25/x1.5/x1.75/x2.0・既定 x1.5・toggle は OFF 表示で始まる。"""
     html, _rd = _serve_html(tmp_path)
     row1 = html.split('class="player-row"')[1].split('class="player-row"')[0]
     select_markup = row1.split('class="speed-select"')[1].split("</select>")[0]
@@ -1200,7 +1200,7 @@ def test_speed_select_and_toggle_defaults(tmp_path):
         assert f'value="{speed}"' in select_markup
     assert 'value="1.5" selected' in select_markup
     toggle_markup = row1.split('class="speed-toggle"')[1].split("</button>")[0]
-    assert toggle_markup.endswith(">x1.0")
+    assert toggle_markup.endswith(">OFF")
 
 
 def test_speed_state_model_paths(tmp_path):

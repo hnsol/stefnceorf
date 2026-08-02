@@ -658,7 +658,9 @@ h1 { font-size: 1.2rem; margin: 0 0 .1rem; }
 /* 削除指定したが安全判定で保持された状態は破線アウトライン＋状態ラベル赤太字で示す
    （フィラー提案の塗りつぶしと表現チャネルを分け、.line.uts より後に置き優先させる） */
 .w.unsafe, .line.unsafe {
-  outline: 1px dashed var(--red); outline-offset: 1px; background: none;
+  /* offset は負にして枠を要素の内側に描く。外側に描くと sticky コントロールの
+     背景で覆えず、下をスクロールする行の枠線が左右にはみ出て見える */
+  outline: 1px dashed var(--red); outline-offset: -1px; background: none;
 }
 .trim { color: var(--green); font-size: .85rem; }
 /* --serve（Hlyst 対話モード）専用 */
@@ -763,7 +765,7 @@ $preview_panel
   <li><span class="w suggest">フィラー提案</span></li>
   <li><span class="w cut">カット済み</span></li>
   <li><span class="line uts" style="display:inline">未転写発話候補</span></li>
-  <li><span class="state unsafe" style="display:inline">削除指定→安全判定で保持</span></li>
+  <li><span class="w unsafe state" style="display:inline">削除指定→安全判定で保持</span></li>
   <li><span class="trim" style="display:inline">✂ 無音トリム</span></li>
 $click_legend
 </ul>
@@ -876,7 +878,7 @@ _SAVE_AREA = Template("""<span class="save-area">
       <option value="1.75">x1.75</option>
       <option value="2">x2.0</option>
     </select>
-    <button type="button" class="speed-toggle" id="speed-toggle">x1.0</button>
+    <button type="button" class="speed-toggle" id="speed-toggle">OFF</button>
   </span>
   <button type="button" id="save" disabled>保存済み</button>
   <span class="msg" id="save-msg"></span>
@@ -988,7 +990,8 @@ _SERVE_SCRIPT = """<script>
   });
 
   function updateSpeedToggleLabel() {
-    speedToggle.textContent = speedEnabled ? ("x" + selectedSpeed) : "x1.0";
+    // 表示は ON/OFF（select と x 値が2つ並ぶと紛らわしいため。値は select が示す）
+    speedToggle.textContent = speedEnabled ? "ON" : "OFF";
     speedToggle.classList.toggle("active", speedEnabled);
   }
 
