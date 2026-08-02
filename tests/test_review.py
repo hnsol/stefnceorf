@@ -1298,7 +1298,6 @@ def test_serve_ui_has_three_compact_player_rows(tmp_path):
     assert "現在案" in html
     assert 'id="abs-window"' not in html
     assert 'id="abs-pos"' not in html
-    assert "Shift+クリック" not in html
     assert "Option(Alt)+クリック" not in html
 
 
@@ -1321,8 +1320,90 @@ def test_normal_click_primes_source_and_saved_then_plays_preview(tmp_path):
     click_handler = serve_script.split(
         'document.getElementById("transcript").addEventListener("click"'
     )[1].split("}, true);")[0]
-    assert "ev.shiftKey" not in click_handler
     assert "ev.altKey" not in click_handler
+    # 通常クリック経路（shift 分岐の外）に playCurrentPlan があること
+    before_shift, after_shift = click_handler.split("if (ev.shiftKey) {", 1)
+    normal_path = before_shift + after_shift[len(_shift_branch(html)) + 1:]
+    assert "playCurrentPlan(target);" in normal_path
+    assert "playCurrentPlan(target);" not in _shift_branch(html)
+
+
+# ---- Shift+クリックで保存済みを再生（Hlyst: Shift+クリックで保存済みを再生） ----
+
+
+def _shift_branch(html):
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    click_handler = serve_script.split(
+        'document.getElementById("transcript").addEventListener("click"'
+    )[1].split("}, true);")[0]
+    after_if = click_handler.split("if (ev.shiftKey) {", 1)[1]
+    depth = 1
+    end = 0
+    for i, ch in enumerate(after_if):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    return after_if[:end]
+
+
+def test_shift_click_plays_saved_without_preview(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    branch = _shift_branch(html)
+    assert "audioOut.play" in branch
+    assert "playCurrentPlan" not in branch
+    assert "post(" not in branch
+    assert "previewCache" not in branch
+
+
+def test_shift_click_sets_active_target(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    click_handler = serve_script.split(
+        'document.getElementById("transcript").addEventListener("click"'
+    )[1].split("}, true);")[0]
+    normal_path = click_handler.split("if (ev.shiftKey) {")[0]
+    shift_branch = _shift_branch(html)
+    # 通常・Shift 両経路が共通関数 selectTarget( を1回だけ通る
+    # （呼び出し箇所は shift 分岐に入る前の共通処理に1箇所だけ存在する）。
+    assert normal_path.count("selectTarget(line, target)") == 1
+    assert "selectTarget(" not in shift_branch
+    play_current_plan_body = html.split(
+        "function playCurrentPlan(target) {"
+    )[1].split("\n  }")[0]
+    assert "currentTarget =" not in play_current_plan_body
+
+
+def test_shift_click_respects_busy_guard(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    click_handler = serve_script.split(
+        'document.getElementById("transcript").addEventListener("click"'
+    )[1].split("}, true);")[0]
+    busy_idx = click_handler.index("if (busy) {")
+    target_idx = click_handler.index("var target = wordData")
+    shift_idx = click_handler.index("if (ev.shiftKey) {")
+    assert busy_idx < target_idx < shift_idx
+
+
+def test_shift_click_without_saved_position_does_not_play(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    branch = _shift_branch(html)
+    assert "savedPositionFor(target)" in branch
+    assert "notePreviewError(" in branch
+    guard = branch.split("if (!savedPositionFor(target)) {")[1].split("}")[0]
+    assert "audioOut.play" not in guard
+
+
+def test_serve_ui_has_shift_click_legend(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    assert "Shift+クリックで保存済みを再生" in html
+
+    static_html, _srd = _html(tmp_path)
+    assert "Shift+クリックで保存済みを再生" not in static_html
 
 
 # ---- 排他再生とSpaceキー操作（Hlyst UX 改修 Task 5） ----

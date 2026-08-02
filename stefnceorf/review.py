@@ -1412,7 +1412,6 @@ _SERVE_SCRIPT = """<script>
   // 現在案プレビューを再生する（対象＋現在の試聴範囲でキャッシュ済みなら即再生、
   // 無ければ現在のチェック状態で /preview を生成してから再生する）。
   function playCurrentPlan(target) {
-    currentTarget = target;
     var key = previewKey(target, currentPad);
     var cached = previewCache[key];
     if (cached) {
@@ -1452,10 +1451,22 @@ _SERVE_SCRIPT = """<script>
     }
   }
 
+  // 対象に保存済み位置があるかどうか（Shift+クリック再生の可否判定に使う）。
+  function savedPositionFor(target) {
+    return savedPositions[targetKey(target)] || null;
+  }
+
   function setActiveLine(el) {
     var prev = document.querySelector(".line.active, .trim.active");
     if (prev) { prev.classList.remove("active"); }
     el.classList.add("active");
+  }
+
+  // active 行表示と currentTarget（範囲2/4/8秒変更時の再プライム対象）の更新を
+  // 一箇所にまとめる。通常クリック・Shift+クリックの両経路がここを1回だけ通る。
+  function selectTarget(line, target) {
+    setActiveLine(line);
+    currentTarget = target;
   }
 
   // 行/単語クリックの再生先を切り替える（capture フェーズで先取りし、本文
@@ -1479,12 +1490,23 @@ _SERVE_SCRIPT = """<script>
       noteState("試聴を生成中です");
       return;
     }
-    setActiveLine(line);
 
     var target = wordData
       ? { type: "word", id: seg.id, word: wordData.index }
       : { type: "line", id: seg.id };
+    selectTarget(line, target);
     primeComparisonPlayers(target, currentPad);
+    if (ev.shiftKey) {
+      ev.preventDefault();          // Shift+click の既定動作（選択拡張）の抑止。
+                                     // mousedown 起点のテキスト選択の完全防止は狙わない
+      if (!savedPositionFor(target)) {
+        notePreviewError("保存済み位置が不明です");
+        return;
+      }
+      var playing = audioOut.play();
+      if (playing && playing.catch) { playing.catch(function () {}); }
+      return;                       // preview へは進まない
+    }
     playCurrentPlan(target);
   }, true);
 
@@ -1624,7 +1646,7 @@ def render_html(review: dict) -> str:
     # 固定 pad 秒クリック説明はここでは出さない（serve モードへ固定の「前後2秒」を
     # 表示しない）。
     click_legend = (
-        ""
+        "<li>Shift+クリックで保存済みを再生</li>"
         if serve
         else f'<li>行・単語をクリックすると前後 {review["pad"]:g} 秒を再生します</li>'
     )
