@@ -906,11 +906,23 @@ _SERVE_SCRIPT = """<script>
   // 状態を巻き戻さないよう、リクエストごとに世代IDを振って照合する。
   var generation = 0;
 
-  function previewKey(target, pad) {
-    var base = target.type === "word"
+  // 行/単語の対象（{type, id, word}）から savedPositions / previewCache の
+  // キー（L<id> / W<id>:<word>）を作る。
+  function targetKey(target) {
+    return target.type === "word"
       ? "W" + target.id + ":" + target.word
       : "L" + target.id;
-    return base + "@" + pad;
+  }
+
+  function previewKey(target, pad) {
+    return targetKey(target) + "@" + pad;
+  }
+
+  // json 順の DATA.segments から id で1件探す。
+  function segmentById(id) {
+    var found = null;
+    DATA.segments.forEach(function (s) { if (s.id === id) { found = s; } });
+    return found;
   }
 
   function snapshot() {
@@ -1232,10 +1244,31 @@ _SERVE_SCRIPT = """<script>
     runPreview(target);
   }
 
-  function seekAndPlay(audio, t) {
-    try { audio.currentTime = t; } catch (e) { /* metadata 未読込 */ }
-    var playing = audio.play();
-    if (playing && playing.catch) { playing.catch(function () {}); }
+  // 比較窓（現在案 preview と同じ幅）の開始位置。center - pad を 0 未満に
+  // させない。
+  function comparisonStart(center, pad) {
+    return Math.max(0, center - pad);
+  }
+
+  // 原音・保存済みプレイヤーを対象の比較窓開始位置へシークする（play() は
+  // 呼ばない。実際の再生は現在案 preview だけが行う）。原音は対象そのものの
+  // source_center（保存の有無に関わらず不変）を使い、保存済みは
+  // savedPositions（/save 成功時にしか更新されない）の output_center だけを
+  // 使う。未保存の現在案 output を保存済みプレイヤーのシークに使わない。
+  function primeComparisonPlayers(target, pad) {
+    var seg = segmentById(target.id);
+    if (!seg) { return; }
+    var wordData = target.type === "word" ? findWord(seg, target.word) : null;
+    var sourceCenter = wordData ? wordData.center : seg.source_center;
+    try {
+      audioSrc.currentTime = comparisonStart(sourceCenter, pad);
+    } catch (e) { /* metadata 未読込 */ }
+    var saved = savedPositions[targetKey(target)];
+    if (saved) {
+      try {
+        audioOut.currentTime = comparisonStart(saved.outputCenter, pad);
+      } catch (e) { /* metadata 未読込 */ }
+    }
   }
 
   function setActiveLine(el) {
@@ -1267,18 +1300,10 @@ _SERVE_SCRIPT = """<script>
     }
     setActiveLine(line);
 
-    if (ev.shiftKey) {
-      seekAndPlay(audioOut, wordData ? wordData.output : seg.output);
-      return;
-    }
-    if (ev.altKey) {
-      seekAndPlay(audioSrc, wordData ? wordData.source : seg.source);
-      return;
-    }
-
     var target = wordData
       ? { type: "word", id: seg.id, word: wordData.index }
       : { type: "line", id: seg.id };
+    primeComparisonPlayers(target, currentPad);
     playCurrentPlan(target);
   }, true);
 
@@ -1295,7 +1320,10 @@ _SERVE_SCRIPT = """<script>
           function (b) { b.classList.remove("active"); }
         );
         btn.classList.add("active");
-        if (currentTarget) { playCurrentPlan(currentTarget); }
+        if (currentTarget) {
+          primeComparisonPlayers(currentTarget, pad);
+          playCurrentPlan(currentTarget);
+        }
       });
     }
   );

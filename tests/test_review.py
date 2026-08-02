@@ -982,18 +982,6 @@ def test_serve_script_normal_click_uses_audio_preview(tmp_path):
     assert "playCurrentPlan(target);" in serve_script
 
 
-def test_serve_script_has_shift_and_alt_shortcuts(tmp_path):
-    """Shift+クリック=保存済み編集後、Option(Alt)+クリック=原音のショートカットがある。"""
-    html, _rd = _serve_html(tmp_path)
-    assert "ev.shiftKey" in html
-    assert "ev.altKey" in html
-    assert "seekAndPlay(audioOut," in html
-    assert "seekAndPlay(audioSrc," in html
-    # Ctrl/Cmd は使わない
-    assert "ev.ctrlKey" not in html
-    assert "ev.metaKey" not in html
-
-
 def test_serve_script_saved_player_not_updated_by_preview(tmp_path):
     """保存済み編集後プレイヤー（audio-out）の src は保存成功時にしか更新されない。"""
     html, _rd = _serve_html(tmp_path)
@@ -1057,6 +1045,17 @@ def test_top_player_labels_are_short_and_equal_width(tmp_path):
     assert ">保存済み</button>" in html
     mode_css = html.split(".mode {")[1].split("}")[0]
     assert "width:" in mode_css
+
+
+# ---- 行クリックで3プレイヤーを同じ比較位置へ揃える（Hlyst UX 改修 Task 4） ----
+
+def test_normal_click_primes_source_and_saved_then_plays_preview(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    assert "function primeComparisonPlayers(target, pad) {" in html
+    assert "primeComparisonPlayers(target, currentPad);" in html
+    assert "playCurrentPlan(target);" in html
+    assert "ev.shiftKey" not in html
+    assert "ev.altKey" not in html
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node が見つからない")
