@@ -1008,14 +1008,16 @@ def test_note_removed_from_both_modes(tmp_path):
 
 
 def test_control_order_speed_save_export_notice(tmp_path):
-    """1段目右側の配置順は 速度→保存→FCPXML書き出し→通知 で固定する。"""
+    """配置は 1段目: 速度→保存→通知、2段目: FCPXML書き出し（4段構成を守る）。"""
     html, _rd = _serve_html(tmp_path)
-    row1 = html.split('class="player-row"')[1].split('class="player-row"')[0]
+    rows = html.split('class="player-row"')
+    row1, row2 = rows[1], rows[2]
     speed_i = row1.index("speed-select")
     save_i = row1.index('id="save"')
-    export_i = row1.index('id="export"')
     msg_i = row1.index('id="save-msg"')
-    assert speed_i < save_i < export_i < msg_i
+    assert speed_i < save_i < msg_i
+    assert 'id="export"' not in row1
+    assert 'id="export"' in row2
 
 
 def test_export_busy_kind_disables_controls(tmp_path):

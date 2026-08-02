@@ -756,6 +756,7 @@ $save_area
     <button type="button" class="seek-btn" data-player="out" data-seek="5">＋5s</button>
     <button type="button" class="seek-btn" data-player="out" data-seek="10">＋10s</button>
   </span>
+$export_area
 </div>
 $preview_panel
 <ul class="legend">
@@ -864,9 +865,8 @@ $serve_script
 """)
 
 
-# --serve 時だけ差し込む速度コントロール＋保存ボタン＋FCPXML書き出しボタン
-# （1段目右端、原音プレイヤーと余白/区切りで分離。配置順は
-# 速度→保存→FCPXML書き出し→通知で固定する）
+# --serve 時だけ差し込む速度コントロール＋保存ボタン（1段目右端、原音プレイヤー
+# と余白/区切りで分離。配置順は 速度→保存→通知 で固定する）
 _SAVE_AREA = Template("""<span class="save-area">
   <span class="speed-controls" id="speed-controls">
     速度
@@ -879,8 +879,13 @@ _SAVE_AREA = Template("""<span class="save-area">
     <button type="button" class="speed-toggle" id="speed-toggle">x1.0</button>
   </span>
   <button type="button" id="save" disabled>保存済み</button>
-  <button type="button" id="export" title="$export_title">FCPXML書き出し</button>
   <span class="msg" id="save-msg"></span>
+</span>""")
+
+# --serve 時だけ差し込む FCPXML 書き出しボタン（2段目右端。インタフェースを
+# 4段＝原音/保存済み/現在案/凡例に収めるため、保存済みプレイヤーの行へ置く）
+_EXPORT_AREA = Template("""<span class="save-area">
+  <button type="button" id="export" title="$export_title">FCPXML書き出し</button>
 </span>""")
 
 
@@ -1596,8 +1601,9 @@ def render_html(review: dict) -> str:
         if serve
         else f'<li>行・単語をクリックすると前後 {review["pad"]:g} 秒を再生します</li>'
     )
-    save_area = (
-        _SAVE_AREA.substitute(export_title=escape(EXPORT_NOTE, quote=True))
+    save_area = _SAVE_AREA.substitute() if serve else ""
+    export_area = (
+        _EXPORT_AREA.substitute(export_title=escape(EXPORT_NOTE, quote=True))
         if serve
         else ""
     )
@@ -1606,6 +1612,7 @@ def render_html(review: dict) -> str:
         h1=escape(HLYST_H1),
         subtitle=escape(HLYST_SUBTITLE),
         save_area=save_area,
+        export_area=export_area,
         preview_panel=_PREVIEW_PANEL if serve else "",
         click_legend=click_legend,
         serve_script=_SERVE_SCRIPT if serve else "",
