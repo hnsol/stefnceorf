@@ -26,6 +26,11 @@ A local, free, privacy-first alternative to [Descript](https://www.descript.com/
 
 > **Requires Apple Silicon Mac** (M1/M2/M3/M4). Intel Macs are not supported. See [FAQ](#can-i-use-stefnceorf-on-windows-or-linux) for cross-platform options.
 
+<p align="center">
+  <img src="assets/hlyst-screenshot.png" alt="Hlyst — browser page for A/B listening and editing: original, saved edit, and current-plan players; per-cut checkboxes; safety-kept cuts highlighted" width="760">
+</p>
+<p align="center"><em>Hlyst (<code>sc review --serve</code>) — toggle each cut with a checkbox, A/B the real render instantly, save back to the transcript.</em></p>
+
 ## Quick Start
 
 ```sh

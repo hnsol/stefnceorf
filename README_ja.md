@@ -24,6 +24,11 @@ Stefnceorf は、**ワンコマンドでポッドキャスト音声の下処理�
 
 正式コマンドは `stefnceorf`（古英語 *stefn*「声」+ *ceorfan*「切る」）、短縮形 `sc`（同一動作）です。
 
+<p align="center">
+  <img src="assets/hlyst-screenshot.png" alt="Hlyst — ブラウザでの A/B 試聴・編集画面。原音・保存済み・現在案の3プレイヤー、カットごとのチェックボックス、安全判定による保持のハイライト" width="760">
+</p>
+<p align="center"><em>Hlyst（<code>sc review --serve</code>）— チェックボックスで削除を切り替え、実レンダー音を即 A/B 試聴して、トランスクリプトへ保存できます。</em></p>
+
 ## クイックスタート
 
 ```sh
