@@ -280,6 +280,16 @@ def build_review_data(
         else:
             effective_delete = not has_audio
 
+        # 比較窓のシーク計算専用の中心位置。保持対象は map_source_sample() で
+        # 編集後位置へ写像し、削除対象は既存の output（結合境界）をそのまま使う
+        # （リストの表示用タイムスタンプは source/output の開始時刻のまま変えない）。
+        source_center = (source_start + source_end) / 2.0
+        if effective_delete:
+            output_center = _sec(output)
+        else:
+            center_sample = int(round(source_center * samplerate))
+            output_center = _sec(map_source_sample(bounds, starts, center_sample))
+
         seg_req_words = req_words.get(seg_id, {})
         words_out: list[dict] = []
         for word_index, word in enumerate(seg.get("words", []) or []):
@@ -302,6 +312,7 @@ def build_review_data(
                     "source": w_start,
                     "center": (w_start + w_end) / 2.0,
                     "output": _sec(map_source_sample(bounds, starts, head)),
+                    "output_center": _sec(map_source_sample(bounds, starts, mid)),
                     "suggest": bool(word.get("suggest")),
                     "cut": not covered,
                     "requested_delete": bool(word_req),
@@ -336,7 +347,9 @@ def build_review_data(
                 "ts": _format_mmss(source_start),
                 "source": source_start,
                 "source_end": source_end,
+                "source_center": source_center,
                 "output": _sec(output),
+                "output_center": output_center,
                 "words": words_out,
                 "label": (
                     _unrecognized_label(seg, max(0.0, source_end - source_start))
@@ -1058,7 +1071,50 @@ _SERVE_SCRIPT = """<script>
     return found;
   }
 
-  function mergeStates(segments) {
+  // 保存済み位置表（L<id> / W<id>:<word> -> {sourceCenter, outputCenter}）。
+  // /save 成功時（mergeSavedStates）だけ再構築する。preview の応答では
+  // 触らない（未保存の試聴で保存済み位置がずれて見えることを防ぐ）。
+  var savedPositions = {};
+
+  function capturePositions(segments) {
+    savedPositions = {};
+    segments.forEach(function (seg) {
+      savedPositions["L" + seg.id] = {
+        sourceCenter: seg.source_center,
+        outputCenter: seg.output_center
+      };
+      seg.words.forEach(function (w) {
+        savedPositions["W" + seg.id + ":" + w.index] = {
+          sourceCenter: w.center,
+          outputCenter: w.output_center
+        };
+      });
+    });
+  }
+
+  // /preview 成功時に使う。ユーザーが指定した削除状態（requested_delete）と
+  // 保存済み位置表（savedPositions）は一切変更せず、現在案の反映結果
+  // （effective_delete と現在案の位置 output_center）だけを更新する。
+  function mergePreviewStates(segments) {
+    var byId = {};
+    segments.forEach(function (s) { byId[s.id] = s; });
+    DATA.segments.forEach(function (seg) {
+      var fresh = byId[seg.id];
+      if (!fresh) { return; }
+      seg.effective_delete = fresh.effective_delete;
+      seg.unsafe_reason = fresh.unsafe_reason;
+      seg.output_center = fresh.output_center;
+      seg.words.forEach(function (w) {
+        var fw = findWord(fresh, w.index);
+        if (!fw) { return; }
+        w.effective_delete = fw.effective_delete;
+        w.output_center = fw.output_center;
+      });
+    });
+  }
+
+  // /save 成功時だけ使う。全状態を確定させ、保存済み位置表を再構築する。
+  function mergeSavedStates(segments) {
     var byId = {};
     segments.forEach(function (s) { byId[s.id] = s; });
     DATA.segments.forEach(function (seg) {
@@ -1069,14 +1125,19 @@ _SERVE_SCRIPT = """<script>
       seg.unsafe_reason = fresh.unsafe_reason;
       seg.state = fresh.state;
       seg.output = fresh.output;
+      seg.source_center = fresh.source_center;
+      seg.output_center = fresh.output_center;
       seg.words.forEach(function (w) {
         var fw = findWord(fresh, w.index);
         if (!fw) { return; }
         w.requested_delete = fw.requested_delete;
         w.effective_delete = fw.effective_delete;
         w.output = fw.output;
+        w.center = fw.center;
+        w.output_center = fw.output_center;
       });
     });
+    capturePositions(DATA.segments);
   }
 
   function toBlob(b64) {
@@ -1099,7 +1160,7 @@ _SERVE_SCRIPT = """<script>
         // この応答より後に新しい操作（トグル/保存）が始まっていたら、
         // 画面の状態を巻き戻さないよう破棄する。
         if (myGeneration !== generation) { return; }
-        mergeStates(payload.segments);
+        mergePreviewStates(payload.segments);
         applyStates();
         notePreview((payload.message || "試聴") + "（クリックで再生）", false);
         // 対象の行/単語をクリックしたときにも再生できるよう音声をキャッシュ
@@ -1244,7 +1305,7 @@ _SERVE_SCRIPT = """<script>
     post("/save", { toggles: toggles() })
       .then(function (payload) {
         if (myGeneration !== generation) { return; }
-        mergeStates(payload.segments);
+        mergeSavedStates(payload.segments);
         applyStates();
         document.querySelector(".stats").textContent = payload.stats.join("\\n");
         var out = document.getElementById("audio-out");
@@ -1266,6 +1327,7 @@ _SERVE_SCRIPT = """<script>
       });
   });
 
+  capturePositions(DATA.segments);
   applyStates();
   updateSaveButton();
 })();

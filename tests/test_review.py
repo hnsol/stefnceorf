@@ -1018,6 +1018,40 @@ def test_serve_html_extra_legend_mentions_shortcuts(tmp_path):
     assert "Option" in html
 
 
+# ---- 保存済み・現在案・削除指定の状態分離（Hlyst UX 改修 Task 1） ----
+
+def test_preview_merge_does_not_overwrite_requested_or_saved_positions(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    body = html.split("function mergePreviewStates(segments) {")[1].split("\n  }")[0]
+    assert "effective_delete" in body
+    assert "requested_delete" not in body
+    assert "savedPositions" not in body
+
+
+def test_review_data_exposes_center_positions(tmp_path):
+    _html, rd = _serve_html(tmp_path)
+    seg = rd["segments"][0]
+    assert {"source_center", "output_center"} <= set(seg)
+    if seg["words"]:
+        assert {"center", "output_center"} <= set(seg["words"][0])
+
+
+# ---- preview範囲変更の競合をなくす（Hlyst UX 改修 Task 2） ----
+
+def test_preview_freezes_pad_for_request_and_cache_key(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    body = html.split("function runPreview(target) {")[1].split("\n  }")[0]
+    assert "var requestPad = currentPad;" in body
+    assert "pad_s: requestPad" in body
+    assert "previewKey(target, requestPad)" in body
+
+
+def test_busy_disables_pad_buttons(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    body = html.split("function setControlsBusy(value")[1].split("\n  }")[0]
+    assert ".padbtn" in body
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node が見つからない")
 def test_generated_scripts_are_valid_javascript(tmp_path):
     """生成 HTML 内の <script> はどちらも node --check で構文検証できる。"""
