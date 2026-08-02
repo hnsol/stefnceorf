@@ -53,9 +53,10 @@ def _add_transcription_arguments(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "未転写発話（UTS）候補を既定でカット指定する（〔〕付きで提示し、"
-            "精密カットが安全な場合に自動削除。〔〕を外せば保持。"
-            "既定: 有効。--no-auto-uts で無効化すると候補提示のみ（音声保持）に戻る）"
+            "未転写発話（UTS）候補・未認識区間を既定でカット指定する（〔〕付きで"
+            "提示し、精密カットが安全な場合に自動削除。〔〕を外せば保持。"
+            "既定: 有効。--no-auto-uts で未認識区間・未転写発話を既定で削除指定"
+            "にせず、候補提示のみ（音声保持）に戻る）"
         ),
     )
     parser.add_argument(

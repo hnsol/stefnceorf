@@ -1454,12 +1454,13 @@ def transcribe(
     initial_prompt を渡す。condition_on_previous_text は False（短チャンク方式で
     繰り返し幻覚を断つ。非verbatim時もプロンプトなし・False）。
 
-    auto_uts=True（既定）のときは UTS（未転写発話）候補行を〔〕付きで出力し、
-    render 側でフィラーと同じ精密カット経路により既定でカットされる（行の
-    〔〕を外せば保持、行削除でも従来どおりカットされる）。auto_uts=False では
-    旧来の「⚠ 未転写発話候補 N.N秒（音声保持）」表示に戻り、音声は常に保持
-    される（render 側は 〔〕 の有無だけを見るため、この引数は txt 出力の
-    文言のみに影響し .sc.json の内容には影響しない）。
+    auto_uts=True（既定）のときは UTS（未転写発話）候補行・plain 未認識区間行の
+    どちらも〔〕付きで出力し、render 側でフィラーと同じ精密カット経路により
+    既定でカットされる（行の〔〕を外せば保持、行削除でも従来どおりカット
+    される）。auto_uts=False では旧来の「⚠ 未転写発話候補 N.N秒（音声保持）」
+    「⚠ 未認識区間 N.N秒（音声保持）」表示に戻り、音声は常に保持される（render
+    側は 〔〕 の有無だけを見るため、この引数は txt 出力の文言のみに影響し
+    .sc.json の内容には影響しない）。
 
     戻り値: {"json_path", "txt_path", "filler_count", "data"}
     """
@@ -1772,6 +1773,13 @@ def transcribe(
                         f"[{seg_id} {_format_time(source_start)}] "
                         f"⚠ 未転写発話候補 {duration:.1f}秒（音声保持）"
                     )
+            elif auto_uts:
+                # 既定: UTS と同じ「〔〕はカット」規約。
+                # 〔〕を外せば保持、行削除でも従来どおりカットされる。
+                lines.append(
+                    f"[{seg_id} {_format_time(source_start)}] "
+                    f"{FILLER_OPEN}未認識 {duration:.1f}秒{FILLER_CLOSE}"
+                )
             else:
                 lines.append(
                     f"[{seg_id} {_format_time(source_start)}] "

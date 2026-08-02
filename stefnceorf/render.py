@@ -1420,21 +1420,30 @@ def build_edit_plan_from_text(
         if seg.get("kind") == "unrecognized":
             start = float(seg["source_start"])
             end = float(seg["source_end"])
-            # UTS（reason:"uts"）で 〔〕 が編集後テキストに残っている＝削除指定。
+            is_uts = seg.get("reason") == "uts"
+            # 〔〕 が編集後テキストに残っている＝削除指定（UTS/plain 未認識 共通）。
             # 行ごと削除した場合とまったく同じ guarded cut 判定を適用する
             # （元位置ポーズ0.25秒＋残す側の境界RMS）。確保できなければ自動削除
             # せず音声保持（従来の unrecognized 保持と同じ）に倒し警告する。
-            if seg.get("reason") == "uts" and brackets:
-                uts_requested += 1
+            if brackets:
+                if is_uts:
+                    uts_requested += 1
+                else:
+                    unrecognized_requested += 1
                 span, reason = _guarded_cut_span(start, end)
                 if span is not None:
                     if span[1] > span[0]:
-                        uts_cut_spans.append(span)
-                    safe_uts_ids.add(seg_id)
+                        (uts_cut_spans if is_uts else unrecognized_cut_spans).append(
+                            span
+                        )
+                    (safe_uts_ids if is_uts else safe_unrecognized_ids).add(seg_id)
                 else:
                     if end > start:
                         plan_intervals.append((start, end))
-                    uts_skipped_unsafe += 1
+                    if is_uts:
+                        uts_skipped_unsafe += 1
+                    else:
+                        unrecognized_skipped_unsafe += 1
                     guarded_cut_reasons[seg_id] = reason
                     all_warnings.append(
                         _guarded_keep_warning(seg_id, seg, reason)

@@ -203,12 +203,12 @@ def _deleted_boundary(
 def _unrecognized_label(seg: dict, duration: float) -> str:
     """未認識/未転写発話セグメントの表示ラベル（transcribe の既定 txt 行と同文言）。
 
-    UTS（reason:"uts"）は既定でカット指定の 〔〕 付き表示にする
+    未認識/UTS（reason:"uts"）はどちらも既定でカット指定の 〔〕 付き表示にする
     （--no-auto-uts 時の旧文言は json に区別情報が無いため反映しない）。
     """
     if seg.get("reason") == "uts":
         return f"{FILLER_OPEN}未転写発話 {duration:.1f}秒{FILLER_CLOSE}"
-    return f"⚠ 未認識区間 {duration:.1f}秒（音声保持）"
+    return f"{FILLER_OPEN}未認識 {duration:.1f}秒{FILLER_CLOSE}"
 
 
 def build_review_data(
@@ -344,9 +344,7 @@ def build_review_data(
                     unsafe_reason,
                 ),
                 "toggle": (
-                    "bracket"
-                    if seg.get("kind") == "unrecognized" and seg.get("reason") == "uts"
-                    else "line"
+                    "bracket" if seg.get("kind") == "unrecognized" else "line"
                 ),
                 "ts": _format_mmss(source_start),
                 "source": source_start,

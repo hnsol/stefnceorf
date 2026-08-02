@@ -301,6 +301,79 @@ def test_set_line_bracket_round_trip(tmp_path):
     assert serve.set_line_bracket(off, seg, True) == "〔未転写発話 1.0秒〕"
 
 
+# ---- plain 未認識行の 〔〕 既定削除指定（UTS と同じ bracket toggle） ----
+
+def test_is_bracket_toggle_includes_plain_unrecognized():
+    assert serve._is_bracket_toggle({"kind": "unrecognized", "reason": None}) is True
+    assert serve._is_bracket_toggle({"kind": "unrecognized", "reason": "uts"}) is True
+    assert serve._is_bracket_toggle({"kind": "speech"}) is False
+
+
+def test_set_line_bracket_round_trip_plain_unrecognized():
+    seg = {
+        "id": "0002", "kind": "unrecognized", "reason": None,
+        "source_start": 1.0, "source_end": 2.0,
+    }
+    on = serve.set_line_bracket("未認識 1.0秒", seg, True)
+    assert on == "〔未認識 1.0秒〕"
+    assert serve.set_line_bracket(on, seg, False) == "未認識 1.0秒"
+
+
+def test_standard_line_plain_unrecognized_uses_bracket_label():
+    seg = {
+        "id": "0002", "kind": "unrecognized", "reason": None,
+        "source_start": 1.0, "source_end": 2.0, "words": [],
+    }
+    assert serve.standard_line(seg, set()) == "[0002 0:01] 〔未認識 1.0秒〕"
+
+
+def test_requested_state_plain_unrecognized_bracket_present():
+    data = {"segments": [
+        {"id": "0002", "kind": "unrecognized", "reason": None,
+         "source_start": 1.0, "source_end": 2.0, "words": []},
+    ]}
+    text = "[0002 0:01] 〔未認識 1.0秒〕\n"
+    state = serve.requested_state(text, data, set())
+    assert state["segments"]["0002"] is True
+
+
+def test_requested_state_plain_unrecognized_bracket_removed():
+    data = {"segments": [
+        {"id": "0002", "kind": "unrecognized", "reason": None,
+         "source_start": 1.0, "source_end": 2.0, "words": []},
+    ]}
+    text = "[0002 0:01] 未認識 1.0秒\n"
+    state = serve.requested_state(text, data, set())
+    assert state["segments"]["0002"] is False
+
+
+def test_apply_toggles_plain_unrecognized_bracket_off_keeps_line():
+    data = {"segments": [
+        {"id": "0002", "kind": "unrecognized", "reason": None,
+         "source_start": 1.0, "source_end": 2.0, "words": []},
+    ]}
+    text = "[0002 0:01] 〔未認識 1.0秒〕\n"
+    out = serve.apply_toggles(
+        text, data, set(), [{"type": "line", "id": "0002", "delete": False}]
+    )
+    assert out == "[0002 0:01] 未認識 1.0秒\n"
+
+
+def test_apply_toggles_plain_unrecognized_bracket_round_trip():
+    data = {"segments": [
+        {"id": "0002", "kind": "unrecognized", "reason": None,
+         "source_start": 1.0, "source_end": 2.0, "words": []},
+    ]}
+    text = "[0002 0:01] 〔未認識 1.0秒〕\n"
+    off = serve.apply_toggles(
+        text, data, set(), [{"type": "line", "id": "0002", "delete": False}]
+    )
+    on = serve.apply_toggles(
+        off, data, set(), [{"type": "line", "id": "0002", "delete": True}]
+    )
+    assert on == text
+
+
 # ---- apply_toggles（raw 行の局所適用） ----
 
 def _all_toggles(tmp_path, text):

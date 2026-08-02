@@ -2363,9 +2363,9 @@ def test_transcribe_rescue_success_inserts_and_offsets(tmp_path, monkeypatch):
     assert resc["end"] == pytest.approx(2.5)
     assert (tmp_path / "input.sc.txt").read_text().splitlines() == [
         "[0001 0:00] 前",
-        "[0002 0:01] ⚠ 未認識区間 0.5秒（音声保持）",
+        "[0002 0:01] 〔未認識 0.5秒〕",
         "[0003 0:01] 救出",
-        "[0004 0:02] ⚠ 未認識区間 10.5秒（音声保持）",
+        "[0004 0:02] 〔未認識 10.5秒〕",
         "[0005 0:13] 後",
     ]
 
@@ -2883,7 +2883,7 @@ def test_transcribe_rescue_fallback_when_hallucination(tmp_path, monkeypatch):
     assert u["source_start"] == pytest.approx(1.0)
     assert u["source_end"] == pytest.approx(13.0)
     assert u["words"] == []
-    assert "未認識区間" in (tmp_path / "input.sc.txt").read_text()
+    assert "〔未認識" in (tmp_path / "input.sc.txt").read_text()
     rng = res["hallucination_ranges"][0]
     assert rng["rescued"] is False
     assert rng["rescued_segments"] == 0
@@ -3335,6 +3335,70 @@ def test_transcribe_no_auto_uts_keeps_legacy_line_text(
     txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
     assert "⚠ 未転写発話候補 0.3秒（音声保持）" in txt
     assert "〔未転写発話" not in txt
+
+
+def test_transcribe_plain_unrecognized_gets_bracket_by_default(
+    tmp_path, monkeypatch
+):
+    """auto_uts=True（既定）: plain 未認識行も 〔〕 付きの既定削除指定になる。"""
+    result = {
+        "language": "ja",
+        "segments": [
+            {"text": "前", "words": [
+                {"word": "前", "start": 0.0, "end": 1.0, "probability": 0.9},
+            ]},
+            {"text": "後", "words": [
+                {"word": "後", "start": 13.0, "end": 14.0, "probability": 0.9},
+            ]},
+        ],
+    }
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda *a, **k: result
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 14.0)
+    monkeypatch.setattr(
+        transcribe, "_detect_uts_spans", lambda wav, segs, cuts, sil: ([], [])
+    )
+
+    wav = _make_input(tmp_path)
+    transcribe.transcribe(str(wav), lang="ja")
+    txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
+    assert "〔未認識 12.0秒〕" in txt
+    assert "⚠ 未認識区間" not in txt
+
+
+def test_transcribe_plain_unrecognized_keeps_legacy_text_no_auto_uts(
+    tmp_path, monkeypatch
+):
+    """--no-auto-uts 相当（auto_uts=False）: plain 未認識行も従来の音声保持文言。"""
+    result = {
+        "language": "ja",
+        "segments": [
+            {"text": "前", "words": [
+                {"word": "前", "start": 0.0, "end": 1.0, "probability": 0.9},
+            ]},
+            {"text": "後", "words": [
+                {"word": "後", "start": 13.0, "end": 14.0, "probability": 0.9},
+            ]},
+        ],
+    }
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda *a, **k: result
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 14.0)
+    monkeypatch.setattr(
+        transcribe, "_detect_uts_spans", lambda wav, segs, cuts, sil: ([], [])
+    )
+
+    wav = _make_input(tmp_path)
+    transcribe.transcribe(str(wav), lang="ja", auto_uts=False)
+    txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
+    assert "⚠ 未認識区間 12.0秒（音声保持）" in txt
+    assert "〔未認識" not in txt
 
 
 @pytest.mark.parametrize("verbatim", [False, True])

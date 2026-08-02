@@ -735,6 +735,16 @@ def test_review_data_uts_toggle_kind(tmp_path):
     assert _seg(rd, "0001")["toggle"] == "line"
 
 
+def test_unrecognized_label_plain_uses_bracket_format():
+    """plain 未認識（reason なし）も UTS と同じ 〔〕 付きの既定削除表示になる。"""
+    assert review._unrecognized_label({"reason": None}, 1.0) == "〔未認識 1.0秒〕"
+    assert (
+        review._unrecognized_label({"reason": "uts"}, 1.0) == "〔未転写発話 1.0秒〕"
+    )
+
+
+
+
 def test_html_title_is_hlyst(tmp_path):
     html, _rd = _html(tmp_path)
     assert "<title>Hlyst — input</title>" in html

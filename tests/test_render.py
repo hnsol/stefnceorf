@@ -1952,6 +1952,46 @@ def test_deleted_uts_row_and_bracketed_uts_share_guard(tmp_path):
     assert line_deleted.stats.uts_cut == bracketed.stats.uts_cut == 1
 
 
+def test_render_plain_unrecognized_bracket_present_safe_cuts(tmp_path):
+    """plain 未認識行も 〔〕 が残っていれば UTS と同じ guarded cut 要求になる。"""
+    txt = _write_guarded_project(tmp_path, 0.20, 0.20, mid_dur=0.4)
+    txt.write_text(
+        "[0001] 前\n[0002] 〔未認識 0.4秒〕\n[0003] 後\n", encoding="utf-8"
+    )
+    plan = render.build_edit_plan(str(txt))
+    assert plan.stats.unrecognized_requested == 1
+    assert plan.stats.unrecognized_cut == 1
+    assert plan.stats.unrecognized_skipped_unsafe == 0
+    assert plan.guarded_cut_reasons == {}
+    assert _middle_tone_is_absent(plan)
+
+
+def test_render_plain_unrecognized_bracket_removed_keeps_audio(tmp_path):
+    """〔〕を外せば保持指定になり、削除されない。"""
+    txt = _write_guarded_project(tmp_path, 0.20, 0.20, mid_dur=0.4)
+    txt.write_text(
+        "[0001] 前\n[0002] 未認識 0.4秒\n[0003] 後\n", encoding="utf-8"
+    )
+    plan = render.build_edit_plan(str(txt))
+    assert plan.stats.unrecognized_requested == 0
+    assert plan.stats.unrecognized_cut == 0
+    assert _middle_tone_is_present(plan)
+
+
+def test_render_plain_unrecognized_bracket_unsafe_kept_with_reason(tmp_path):
+    """安全判定を通らないなら自動削除せず保持し、reason を記録する。"""
+    txt = _write_guarded_project(tmp_path, 0.10, 0.10, mid_dur=0.4)
+    txt.write_text(
+        "[0001] 前\n[0002] 〔未認識 0.4秒〕\n[0003] 後\n", encoding="utf-8"
+    )
+    plan = render.build_edit_plan(str(txt))
+    assert plan.stats.unrecognized_requested == 1
+    assert plan.stats.unrecognized_cut == 0
+    assert plan.stats.unrecognized_skipped_unsafe == 1
+    assert plan.guarded_cut_reasons == {"0002": "pause"}
+    assert _middle_tone_is_present(plan)
+
+
 def test_guarded_cut_does_not_fall_back_to_coarse_silences(tmp_path):
     # rms_silences を持たない旧 JSON。粗い silences があっても使わず保持する。
     plan = _build_deleted_unrecognized_plan(

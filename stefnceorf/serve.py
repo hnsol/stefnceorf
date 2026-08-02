@@ -144,6 +144,18 @@ def uts_label(seg: dict) -> str:
     return f"{FILLER_OPEN}未転写発話 {duration:.1f}秒{FILLER_CLOSE}"
 
 
+def _unrecognized_label(seg: dict) -> str:
+    """未認識/UTS 行の標準ラベル（〔〕付き）。transcribe の既定出力と同文言。
+
+    reason:"uts" は「未転写発話」、plain 未認識は「未認識」を使う（どちらも
+    auto_uts の既定である〔〕付き＝削除指定の表示）。
+    """
+    duration = max(0.0, float(seg["source_end"]) - float(seg["source_start"]))
+    if seg.get("reason") == "uts":
+        return f"{FILLER_OPEN}未転写発話 {duration:.1f}秒{FILLER_CLOSE}"
+    return f"{FILLER_OPEN}未認識 {duration:.1f}秒{FILLER_CLOSE}"
+
+
 def standard_line(seg: dict, fillers: set[str]) -> str:
     """json から transcribe と同じ標準形式の行を生成する（改行なし）。
 
@@ -154,12 +166,7 @@ def standard_line(seg: dict, fillers: set[str]) -> str:
 
     if seg.get("kind") == "unrecognized":
         start = float(seg["source_start"])
-        duration = max(0.0, float(seg["source_end"]) - start)
-        label = (
-            uts_label(seg)
-            if seg.get("reason") == "uts"
-            else f"⚠ 未認識区間 {duration:.1f}秒（音声保持）"
-        )
+        label = _unrecognized_label(seg)
         return f"[{seg['id']} {_format_time(start)}] {label}"
 
     words = seg.get("words", []) or []
@@ -332,24 +339,28 @@ def set_word_bracket(
 
 
 def set_line_bracket(body: str, seg: dict, delete: bool) -> str:
-    """UTS 行の本文に 〔〕 を付与/解除する。
+    """未認識/UTS 行の本文に 〔〕 を付与/解除する。
 
-    UTS 行の本文は機械生成のプレースホルダなので、付与時は標準ラベルへ揃える。
-    解除は 〔〕 の記号だけを外して中身を残す（同じ操作で元に戻る）。
+    未認識/UTS 行の本文は機械生成のプレースホルダなので、付与時は標準ラベルへ
+    揃える。解除は 〔〕 の記号だけを外して中身を残す（同じ操作で元に戻る）。
     """
     has_bracket = _FILLER_RE.search(body) is not None
     if delete == has_bracket:
         return body
     if delete:
-        return uts_label(seg)
+        return _unrecognized_label(seg)
     return _FILLER_RE.sub(
         lambda m: m.group(0)[len(FILLER_OPEN): -len(FILLER_CLOSE)], body
     )
 
 
 def _is_bracket_toggle(seg: dict) -> bool:
-    """この行の「削除」を 〔〕 で表すか（UTS 行）／行の有無で表すか。"""
-    return seg.get("kind") == "unrecognized" and seg.get("reason") == "uts"
+    """この行の「削除」を 〔〕 で表すか（未認識/UTS 行）／行の有無で表すか。
+
+    plain 未認識行（reason なし）も UTS と同じく auto_uts の既定で〔〕付き
+    出力になったため、UTS 限定だった bracket toggle をここで揃える。
+    """
+    return seg.get("kind") == "unrecognized"
 
 
 def _line_index(lines: list[str]) -> dict[str, int]:
@@ -467,7 +478,7 @@ def requested_state(raw_text: str, data: dict, fillers: set[str]) -> dict:
     """raw TXT から「削除指定（requested_delete）」の一覧を組み立てる。
 
     戻り値 {"segments": {id: bool}, "words": {id: {word_index: bool}}}。
-    UTS 行は 〔〕 の有無、その他の行は行の有無が削除指定にあたる。
+    未認識/UTS 行は 〔〕 の有無、その他の行は行の有無が削除指定にあたる。
     """
     lines = raw_text.splitlines(keepends=True)
     index = _line_index(lines)
