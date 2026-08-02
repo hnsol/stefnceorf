@@ -2,6 +2,7 @@ import json
 import re
 import shutil
 import subprocess
+from html import escape
 
 import numpy as np
 import pytest
@@ -445,11 +446,10 @@ def test_review_data_reports_silence_trim(tmp_path):
     assert trim["removed"] == pytest.approx(1.28, abs=0.05)
 
 
-def test_review_data_carries_stats_and_note(tmp_path):
+def test_review_data_carries_stats(tmp_path):
     _plan, rd = _build(tmp_path, _FULL_TXT)
     assert any(line.startswith("Duration: ") for line in rd["stats"])
-    assert "sc render" in rd["note"]
-    assert "Logic" in rd["note"]
+    assert "note" not in rd
 
 
 # ---- HTML 生成 ----
@@ -539,9 +539,9 @@ def test_html_uses_relative_audio_paths(tmp_path):
     assert str(tmp_path) not in html
 
 
-def test_html_shows_logic_note(tmp_path):
+def test_html_has_no_note_paragraph(tmp_path):
     html, _rd = _html(tmp_path)
-    assert "最終確認はLogicで行ってください。" in html
+    assert 'class="note"' not in html
 
 
 def test_html_shows_silence_trim_marker(tmp_path):
@@ -752,13 +752,14 @@ def test_html_title_is_hlyst(tmp_path):
     assert "削除のON/OFFを切り替え、現在案を試聴して保存します。" in html
 
 
-def test_html_note_is_three_lines(tmp_path):
-    html, _rd = _html(tmp_path)
-    assert "Hlystは sc render の音声を再生します。" in html
-    assert "Logic用FCPXMLではカット部分が空白として残るため、間の長さは一致しません。" in html
-    assert "最終確認はLogicで行ってください。" in html
-    note_block = html.split('<p class="note">')[1].split("</p>")[0]
-    assert note_block.count("<br>") == 2
+def test_export_note_only_in_button_title(tmp_path):
+    """注記は静的モードに存在せず、serve モードでは export ボタンの title だけに残る。"""
+    static_html, _rd = _html(tmp_path)
+    assert "最終確認はLogicで行ってください。" not in static_html
+
+    serve_html, _rd2 = _serve_html(tmp_path)
+    assert escape(review.EXPORT_NOTE, quote=True) in serve_html
+    assert f'title="{escape(review.EXPORT_NOTE, quote=True)}"' in serve_html
 
 
 def test_static_html_has_no_checkboxes(tmp_path):
@@ -983,6 +984,114 @@ def test_serve_html_save_button_is_in_first_player_row(tmp_path):
 def test_serve_html_save_button_default_label(tmp_path):
     html, _rd = _serve_html(tmp_path)
     assert '<button type="button" id="save" disabled>保存済み</button>' in html
+
+
+# ---- FCPXML 書き出しコントロール（Hlyst UX 改修） ----
+
+def test_export_button_only_in_serve_html(tmp_path):
+    static_html, _rd = _html(tmp_path)
+    serve_html, _rd2 = _serve_html(tmp_path)
+    assert 'id="export"' not in static_html
+    assert 'id="export"' in serve_html
+
+
+def test_export_button_title_is_escaped(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    assert f'title="{escape(review.EXPORT_NOTE, quote=True)}"' in html
+
+
+def test_note_removed_from_both_modes(tmp_path):
+    static_html, _rd = _html(tmp_path)
+    serve_html, _rd2 = _serve_html(tmp_path)
+    assert 'class="note"' not in static_html
+    assert 'class="note"' not in serve_html
+
+
+def test_control_order_speed_save_export_notice(tmp_path):
+    """1段目右側の配置順は 速度→保存→FCPXML書き出し→通知 で固定する。"""
+    html, _rd = _serve_html(tmp_path)
+    row1 = html.split('class="player-row"')[1].split('class="player-row"')[0]
+    speed_i = row1.index("speed-select")
+    save_i = row1.index('id="save"')
+    export_i = row1.index('id="export"')
+    msg_i = row1.index('id="save-msg"')
+    assert speed_i < save_i < export_i < msg_i
+
+
+def test_export_busy_kind_disables_controls(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    assert '"export"' in serve_script
+    assert "書き出し中…" in serve_script
+
+
+def test_post_preserves_error_payload(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    post_body = html.split("function post(path, body) {")[1].split("\n  }")[0]
+    assert "err.payload = payload;" in post_body
+
+
+def test_export_partial_success_syncs_saved_state(tmp_path):
+    """成功・失敗いずれも applyReviewPayload 経由で厳密比較の txt_saved を見る。"""
+    html, _rd = _serve_html(tmp_path)
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    assert "err.payload" in serve_script
+    assert "applyReviewPayload(" in serve_script
+    assert "payload.txt_saved === true" in serve_script
+
+
+def test_js_review_updated_without_save_syncs_audio(tmp_path):
+    """review_updated===true のとき（txt_saved の値に関わらず）音源を同期する。"""
+    html, _rd = _serve_html(tmp_path)
+    body = html.split("function applyReviewPayload(payload, opts) {")[1].split(
+        "\n  }"
+    )[0]
+    assert "payload.review_updated === true" in body
+    assert 'DATA.review_audio + "&v="' in body
+    assert "clearPreviewCache();" in body
+
+
+def test_js_review_updated_without_save_on_fcpxml_failure(tmp_path):
+    """export の catch 経路でも applyReviewPayload を通して音源同期を試みる。"""
+    html, _rd = _serve_html(tmp_path)
+    export_body = html.split('post("/export"')[1].split("setControlsBusy(false);")[0]
+    assert export_body.count("applyReviewPayload(") == 2
+
+
+def test_js_review_updated_does_not_commit_baseline(tmp_path):
+    """review_updated の同期と baseline 更新（commitBaseline）は独立して判定する。"""
+    html, _rd = _serve_html(tmp_path)
+    body = html.split("function applyReviewPayload(payload, opts) {")[1].split(
+        "\n  }"
+    )[0]
+    review_block = body.split("if (payload.review_updated === true) {")[1].split(
+        "if (commitBaseline) {"
+    )[0]
+    assert "baseline = snapshot();" not in review_block
+    assert "if (commitBaseline) {" in body
+    assert "baseline = snapshot();" in body.split("if (commitBaseline) {")[1]
+
+
+def test_js_clean_failure_changes_nothing(tmp_path):
+    """txt_saved/review_updated がどちらも false（またはキー欠落）なら何もしない。"""
+    html, _rd = _serve_html(tmp_path)
+    body = html.split("function applyReviewPayload(payload, opts) {")[1].split(
+        "\n  }"
+    )[0]
+    assert "if (payload.review_updated === true) {" in body
+    assert "if (commitBaseline) {" in body
+
+
+def test_js_refresh_failure_commits_baseline_only(tmp_path):
+    """txt_saved===true かつ segments 無しでは baseline だけ更新し音源は触らない。"""
+    html, _rd = _serve_html(tmp_path)
+    export_handler = html.split('post("/export"')[1]
+    assert (
+        "applyReviewPayload(payload, { commitBaseline: payload.txt_saved === true })"
+        in export_handler
+        or "applyReviewPayload(payload, {commitBaseline: payload.txt_saved === true})"
+        in export_handler
+    )
 
 
 # ---- 再生速度コントロール（Hlyst UX 改修） ----

@@ -51,10 +51,10 @@ PLAY_PAD_S = 2.0
 HLYST_H1 = "Hlyst — A/B試聴・編集"
 HLYST_SUBTITLE = "削除のON/OFFを切り替え、現在案を試聴して保存します。"
 
-# Logic 用 FCPXML との差異を明示する注記（HTML 冒頭に常時表示。3行）
-LOGIC_NOTE = (
-    "Hlystは sc render の音声を再生します。\n"
-    "Logic用FCPXMLではカット部分が空白として残るため、間の長さは一致しません。\n"
+# Logic 用 FCPXML との差異を明示する注記（export ボタンの title 属性にだけ表示）
+EXPORT_NOTE = (
+    "Hlystは sc render の音声を再生します。"
+    "Logic用FCPXMLではカット部分が空白として残るため、間の長さは一致しません。"
     "最終確認はLogicで行ってください。"
 )
 
@@ -398,7 +398,6 @@ def build_review_data(
         "trims": trims,
         "stats": format_stats(plan.stats),
         "warnings": list(plan.warnings),
-        "note": LOGIC_NOTE,
     }
 
 
@@ -608,10 +607,6 @@ body {
 }
 h1 { font-size: 1.2rem; margin: 0 0 .1rem; }
 .subtitle { font-size: .85rem; color: var(--text-muted); margin: 0 0 .5rem; }
-.note {
-  font-size: .85rem; padding: .5rem .75rem; margin: 0 0 1rem;
-  border-left: 3px solid var(--yellow); background: var(--yellow-tint);
-}
 /* 操作エリアはスクロールしても画面上部に固定する */
 .controls {
   position: sticky; top: 0; z-index: 10; background: var(--surface);
@@ -725,7 +720,6 @@ label.wt input { margin: 0 .1em 0 .2em; vertical-align: middle; }
 <body>
 <h1>$h1</h1>
 <p class="subtitle">$subtitle</p>
-<p class="note">$note</p>
 <div class="controls">
 <div class="player-row">
   <button type="button" class="mode" data-mode="src">原音</button>
@@ -855,9 +849,10 @@ $serve_script
 """)
 
 
-# --serve 時だけ差し込む速度コントロール＋保存ボタン
-# （1段目右端、原音プレイヤーと余白/区切りで分離。速度は保存ボタンの左）
-_SAVE_AREA = """<span class="save-area">
+# --serve 時だけ差し込む速度コントロール＋保存ボタン＋FCPXML書き出しボタン
+# （1段目右端、原音プレイヤーと余白/区切りで分離。配置順は
+# 速度→保存→FCPXML書き出し→通知で固定する）
+_SAVE_AREA = Template("""<span class="save-area">
   <span class="speed-select" id="speed-select">
     速度
     <button type="button" class="padbtn speedbtn active" data-speed="1">x1.0</button>
@@ -867,8 +862,9 @@ _SAVE_AREA = """<span class="save-area">
     <button type="button" class="padbtn speedbtn" data-speed="2">x2.0</button>
   </span>
   <button type="button" id="save" disabled>保存済み</button>
+  <button type="button" id="export" title="$export_title">FCPXML書き出し</button>
   <span class="msg" id="save-msg"></span>
-</span>"""
+</span>""")
 
 
 # --serve 時だけ差し込む3段目（現在案の状態ラベル・audio・試聴範囲切替・対象/現在案の絶対時刻）。
@@ -898,6 +894,7 @@ _SERVE_SCRIPT = """<script>
   var audioSrc = document.getElementById("audio-src");
   var audioOut = document.getElementById("audio-out");
   var saveBtn = document.getElementById("save");
+  var exportBtn = document.getElementById("export");
   var saveMsg = document.getElementById("save-msg");
   var previewMsg = document.getElementById("preview-msg");
   var previewState = document.getElementById("preview-state");
@@ -905,9 +902,9 @@ _SERVE_SCRIPT = """<script>
   var absCenter = document.getElementById("abs-center");
   var dirty = false;
   var busy = false;
-  // busy 中の種別。null（非busy）/ "preview"（試聴生成中） / "save"（保存中）。
-  // preview 中は保存ボタンの文言を維持したまま disable し、save 中だけ
-  // 「保存中…」と表示を分けるために使う。
+  // busy 中の種別。null（非busy）/ "preview"（試聴生成中） / "save"（保存中） /
+  // "export"（FCPXML書き出し中）。preview 中は保存/書き出しボタンの文言を
+  // 維持したまま disable し、save/export 中だけ専用の進行中文言に切り替える。
   var busyKind = null;
   var baseline = snapshot();
   // 3段目「現在案プレビュー」の試聴範囲（秒）。3段目付近のボタンで切替できる。
@@ -1036,9 +1033,22 @@ _SERVE_SCRIPT = """<script>
     saveBtn.textContent = dirty ? "変更を保存（" + n + "件）" : "保存済み";
   }
 
-  // busy 中は全チェックボックスと保存ボタン・pad切替ボタン（.padbtn）を操作
-  // 不能にする（見た目にも分かるようにする）。busy を素通しして黙って古い
-  // 操作を捨てる経路を作らないため。kind は "preview" / "save" / 省略（解除時）。
+  // FCPXML書き出しボタンの表示を export中／通常の2状態で切り替える。dirty で
+  // なくても常時利用可（busy 中を除く）で、export 中だけ「書き出し中…」にする。
+  function updateExportButton() {
+    if (busyKind === "export") {
+      exportBtn.disabled = true;
+      exportBtn.textContent = "書き出し中…";
+      return;
+    }
+    exportBtn.disabled = busy;
+    exportBtn.textContent = "FCPXML書き出し";
+  }
+
+  // busy 中は全チェックボックスと保存/書き出しボタン・pad切替ボタン（.padbtn）
+  // を操作不能にする（見た目にも分かるようにする）。busy を素通しして黙って
+  // 古い操作を捨てる経路を作らないため。kind は "preview" / "save" /
+  // "export" / 省略（解除時）。
   function setControlsBusy(value, kind) {
     busy = value;
     busyKind = value ? (kind || null) : null;
@@ -1051,6 +1061,7 @@ _SERVE_SCRIPT = """<script>
       function (btn) { btn.disabled = value; }
     );
     updateSaveButton();
+    updateExportButton();
   }
 
   // previewCache の全 object URL を revoke して破棄する。トグル変更のたびに
@@ -1150,11 +1161,21 @@ _SERVE_SCRIPT = """<script>
     }).then(function (res) {
       return res.json().then(function (payload) {
         if (!res.ok || payload.error) {
-          throw new Error(payload.error || ("HTTP " + res.status));
+          // エラー時も payload 全体を保持する（txt_saved/review_updated/
+          // segments 等から呼び出し側が画面同期を判断できるようにするため）。
+          var err = new Error(payload.error || ("HTTP " + res.status));
+          err.payload = payload;
+          throw err;
         }
         return payload;
       });
     });
+  }
+
+  // パスの basename（フルパスでなく表示用のファイル名だけを見せるため）。
+  function basename(path) {
+    var parts = String(path).split(/[\\/]/);
+    return parts[parts.length - 1];
   }
 
   function findWord(seg, index) {
@@ -1230,6 +1251,31 @@ _SERVE_SCRIPT = """<script>
       });
     });
     capturePositions(DATA.segments);
+  }
+
+  // /save・/export の応答を画面へ反映する共通経路。txt_saved（保存 baseline
+  // の基準）と review_updated（review.wav 再生成の成否）は独立した2軸のため、
+  // それぞれ opts.commitBaseline と payload.review_updated の厳密比較
+  // （=== true）で個別に判定する。segments が無い応答（review.wav 再生成
+  // 失敗など）では音源・データの同期をスキップする。
+  function applyReviewPayload(payload, opts) {
+    var commitBaseline = !!(opts && opts.commitBaseline);
+    if (payload.review_updated === true) {
+      var out = document.getElementById("audio-out");
+      out.src = DATA.review_audio + "&v=" + payload.version;
+      out.load();
+      clearPreviewCache();
+      if (payload.segments) {
+        mergeSavedStates(payload.segments);
+        applyStates();
+        if (payload.stats) {
+          document.querySelector(".stats").textContent = payload.stats.join("\\n");
+        }
+      }
+    }
+    if (commitBaseline) {
+      baseline = snapshot();
+    }
   }
 
   function toBlob(b64) {
@@ -1418,20 +1464,45 @@ _SERVE_SCRIPT = """<script>
     post("/save", { toggles: toggles() })
       .then(function (payload) {
         if (myGeneration !== generation) { return; }
-        mergeSavedStates(payload.segments);
-        applyStates();
-        document.querySelector(".stats").textContent = payload.stats.join("\\n");
-        var out = document.getElementById("audio-out");
-        out.src = DATA.review_audio + "&v=" + payload.version;
-        out.load();
-        baseline = snapshot();
-        // 保存成功後は編集後プランが確定するため、古いプレビュー音声を
-        // すべて破棄する（保存前の中間状態の音が再生されないようにする）。
-        clearPreviewCache();
+        // /save は常に TXT を書き保存済み音声を作り直す（既存契約は
+        // {version, txt_path, segments, stats, warnings} のまま txt_saved /
+        // review_updated を含まないため、ここで相当する true を明示して
+        // applyReviewPayload へ寄せる）。
+        applyReviewPayload(
+          {
+            version: payload.version,
+            segments: payload.segments,
+            stats: payload.stats,
+            review_updated: true
+          },
+          { commitBaseline: true }
+        );
         noteSave("保存しました: " + payload.txt_path, false);
       })
       .catch(function (err) {
         if (myGeneration !== generation) { return; }
+        noteSave(err.message, true);
+      })
+      .then(function () {
+        if (myGeneration !== generation) { return; }
+        setControlsBusy(false);
+      });
+  });
+
+  exportBtn.addEventListener("click", function () {
+    if (busy) { return; }
+    var myGeneration = ++generation;
+    setControlsBusy(true, "export");
+    post("/export", { toggles: toggles() })
+      .then(function (payload) {
+        if (myGeneration !== generation) { return; }
+        applyReviewPayload(payload, { commitBaseline: payload.txt_saved === true });
+        noteSave("FCPXML書き出し済み: " + basename(payload.fcpxml_path), false);
+      })
+      .catch(function (err) {
+        if (myGeneration !== generation) { return; }
+        var payload = err.payload || {};
+        applyReviewPayload(payload, { commitBaseline: payload.txt_saved === true });
         noteSave(err.message, true);
       })
       .then(function () {
@@ -1483,15 +1554,19 @@ def render_html(review: dict) -> str:
         if serve
         else f'<li>行・単語をクリックすると前後 {review["pad"]:g} 秒を再生します</li>'
     )
+    save_area = (
+        _SAVE_AREA.substitute(export_title=escape(EXPORT_NOTE, quote=True))
+        if serve
+        else ""
+    )
     return _HTML_TEMPLATE.substitute(
         title=escape(f"Hlyst — {review['base']}"),
         h1=escape(HLYST_H1),
         subtitle=escape(HLYST_SUBTITLE),
-        save_area=_SAVE_AREA if serve else "",
+        save_area=save_area,
         preview_panel=_PREVIEW_PANEL if serve else "",
         click_legend=click_legend,
         serve_script=_SERVE_SCRIPT if serve else "",
-        note="<br>".join(escape(line) for line in review["note"].split("\n")),
         source_audio=escape(review["source_audio"], quote=True),
         review_audio=escape(review["review_audio"], quote=True),
         stats=escape("\n".join(review["stats"])),

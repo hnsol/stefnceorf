@@ -1750,6 +1750,33 @@ def test_export_stale_retry_refresh_failure_states(tmp_path, monkeypatch):
     assert not _fcpxml_path(tmp_path).exists()
 
 
+def test_export_stale_retry_refresh_failure_message_omits_saved_prefix(
+    tmp_path, monkeypatch
+):
+    """stale 再試行 (txt_saved=False) は『TXT は保存済みです』を前置きしない。
+
+    初回 dirty export の失敗は既存どおり「TXT は保存済みです。…」で始まる文言だが、
+    続く clean/stale 再試行の失敗（今回は何も書いていない）でその前置きが出ると
+    誤解を招くため、export() 側で txt_saved に応じて文言を作り分ける。
+    """
+    session, _txt = _session(tmp_path)
+
+    def _boom(*args, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(serve, "render_plan", _boom)
+    with pytest.raises(serve.ExportRefreshError) as exc1:
+        session.export(_cut_0003_toggles(tmp_path, session))
+    assert exc1.value.txt_saved is True
+    assert "TXT は保存済みです" in str(exc1.value)
+
+    with pytest.raises(serve.ExportRefreshError) as exc2:
+        session.export(_all_toggles(tmp_path, session.raw_text))
+    assert exc2.value.txt_saved is False
+    assert "TXT は保存済みです" not in str(exc2.value)
+    assert "review.wavの更新に失敗しました" in str(exc2.value)
+
+
 def test_export_stale_retry_success_generates_fcpxml(tmp_path, monkeypatch):
     """stale 再試行が成功したら保存なしでも音源が更新され FCPXML が出る。"""
     session, _txt = _session(tmp_path)

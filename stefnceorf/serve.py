@@ -769,7 +769,16 @@ class HlystSession:
                 except AudioRenderError as exc:
                     # review.wav が古いままなので FCPXML は作らない。
                     # txt_saved は「今回実際に書いたか」（stale 再試行では False）。
-                    raise ExportRefreshError(str(exc), txt_saved=saved) from exc
+                    # _refresh_after_save の文言は「TXT は保存済みです。…」で
+                    # 始まる固定文言だが、stale 再試行（saved=False）ではその
+                    # 前置きが誤解を招くため、export() 側で txt_saved に応じて
+                    # 文言を組み立てる。
+                    if saved:
+                        message = str(exc)
+                    else:
+                        cause = exc.__cause__ if exc.__cause__ is not None else exc
+                        message = f"review.wavの更新に失敗しました: {cause}"
+                    raise ExportRefreshError(message, txt_saved=saved) from exc
                 review_updated = True
 
             data = self.review_data(self.raw_text, self.plan)
