@@ -47,11 +47,15 @@ REVIEW_HTML_SUFFIX = ".review.html"
 # 行/単語クリック時に再生する前後の余白（秒）。カット境界の前後を耳で追える長さ。
 PLAY_PAD_S = 2.0
 
-# Logic 用 FCPXML との差異を明示する注記（HTML 冒頭に常時表示）
+# Hlyst の h1 直下の見出し・サブタイトル（serve/静的モード共通）
+HLYST_H1 = "Hlyst — A/B試聴・編集"
+HLYST_SUBTITLE = "削除のON/OFFを切り替え、現在案を試聴して保存します。"
+
+# Logic 用 FCPXML との差異を明示する注記（HTML 冒頭に常時表示。3行）
 LOGIC_NOTE = (
-    "この A/B は sc render の結果に対して正確です。"
-    "Logic 用 FCPXML は削除をタイムラインの空白として残すため、"
-    "Logic 上の再生とは異なります。"
+    "Hlystは sc render の音声を再生します。\n"
+    "Logic用FCPXMLではカット部分が空白として残るため、間の長さは一致しません。\n"
+    "最終確認はLogicで行ってください。"
 )
 
 
@@ -716,7 +720,7 @@ label.wt input { margin: 0 .1em 0 .2em; vertical-align: middle; }
 </style>
 </head>
 <body>
-<h1>$title</h1>
+<h1>$h1</h1>
 <p class="subtitle">$subtitle</p>
 <p class="note">$note</p>
 <div class="controls">
@@ -1439,15 +1443,13 @@ def render_html(review: dict) -> str:
     )
     return _HTML_TEMPLATE.substitute(
         title=escape(f"Hlyst — {review['base']}"),
-        subtitle=escape(
-            "A/B試聴・編集（チェックで削除ON/OFF→クリックで試聴→保存）"
-            if serve else "A/B試聴"
-        ),
+        h1=escape(HLYST_H1),
+        subtitle=escape(HLYST_SUBTITLE),
         save_area=_SAVE_AREA if serve else "",
         preview_panel=_PREVIEW_PANEL if serve else "",
         click_legend=click_legend,
         serve_script=_SERVE_SCRIPT if serve else "",
-        note=escape(review["note"]),
+        note="<br>".join(escape(line) for line in review["note"].split("\n")),
         source_audio=escape(review["source_audio"], quote=True),
         review_audio=escape(review["review_audio"], quote=True),
         stats=escape("\n".join(review["stats"])),

@@ -541,7 +541,7 @@ def test_html_uses_relative_audio_paths(tmp_path):
 
 def test_html_shows_logic_note(tmp_path):
     html, _rd = _html(tmp_path)
-    assert "Logic 上の再生とは異なります" in html
+    assert "最終確認はLogicで行ってください。" in html
 
 
 def test_html_shows_silence_trim_marker(tmp_path):
@@ -738,7 +738,17 @@ def test_review_data_uts_toggle_kind(tmp_path):
 def test_html_title_is_hlyst(tmp_path):
     html, _rd = _html(tmp_path)
     assert "<title>Hlyst — input</title>" in html
-    assert "A/B試聴" in html
+    assert "<h1>Hlyst — A/B試聴・編集</h1>" in html
+    assert "削除のON/OFFを切り替え、現在案を試聴して保存します。" in html
+
+
+def test_html_note_is_three_lines(tmp_path):
+    html, _rd = _html(tmp_path)
+    assert "Hlystは sc render の音声を再生します。" in html
+    assert "Logic用FCPXMLではカット部分が空白として残るため、間の長さは一致しません。" in html
+    assert "最終確認はLogicで行ってください。" in html
+    note_block = html.split('<p class="note">')[1].split("</p>")[0]
+    assert note_block.count("<br>") == 2
 
 
 def test_static_html_has_no_checkboxes(tmp_path):
