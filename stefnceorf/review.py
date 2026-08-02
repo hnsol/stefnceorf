@@ -883,8 +883,11 @@ _SAVE_AREA = Template("""<span class="save-area">
 </span>""")
 
 # --serve 時だけ差し込む FCPXML 書き出しボタン（2段目右端。インタフェースを
-# 4段＝原音/保存済み/現在案/凡例に収めるため、保存済みプレイヤーの行へ置く）
+# 4段＝原音/保存済み/現在案/凡例に収めるため、保存済みプレイヤーの行へ置く）。
+# 書き出し結果の通知はボタンの隣に出し、成功時は自動で消す（1段目に出すと
+# 保存ボタン周りを圧迫するため）。
 _EXPORT_AREA = Template("""<span class="save-area">
+  <span class="msg" id="export-msg"></span>
   <button type="button" id="export" title="$export_title">FCPXML書き出し</button>
 </span>""")
 
@@ -1138,6 +1141,21 @@ _SERVE_SCRIPT = """<script>
   function noteSave(text, isError) {
     saveMsg.textContent = text;
     saveMsg.classList.toggle("error", !!isError);
+  }
+
+  // 書き出し結果は2段目のFCPXMLボタン横へ。成功メッセージは数秒で自動的に
+  // 消す（エラーは操作されるまで残す）。
+  var exportMsg = document.getElementById("export-msg");
+  var exportMsgTimer = null;
+  function noteExport(text, isError) {
+    if (exportMsgTimer) { clearTimeout(exportMsgTimer); exportMsgTimer = null; }
+    exportMsg.textContent = text;
+    exportMsg.classList.toggle("error", !!isError);
+    if (!isError) {
+      exportMsgTimer = setTimeout(function () {
+        exportMsg.textContent = "";
+      }, 5000);
+    }
   }
 
   // 秒 → "M:SS.d" 形式（等幅数字表示欄で使う）。
@@ -1544,13 +1562,13 @@ _SERVE_SCRIPT = """<script>
       .then(function (payload) {
         if (myGeneration !== generation) { return; }
         applyReviewPayload(payload, { commitBaseline: payload.txt_saved === true });
-        noteSave("FCPXML書き出し済み: " + basename(payload.fcpxml_path), false);
+        noteExport("書き出し済み: " + basename(payload.fcpxml_path), false);
       })
       .catch(function (err) {
         if (myGeneration !== generation) { return; }
         var payload = err.payload || {};
         applyReviewPayload(payload, { commitBaseline: payload.txt_saved === true });
-        noteSave(err.message, true);
+        noteExport(err.message, true);
       })
       .then(function () {
         if (myGeneration !== generation) { return; }
