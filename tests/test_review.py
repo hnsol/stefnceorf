@@ -894,7 +894,7 @@ def test_serve_script_disables_checkboxes_while_busy(tmp_path):
     """busy 中はチェックボックス（.del/.delw）と保存ボタンを操作不能にする。"""
     html, _rd = _serve_html(tmp_path)
     assert "input.del, input.delw" in html
-    assert "function setControlsBusy(value) {" in html
+    assert "function setControlsBusy(value, kind) {" in html
     assert "box.disabled = value;" in html
 
 

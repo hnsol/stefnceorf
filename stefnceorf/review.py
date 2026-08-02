@@ -888,6 +888,10 @@ _SERVE_SCRIPT = """<script>
   var absPos = document.getElementById("abs-pos");
   var dirty = false;
   var busy = false;
+  // busy 中の種別。null（非busy）/ "preview"（試聴生成中） / "save"（保存中）。
+  // preview 中は保存ボタンの文言を維持したまま disable し、save 中だけ
+  // 「保存中…」と表示を分けるために使う。
+  var busyKind = null;
   var baseline = snapshot();
   // 3段目「現在案プレビュー」の試聴範囲（秒）。3段目付近のボタンで切替できる。
   var currentPad = 4;
@@ -941,9 +945,11 @@ _SERVE_SCRIPT = """<script>
     return Object.keys(cur).filter(function (k) { return cur[k] !== baseline[k]; });
   }
 
-  // 保存ボタンの表示を busy／変更あり（件数入り）／変更なしの3状態で切り替える。
+  // 保存ボタンの表示を save中／preview中／変更あり（件数入り）／変更なしの
+  // 4状態で切り替える。preview中は「保存中…」ではなく通常の文言を維持した
+  // まま disable する（保存していないのに保存中と誤表示しないため）。
   function updateSaveButton() {
-    if (busy) {
+    if (busyKind === "save") {
       saveBtn.disabled = true;
       saveBtn.classList.remove("dirty");
       saveBtn.textContent = "保存中…";
@@ -951,18 +957,24 @@ _SERVE_SCRIPT = """<script>
     }
     var n = dirtyKeys().length;
     dirty = n > 0;
-    saveBtn.disabled = !dirty;
-    saveBtn.classList.toggle("dirty", dirty);
+    saveBtn.disabled = !dirty || busy;
+    saveBtn.classList.toggle("dirty", dirty && !busy);
     saveBtn.textContent = dirty ? "変更を保存（" + n + "件）" : "保存済み";
   }
 
-  // busy 中は全チェックボックスと保存ボタンを操作不能にする（見た目にも分かる
-  // ようにする）。busy を素通しして黙って古い操作を捨てる経路を作らないため。
-  function setControlsBusy(value) {
+  // busy 中は全チェックボックスと保存ボタン・pad切替ボタン（.padbtn）を操作
+  // 不能にする（見た目にも分かるようにする）。busy を素通しして黙って古い
+  // 操作を捨てる経路を作らないため。kind は "preview" / "save" / 省略（解除時）。
+  function setControlsBusy(value, kind) {
     busy = value;
+    busyKind = value ? (kind || null) : null;
     Array.prototype.forEach.call(
       document.querySelectorAll("input.del, input.delw"),
       function (box) { box.disabled = value; }
+    );
+    Array.prototype.forEach.call(
+      document.querySelectorAll(".padbtn"),
+      function (btn) { btn.disabled = value; }
     );
     updateSaveButton();
   }
@@ -1152,10 +1164,15 @@ _SERVE_SCRIPT = """<script>
   function runPreview(target) {
     if (busy) { return; }
     currentTarget = target;
+    // currentPad はボタン操作でいつでも変わるため、この試聴リクエスト専用の
+    // 値としてここで固定する。以降（POST body・キャッシュキー・応答処理）は
+    // すべて requestPad を使い、応答処理中にグローバル currentPad を
+    // 参照しない（範囲変更中の競合・誤キャッシュを防ぐ）。
+    var requestPad = currentPad;
     var myGeneration = ++generation;
-    setControlsBusy(true);
+    setControlsBusy(true, "preview");
     notePreview("試聴を生成中…", false);
-    post("/preview", { toggles: toggles(), target: target, pad_s: currentPad })
+    post("/preview", { toggles: toggles(), target: target, pad_s: requestPad })
       .then(function (payload) {
         // この応答より後に新しい操作（トグル/保存）が始まっていたら、
         // 画面の状態を巻き戻さないよう破棄する。
@@ -1167,7 +1184,7 @@ _SERVE_SCRIPT = """<script>
         // しておく（従来どおり）。加えて、チェック変更の結果をすぐ耳で確認
         // できるよう audio-preview へも即座に設定し load/play を試みる
         // （autoplay 拒否は握りつぶし、src 設定と load だけは完了させる）。
-        var key = previewKey(target, currentPad);
+        var key = previewKey(target, requestPad);
         var url = URL.createObjectURL(toBlob(payload.audio));
         var entry = {
           url: url,
@@ -1175,7 +1192,7 @@ _SERVE_SCRIPT = """<script>
           windowEnd: payload.window_end_s,
           center: payload.center_s,
           target: payload.target_source_s,
-          pad: payload.pad_s
+          pad: requestPad
         };
         previewCache[key] = entry;
         updateAbsTimes(entry);
@@ -1238,6 +1255,12 @@ _SERVE_SCRIPT = """<script>
     var wordData = word ? findWord(seg, Number(word.dataset.w)) : null;
 
     ev.stopPropagation();
+    // busy 中は対象を変更しない（active 表示・試聴対象を黙って切り替えない）。
+    // 生成中であることをその場で伝えるだけにとどめる。
+    if (busy) {
+      notePreview("試聴を生成中です", false);
+      return;
+    }
     setActiveLine(line);
 
     if (ev.shiftKey) {
@@ -1301,7 +1324,7 @@ _SERVE_SCRIPT = """<script>
   saveBtn.addEventListener("click", function () {
     if (busy || !dirty) { return; }
     var myGeneration = ++generation;
-    setControlsBusy(true);
+    setControlsBusy(true, "save");
     post("/save", { toggles: toggles() })
       .then(function (payload) {
         if (myGeneration !== generation) { return; }
