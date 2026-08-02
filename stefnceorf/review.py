@@ -906,6 +906,23 @@ _SERVE_SCRIPT = """<script>
   // 状態を巻き戻さないよう、リクエストごとに世代IDを振って照合する。
   var generation = 0;
 
+  var allPlayers = [audioSrc, audioOut, preview];
+  // Space キー操作の対象（直近に再生・停止した audio）。既定は現在案 preview。
+  var lastPlayer = preview;
+
+  // 排他再生。いずれかの audio が再生開始したら他2つを止める（3つの audio が
+  // 同時に鳴らないようにする）。lastPlayer もその audio に更新する。
+  function pauseOtherPlayers(active) {
+    allPlayers.forEach(function (other) {
+      if (other !== active) { other.pause(); }
+    });
+    lastPlayer = active;
+  }
+
+  allPlayers.forEach(function (player) {
+    player.addEventListener("play", function () { pauseOtherPlayers(player); });
+  });
+
   // 行/単語の対象（{type, id, word}）から savedPositions / previewCache の
   // キー（L<id> / W<id>:<word>）を作る。
   function targetKey(target) {
@@ -1375,6 +1392,27 @@ _SERVE_SCRIPT = """<script>
         if (myGeneration !== generation) { return; }
         setControlsBusy(false);
       });
+  });
+
+  // Space キーで lastPlayer（直近に操作した audio）を再生/停止する。
+  // フォーム操作・修飾キー・キーリピート中は横取りしない。
+  document.addEventListener("keydown", function (ev) {
+    if (ev.code !== "Space") { return; }
+    if (ev.metaKey || ev.ctrlKey || ev.altKey || ev.repeat) { return; }
+    if (
+      ev.target && ev.target.closest &&
+      ev.target.closest("input, button, select, textarea, audio, [contenteditable]")
+    ) {
+      return;
+    }
+    // 現在案 preview が一度も生成されていなければ何もしない（再生する音が無い）。
+    if (lastPlayer === preview && !preview.currentSrc) { return; }
+    ev.preventDefault();
+    if (lastPlayer.paused) {
+      lastPlayer.play();
+    } else {
+      lastPlayer.pause();
+    }
   });
 
   capturePositions(DATA.segments);

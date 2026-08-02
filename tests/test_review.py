@@ -1054,8 +1054,31 @@ def test_normal_click_primes_source_and_saved_then_plays_preview(tmp_path):
     assert "function primeComparisonPlayers(target, pad) {" in html
     assert "primeComparisonPlayers(target, currentPad);" in html
     assert "playCurrentPlan(target);" in html
-    assert "ev.shiftKey" not in html
-    assert "ev.altKey" not in html
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    click_handler = serve_script.split(
+        'document.getElementById("transcript").addEventListener("click"'
+    )[1].split("}, true);")[0]
+    assert "ev.shiftKey" not in click_handler
+    assert "ev.altKey" not in click_handler
+
+
+# ---- 排他再生とSpaceキー操作（Hlyst UX 改修 Task 5） ----
+
+def test_serve_script_pauses_other_audio_players(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    assert "function pauseOtherPlayers(active) {" in html
+    assert 'player.addEventListener("play"' in html
+    assert "other.pause();" in html
+
+
+def test_space_toggles_last_player_but_ignores_controls(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    assert 'document.addEventListener("keydown"' in html
+    assert 'ev.code !== "Space"' in html
+    assert 'closest("input, button, select, textarea, audio' in html
+    assert "ev.preventDefault();" in html
+    assert "lastPlayer.pause();" in html
+    assert "lastPlayer.play();" in html
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node が見つからない")
