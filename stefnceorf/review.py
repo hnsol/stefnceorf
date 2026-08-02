@@ -662,6 +662,10 @@ h1 { font-size: 1.2rem; margin: 0 0 .1rem; }
      背景で覆えず、下をスクロールする行の枠線が左右にはみ出て見える */
   outline: 1px dashed var(--red); outline-offset: -1px; background: none;
 }
+/* 枠が文字に重ならないよう単語には左右の余白を持たせる。凡例サンプルは
+   inline-block＋上下余白で、枠と文字の間隔を実表示と同等に確保する */
+.w.unsafe { padding: 0 .2em; }
+.legend .w.unsafe { display: inline-block; padding: .1em .4em; }
 .trim { color: var(--green); font-size: .85rem; }
 /* --serve（Hlyst 対話モード）専用 */
 /* 保存ボタン（と速度コントロール）は1段目右端に、余白/区切りで原音プレイヤーと分離する */
@@ -675,25 +679,27 @@ h1 { font-size: 1.2rem; margin: 0 0 .1rem; }
   display: flex; align-items: center; gap: .25rem; font-size: .8rem;
   color: var(--text-muted); white-space: nowrap;
 }
-.speed-select {
-  font: inherit; font-size: .75rem; padding: .1rem .3rem; cursor: pointer;
+/* select と toggle は高さを揃える（幅は違ってよい）。toggle は ON/OFF どちらの
+   文言でも大きさが変わらないよう固定幅にする */
+.speed-select, .speed-toggle {
+  font: inherit; font-size: .75rem; cursor: pointer; box-sizing: border-box;
+  height: 1.7rem; padding: 0 .4rem;
   border: 1px solid var(--border); background: transparent; border-radius: .25rem;
   color: var(--text);
 }
-.speed-toggle {
-  font: inherit; font-size: .75rem; padding: .15rem .6rem; cursor: pointer;
-  border: 1px solid var(--border); background: transparent; border-radius: .25rem;
-  color: var(--text);
-}
+.speed-toggle { width: 3.4em; text-align: center; }
 .speed-toggle.active {
   border-color: var(--text); background: var(--surface); font-weight: 700;
 }
 .speed-select:disabled, .speed-toggle:disabled { opacity: .5; cursor: default; }
-#save {
+/* 保存と XML出力 は縦横の大きさを揃える（保存が「変更を保存（N件）」のときだけ
+   幅が伸びるのは許容） */
+#save, #export {
   font: inherit; padding: .25rem 1rem; cursor: pointer; border-radius: .25rem;
   border: 1px solid currentColor; background: transparent;
+  box-sizing: border-box; height: 2.1rem; min-width: 7em;
 }
-#save:disabled { opacity: .5; cursor: default; }
+#save:disabled, #export:disabled { opacity: .5; cursor: default; }
 #save.dirty { background: var(--green); color: var(--on-accent); border-color: var(--green); }
 .msg { font-size: .8rem; }
 .msg.error { color: var(--red); }
@@ -765,7 +771,7 @@ $preview_panel
   <li><span class="w suggest">フィラー提案</span></li>
   <li><span class="w cut">カット済み</span></li>
   <li><span class="line uts" style="display:inline">未転写発話候補</span></li>
-  <li><span class="w unsafe state" style="display:inline">削除指定→安全判定で保持</span></li>
+  <li><span class="w unsafe state">削除指定→安全判定で保持</span></li>
   <li><span class="trim" style="display:inline">✂ 無音トリム</span></li>
 $click_legend
 </ul>
@@ -890,7 +896,7 @@ _SAVE_AREA = Template("""<span class="save-area">
 # 保存ボタン周りを圧迫するため）。
 _EXPORT_AREA = Template("""<span class="save-area">
   <span class="msg" id="export-msg"></span>
-  <button type="button" id="export" title="$export_title">FCPXML書き出し</button>
+  <button type="button" id="export" title="$export_title">XML出力</button>
 </span>""")
 
 
@@ -1088,7 +1094,7 @@ _SERVE_SCRIPT = """<script>
       return;
     }
     exportBtn.disabled = busy;
-    exportBtn.textContent = "FCPXML書き出し";
+    exportBtn.textContent = "XML出力";
   }
 
   // busy 中は全チェックボックスと保存/書き出しボタン・pad切替ボタン
