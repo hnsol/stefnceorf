@@ -934,7 +934,7 @@ def test_html_controls_is_two_player_rows(tmp_path):
 
 def test_serve_html_has_pad_range_buttons_default_4s(tmp_path):
     html, _rd = _serve_html(tmp_path)
-    transcript_area = html.split('<div class="preview-panel">')[1].split(
+    transcript_area = html.split('<div class="player-row preview-panel">')[1].split(
         "</div>"
     )[0]
     assert 'data-pad="2"' in transcript_area
@@ -947,8 +947,6 @@ def test_serve_html_has_absolute_time_placeholders(tmp_path):
     html, _rd = _serve_html(tmp_path)
     assert 'id="abs-target"' in html
     assert 'id="abs-center"' in html
-    assert 'id="abs-window"' in html
-    assert 'id="abs-pos"' in html
 
 
 def test_serve_html_save_button_is_in_first_player_row(tmp_path):
@@ -956,7 +954,9 @@ def test_serve_html_save_button_is_in_first_player_row(tmp_path):
     html, _rd = _serve_html(tmp_path)
     row1 = html.split('class="player-row"')[1].split('class="player-row"')[0]
     assert 'id="save"' in row1
-    preview_panel = html.split('<div class="preview-panel">')[1].split("</div>")[0]
+    preview_panel = html.split('<div class="player-row preview-panel">')[1].split(
+        "</div>"
+    )[0]
     assert 'id="save"' not in preview_panel
 
 
@@ -994,14 +994,6 @@ def test_serve_script_has_shift_and_alt_shortcuts(tmp_path):
     assert "ev.metaKey" not in html
 
 
-def test_serve_script_playback_position_uses_window_start_plus_current_time(tmp_path):
-    html, _rd = _serve_html(tmp_path)
-    assert (
-        "absPos.textContent = formatTime(currentWindowStart + preview.currentTime);"
-        in html
-    )
-
-
 def test_serve_script_saved_player_not_updated_by_preview(tmp_path):
     """保存済み編集後プレイヤー（audio-out）の src は保存成功時にしか更新されない。"""
     html, _rd = _serve_html(tmp_path)
@@ -1010,12 +1002,6 @@ def test_serve_script_saved_player_not_updated_by_preview(tmp_path):
     )[0]
     assert "audio-out" not in run_preview_body
     assert html.count('out.src = DATA.review_audio + "&v="') == 1
-
-
-def test_serve_html_extra_legend_mentions_shortcuts(tmp_path):
-    html, _rd = _serve_html(tmp_path)
-    assert "Shift" in html
-    assert "Option" in html
 
 
 # ---- 保存済み・現在案・削除指定の状態分離（Hlyst UX 改修 Task 1） ----
@@ -1050,6 +1036,27 @@ def test_busy_disables_pad_buttons(tmp_path):
     html, _rd = _serve_html(tmp_path)
     body = html.split("function setControlsBusy(value")[1].split("\n  }")[0]
     assert ".padbtn" in body
+
+
+# ---- 3段UIを1行構成へ整理（Hlyst UX 改修 Task 3） ----
+
+def test_serve_ui_has_three_compact_player_rows(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    assert html.count('class="player-row') == 3
+    assert "対象 原音" in html
+    assert "現在案" in html
+    assert 'id="abs-window"' not in html
+    assert 'id="abs-pos"' not in html
+    assert "Shift+クリック" not in html
+    assert "Option(Alt)+クリック" not in html
+
+
+def test_top_player_labels_are_short_and_equal_width(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    assert ">原音</button>" in html
+    assert ">保存済み</button>" in html
+    mode_css = html.split(".mode {")[1].split("}")[0]
+    assert "width:" in mode_css
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node が見つからない")

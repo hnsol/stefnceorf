@@ -623,7 +623,7 @@ h1 { font-size: 1.2rem; margin: 0 0 .1rem; }
 .player-row audio { height: 2rem; }
 .seek { display: flex; gap: .25rem; }
 .mode {
-  font: inherit; padding: .25rem .75rem; cursor: pointer;
+  font: inherit; padding: .25rem .75rem; cursor: pointer; width: 6rem; text-align: center;
   border: 1px solid currentColor; background: transparent; border-radius: .25rem;
 }
 .mode.active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
@@ -678,24 +678,36 @@ h1 { font-size: 1.2rem; margin: 0 0 .1rem; }
 #save.dirty { background: var(--green); color: var(--on-accent); border-color: var(--green); }
 .msg { font-size: .8rem; }
 .msg.error { color: var(--red); }
-/* 3段目: 試聴範囲切替・絶対時刻・現在案プレビュー */
+/* 3段目: 現在案プレビュー（状態ラベル・audio・試聴範囲切替・対象/現在案の絶対時刻）。
+   デスクトップでは1行に収め、狭い画面だけ折り返す。 */
 .preview-panel {
-  display: flex; flex-wrap: wrap; align-items: center; gap: .4rem 1rem;
+  display: flex; flex-wrap: nowrap; align-items: center; gap: .5rem 1rem;
   margin-bottom: .75rem;
 }
-.pad-select { display: flex; gap: .25rem; }
+@media (max-width: 40rem) {
+  .preview-panel { flex-wrap: wrap; }
+}
+.preview-panel .state-label {
+  font-size: .85rem; color: var(--text-muted); white-space: nowrap;
+}
+.pad-select {
+  display: flex; align-items: center; gap: .25rem; font-size: .8rem;
+  color: var(--text-muted); white-space: nowrap;
+}
 .padbtn {
   font: inherit; font-size: .75rem; padding: .15rem .6rem; cursor: pointer;
   border: 1px solid var(--border); background: transparent; border-radius: .25rem;
   color: var(--text);
 }
-.padbtn.active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
-.abs-times {
-  display: flex; flex-wrap: wrap; gap: .2rem 1rem; font-size: .8rem;
-  font-variant-numeric: tabular-nums;
+/* 範囲選択はアクション色（青）を使わず、中立色の segmented control にする */
+.padbtn.active {
+  border-color: var(--text); background: var(--surface); font-weight: 700;
 }
-.abs-times .abs-row { white-space: nowrap; color: var(--text-muted); }
-.abs-times .abs-row b { color: var(--text); font-weight: 400; }
+.abs-times {
+  font-size: .8rem; font-variant-numeric: tabular-nums; color: var(--text-muted);
+  white-space: nowrap;
+}
+.abs-times b { color: var(--text); font-weight: 400; }
 .state { font-size: .75rem; color: var(--text-muted); min-width: 8rem; text-align: right; }
 .state.unsafe { color: var(--red); font-weight: 700; }
 label.wt { display: inline; }
@@ -709,7 +721,7 @@ label.wt input { margin: 0 .1em 0 .2em; vertical-align: middle; }
 <p class="note">$note</p>
 <div class="controls">
 <div class="player-row">
-  <button type="button" class="mode" data-mode="src">原音を再生</button>
+  <button type="button" class="mode" data-mode="src">原音</button>
   <audio id="audio-src" controls preload="metadata" src="$source_audio"></audio>
   <span class="seek">
     <button type="button" class="seek-btn" data-player="src" data-seek="-10">−10s</button>
@@ -720,7 +732,7 @@ label.wt input { margin: 0 .1em 0 .2em; vertical-align: middle; }
 $save_area
 </div>
 <div class="player-row">
-  <button type="button" class="mode active" data-mode="out">保存済み編集後を再生</button>
+  <button type="button" class="mode active" data-mode="out">保存済み</button>
   <audio id="audio-out" controls preload="metadata" src="$review_audio"></audio>
   <span class="seek">
     <button type="button" class="seek-btn" data-player="out" data-seek="-10">−10s</button>
@@ -736,8 +748,7 @@ $preview_panel
   <li><span class="line uts" style="display:inline">未転写発話候補</span></li>
   <li><span class="state unsafe" style="display:inline">削除指定→安全判定で保持</span></li>
   <li><span class="trim" style="display:inline">✂ 無音トリム</span></li>
-  <li>行・単語をクリックすると前後 $pad 秒を再生します</li>
-$extra_legend
+$click_legend
 </ul>
 </div>
 <pre class="stats">$stats</pre>
@@ -844,29 +855,20 @@ _SAVE_AREA = """<span class="save-area">
 </span>"""
 
 
-# --serve 時だけ差し込む3段目（試聴範囲切替・絶対時刻・現在案プレビュー）
-_PREVIEW_PANEL = """<div class="preview-panel">
-  <span class="pad-select">
-    <button type="button" class="padbtn" data-pad="2">±2秒</button>
-    <button type="button" class="padbtn active" data-pad="4">±4秒</button>
-    <button type="button" class="padbtn" data-pad="8">±8秒</button>
-  </span>
-  <span class="abs-times">
-    <span class="abs-row">対象 原音 <b id="abs-target">--:--.-</b></span>
-    <span class="abs-row">現在案 <b id="abs-center">--:--.-</b></span>
-    <span class="abs-row">試聴範囲 <b id="abs-window">--:--.- – --:--.-（±4秒）</b></span>
-    <span class="abs-row">再生位置 <b id="abs-pos">--:--.-</b></span>
-  </span>
+# --serve 時だけ差し込む3段目（現在案の状態ラベル・audio・試聴範囲切替・対象/現在案の絶対時刻）。
+# デスクトップでは1行（nowrap）、狭い画面だけ preview-panel の media query で折り返す。
+_PREVIEW_PANEL = """<div class="player-row preview-panel">
+  <span class="state-label" id="preview-state">現在案：未選択</span>
   <audio id="audio-preview" controls preload="none"></audio>
+  <span class="pad-select">
+    範囲
+    <button type="button" class="padbtn" data-pad="2">2秒</button>
+    <button type="button" class="padbtn active" data-pad="4">4秒</button>
+    <button type="button" class="padbtn" data-pad="8">8秒</button>
+  </span>
+  <span class="abs-times">対象 原音 <b id="abs-target">--:--.-</b> → 現在案 <b id="abs-center">--:--.-</b></span>
   <span class="msg" id="preview-msg"></span>
 </div>"""
-
-
-# --serve 時だけ差し込む凡例（クリック操作の割り当てをショートカット無しでも分かるように）
-_EXTRA_LEGEND = (
-    "<li>クリック=現在案を試聴／Shift+クリック=保存済み編集後／"
-    "Option(Alt)+クリック=原音</li>"
-)
 
 
 # --serve 時だけ差し込む対話スクリプト（トグル→即試聴→保存）
@@ -882,10 +884,9 @@ _SERVE_SCRIPT = """<script>
   var saveBtn = document.getElementById("save");
   var saveMsg = document.getElementById("save-msg");
   var previewMsg = document.getElementById("preview-msg");
+  var previewState = document.getElementById("preview-state");
   var absTarget = document.getElementById("abs-target");
   var absCenter = document.getElementById("abs-center");
-  var absWindow = document.getElementById("abs-window");
-  var absPos = document.getElementById("abs-pos");
   var dirty = false;
   var busy = false;
   // busy 中の種別。null（非busy）/ "preview"（試聴生成中） / "save"（保存中）。
@@ -897,10 +898,8 @@ _SERVE_SCRIPT = """<script>
   var currentPad = 4;
   // 直前にプレビューした対象（行/単語）。試聴範囲を切り替えたときの再生成に使う。
   var currentTarget = null;
-  // audio-preview の再生位置表示（window_start_s + currentTime）の基準値。
-  var currentWindowStart = 0;
   // トグル直後は自動再生せず、取得した音声をキャッシュして
-  // 対象の行/単語をクリックしたときに再生する（key -> {url, windowStart, ...}）。
+  // 対象の行/単語をクリックしたときに再生する（key -> {url, ...}）。
   // キーには pad を含める（対象・pad・編集状態が一致する場合のみ再利用する）。
   var previewCache = {};
   // /preview, /save の応答が世代遅れ（その後に新しい操作が始まっている）なら
@@ -989,9 +988,20 @@ _SERVE_SCRIPT = """<script>
     });
   }
 
-  function notePreview(text, isError) {
+  // 3段目左ラベル（現在案の状態）。preview応答の message をそのまま表示する。
+  function noteState(text) {
+    previewState.textContent = text;
+  }
+
+  // previewエラーは状態ラベルとは別要素へ出し、混ぜない。
+  function notePreviewError(text) {
     previewMsg.textContent = text;
-    previewMsg.classList.toggle("error", !!isError);
+    previewMsg.classList.add("error");
+  }
+
+  function clearPreviewError() {
+    previewMsg.textContent = "";
+    previewMsg.classList.remove("error");
   }
 
   function noteSave(text, isError) {
@@ -1011,15 +1021,10 @@ _SERVE_SCRIPT = """<script>
     return sign + m + ":" + sStr;
   }
 
-  // キャッシュ済み/応答直後の試聴データから絶対時刻表示を更新する。
+  // キャッシュ済み/応答直後の試聴データから「対象 原音」「現在案」の絶対時刻表示を更新する。
   function updateAbsTimes(entry) {
-    currentWindowStart = entry.windowStart;
     absTarget.textContent = formatTime(entry.target);
     absCenter.textContent = formatTime(entry.center);
-    absWindow.textContent =
-      formatTime(entry.windowStart) + "–" + formatTime(entry.windowEnd) +
-      "（±" + Math.round(entry.pad) + "秒）";
-    absPos.textContent = formatTime(entry.windowStart);
   }
 
   function stateLabel(requested, effective, unsafeReason) {
@@ -1171,7 +1176,8 @@ _SERVE_SCRIPT = """<script>
     var requestPad = currentPad;
     var myGeneration = ++generation;
     setControlsBusy(true, "preview");
-    notePreview("試聴を生成中…", false);
+    noteState("試聴を生成中…");
+    clearPreviewError();
     post("/preview", { toggles: toggles(), target: target, pad_s: requestPad })
       .then(function (payload) {
         // この応答より後に新しい操作（トグル/保存）が始まっていたら、
@@ -1179,7 +1185,8 @@ _SERVE_SCRIPT = """<script>
         if (myGeneration !== generation) { return; }
         mergePreviewStates(payload.segments);
         applyStates();
-        notePreview((payload.message || "試聴") + "（クリックで再生）", false);
+        noteState(payload.message || "現在案");
+        clearPreviewError();
         // 対象の行/単語をクリックしたときにも再生できるよう音声をキャッシュ
         // しておく（従来どおり）。加えて、チェック変更の結果をすぐ耳で確認
         // できるよう audio-preview へも即座に設定し load/play を試みる
@@ -1188,8 +1195,6 @@ _SERVE_SCRIPT = """<script>
         var url = URL.createObjectURL(toBlob(payload.audio));
         var entry = {
           url: url,
-          windowStart: payload.window_start_s,
-          windowEnd: payload.window_end_s,
           center: payload.center_s,
           target: payload.target_source_s,
           pad: requestPad
@@ -1203,7 +1208,7 @@ _SERVE_SCRIPT = """<script>
       })
       .catch(function (err) {
         if (myGeneration !== generation) { return; }
-        notePreview(err.message, true);
+        notePreviewError(err.message);
       })
       .then(function () {
         if (myGeneration !== generation) { return; }
@@ -1241,9 +1246,8 @@ _SERVE_SCRIPT = """<script>
 
   // 行/単語クリックの再生先を切り替える（capture フェーズで先取りし、本文
   // スクリプト側の既定動作＝上段2プレイヤーへは渡さない）。
-  // 通常クリック＝3段目「現在案プレビュー」、Shift+クリック＝保存済み編集後、
-  // Option(Alt)+クリック＝原音。無音トリムは対象が無いため上段プレイヤーの
-  // 既定動作（本文スクリプト側）に委ねる。
+  // 通常クリック＝3段目「現在案プレビュー」。無音トリムは対象が無いため上段
+  // プレイヤーの既定動作（本文スクリプト側）に委ねる。
   document.getElementById("transcript").addEventListener("click", function (ev) {
     if (ev.target.closest("input, label.wt")) { return; }
     if (ev.target.closest(".trim")) { return; }
@@ -1258,7 +1262,7 @@ _SERVE_SCRIPT = """<script>
     // busy 中は対象を変更しない（active 表示・試聴対象を黙って切り替えない）。
     // 生成中であることをその場で伝えるだけにとどめる。
     if (busy) {
-      notePreview("試聴を生成中です", false);
+      noteState("試聴を生成中です");
       return;
     }
     setActiveLine(line);
@@ -1295,11 +1299,6 @@ _SERVE_SCRIPT = """<script>
       });
     }
   );
-
-  // 再生位置表示（3段目）。window_start_s + currentTime を M:SS.d で更新する。
-  preview.addEventListener("timeupdate", function () {
-    absPos.textContent = formatTime(currentWindowStart + preview.currentTime);
-  });
 
   document.getElementById("transcript").addEventListener("change", function (ev) {
     var box = ev.target;
@@ -1364,6 +1363,14 @@ def render_html(review: dict) -> str:
     （静的モードの出力は従来どおり読み取り専用）。
     """
     serve = bool(review.get("serve"))
+    # serve（Hlyst 対話モード）はクリック＝現在案 preview 専用のため、静的モード専用の
+    # 固定 pad 秒クリック説明はここでは出さない（serve モードへ固定の「前後2秒」を
+    # 表示しない）。
+    click_legend = (
+        ""
+        if serve
+        else f'<li>行・単語をクリックすると前後 {review["pad"]:g} 秒を再生します</li>'
+    )
     return _HTML_TEMPLATE.substitute(
         title=escape(f"Hlyst — {review['base']}"),
         subtitle=escape(
@@ -1372,12 +1379,11 @@ def render_html(review: dict) -> str:
         ),
         save_area=_SAVE_AREA if serve else "",
         preview_panel=_PREVIEW_PANEL if serve else "",
-        extra_legend=_EXTRA_LEGEND if serve else "",
+        click_legend=click_legend,
         serve_script=_SERVE_SCRIPT if serve else "",
         note=escape(review["note"]),
         source_audio=escape(review["source_audio"], quote=True),
         review_audio=escape(review["review_audio"], quote=True),
-        pad=f"{review['pad']:g}",
         stats=escape("\n".join(review["stats"])),
         transcript=_transcript_markup(review),
         data=_embed_json(review),
