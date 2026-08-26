@@ -505,6 +505,7 @@ def plan_filler_cut(
 
 
 UNRECOGNIZED_PAUSE_KEEP_S = 0.25  # 未認識区間/UTS削除後に元位置で残す間の合計（FILLER_PAUSE_KEEP_S と同値）
+GUARDED_EDGE_SEARCH_S = 0.75  # カット端から無音開始までに許容する非無音（減衰尾・呼気）の最大長。これを超えて内側にしか無音が無い場合は安全に切れないので保持
 
 
 def plan_guarded_pause(
@@ -512,14 +513,32 @@ def plan_guarded_pause(
     cut_end: float,
     silence_spans: list[tuple[float, float]] | None,
     pause_keep: float = UNRECOGNIZED_PAUSE_KEEP_S,
+    edge_search_s: float = GUARDED_EDGE_SEARCH_S,
 ) -> tuple[tuple[float, float], tuple[float, float]] | None:
     """削除区間の両端に接する既知無音から pause_keep 秒を残す（純関数）。
 
     未認識区間・UTS行の削除は、デジタル無音の挿入や別位置のルームトーン借用、
     長いクロスフェードに頼らず「元の録音でその位置が本当に無音だった分だけ」
-    残すという方針の一部。容量に数えてよいのは cut_start / cut_end を含む
-    （または端で接する）既知無音スパンだけで、対象から離れた位置の無音や、
+    残すという方針の一部。容量に数えてよいのは cut_start / cut_end 側から
+    見て安全に到達できる既知無音スパンだけで、対象から離れた位置の無音や、
     間に未知音声を挟んだ先の無音は数えない。
+
+    境界は Whisper の単語タイムスタンプなので、実際の発話減衰尾により無音の
+    開始/終了が境界からずれる（20〜700ms 程度）。そのため両端とも「端に接する
+    スパン」だけでなく、端から edge_search_s 秒だけカット内側まで探索する:
+      左スパン = merged を先頭から見て cut_start に届く（end が
+        cut_start-TOL 以上の）最初のスパン。その start が
+        cut_start+edge_search_s 以下、かつ cut_end+TOL 以下（＝右端の
+        手前から始まっている）なら採用、満たさなければその時点で None
+        （それより後のスパンはさらに深いので探索しない）。無音が cut_end
+        を越えて続くのは正常（既知無音なので容量に数えてよい）ため、
+        end が cut_end を超えることは棄却理由にしない。
+      右スパン = merged を末尾から見て cut_end に届く（start が
+        cut_end+TOL 以下の）最初のスパン。その end が
+        cut_end-edge_search_s 以上、かつ cut_start-TOL 以上（＝左端を
+        越えて始まっていない）なら採用、満たさなければ同様に None。
+    cut_start から左スパンの開始（内側にずれている場合）までの減衰尾部分は
+    無音と確認できないため、そのまま出力（cut 対象）に残る。
 
     silence_spans には UTS 検出と同じ細かいRMS無音（.sc.json の rms_silences）を
     渡す。前後のセグメント境界（発話の端）ではなく無音スパン自体を基準にするのは、
@@ -535,6 +554,12 @@ def plan_guarded_pause(
     不足分をもう片方へ回す。左右の容量合計が pause_keep に満たない場合、
     または左右スパンの外側端の距離が pause_keep 未満（残す間の方が長い）の
     場合は安全に残せないので None を返す。
+
+    最後に、算出した keep 区間を除いた実際のカット区間
+    (left_edge+left_keep, right_edge-right_keep) が対象区間
+    (cut_start, cut_end) と正の長さで重なるかを確認する。片側にしか無音が
+    無い短い gap では左右スパンが同一になり得るが、その場合に対象音声を
+    まったく削らない「空カット」が成立してしまうのを防ぐため。
     """
     if not silence_spans:
         return None
@@ -548,15 +573,26 @@ def plan_guarded_pause(
         else:
             merged.append((s, e))
 
-    def _span_at(t: float) -> tuple[float, float] | None:
-        """時刻 t を含む（端で接する）無音スパン。無ければ None。"""
+    def _find_left() -> tuple[float, float] | None:
         for s, e in merged:
-            if s <= t + SILENCE_EDGE_TOL_S and e >= t - SILENCE_EDGE_TOL_S:
-                return (s, e)
+            if e < cut_start - SILENCE_EDGE_TOL_S:
+                continue  # まだ cut_start に届いていない。より後ろを探す
+            if s > cut_start + edge_search_s or s > cut_end + SILENCE_EDGE_TOL_S:
+                return None  # 深すぎる、または右端を越えて始まっている
+            return (s, e)
         return None
 
-    left_span = _span_at(cut_start)
-    right_span = _span_at(cut_end)
+    def _find_right() -> tuple[float, float] | None:
+        for s, e in reversed(merged):
+            if s > cut_end + SILENCE_EDGE_TOL_S:
+                continue  # まだ cut_end に届いていない。より前を探す
+            if e < cut_end - edge_search_s or e < cut_start - SILENCE_EDGE_TOL_S:
+                return None  # 深すぎる、または左端の手前で終わっている
+            return (s, e)
+        return None
+
+    left_span = _find_left()
+    right_span = _find_right()
     if left_span is None or right_span is None:
         return None
 
@@ -582,9 +618,15 @@ def plan_guarded_pause(
         if deficit > 1e-9:
             right_keep = min(right_capacity, right_keep + deficit)
 
+    left_keep_end = left_edge + left_keep
+    right_keep_start = right_edge - right_keep
+    if min(right_keep_start, cut_end) - max(left_keep_end, cut_start) <= 1e-6:
+        # 実際に削れる対象音声が残らない（空カットになる）ので不可
+        return None
+
     return (
-        (left_edge, left_edge + left_keep),
-        (right_edge - right_keep, right_edge),
+        (left_edge, left_keep_end),
+        (right_keep_start, right_edge),
     )
 
 

@@ -507,6 +507,76 @@ def test_guarded_pause_rejects_when_single_span_is_shorter_than_pause():
     ) is None
 
 
+def test_guarded_pause_uses_silence_starting_after_decay_tail():
+    # 無音開始が cut_start より遅れ、終端も cut_end の手前で終わる減衰尾ケース
+    result = render.plan_guarded_pause(
+        cut_start=1.30,
+        cut_end=6.00,
+        silence_spans=[(1.50, 5.90)],
+    )
+    assert result == (
+        (pytest.approx(1.50), pytest.approx(1.625)),
+        (pytest.approx(5.775), pytest.approx(5.90)),
+    )
+
+
+def test_guarded_pause_rejects_left_span_beyond_edge_search_s():
+    # 無音開始が edge_search_s (0.75s) を超えて内側 → 保持不可
+    assert render.plan_guarded_pause(
+        cut_start=1.30,
+        cut_end=6.00,
+        silence_spans=[(2.20, 5.99)],
+    ) is None
+
+
+def test_guarded_pause_rejects_right_span_beyond_edge_search_s():
+    # 無音終端が edge_search_s (0.75s) を超えて内側 → 保持不可
+    assert render.plan_guarded_pause(
+        cut_start=1.30,
+        cut_end=6.00,
+        silence_spans=[(1.31, 5.00)],
+    ) is None
+
+
+def test_guarded_pause_uses_separate_spans_on_each_side():
+    # 左右それぞれ別スパンが edge_search_s 内側にあるケース
+    result = render.plan_guarded_pause(
+        cut_start=1.00,
+        cut_end=6.00,
+        silence_spans=[(1.20, 2.00), (5.50, 5.95)],
+    )
+    assert result == (
+        (pytest.approx(1.20), pytest.approx(1.325)),
+        (pytest.approx(5.825), pytest.approx(5.95)),
+    )
+
+
+def test_guarded_pause_uses_single_span_covering_and_exceeding_both_edges():
+    # 対象全体を覆い両端を越える単一スパン（両端越えを棄却理由にしないことの回帰防止）
+    result = render.plan_guarded_pause(
+        cut_start=1.30,
+        cut_end=1.70,
+        silence_spans=[(1.00, 2.00)],
+    )
+    assert result == (
+        (pytest.approx(1.00), pytest.approx(1.125)),
+        (pytest.approx(1.875), pytest.approx(2.00)),
+    )
+
+
+def test_guarded_pause_uses_silence_extending_past_cut_end():
+    # 無音が cut_end を越えて続く減衰尾ケース（次単語のタイムスタンプずれで頻発）
+    result = render.plan_guarded_pause(
+        cut_start=1.30,
+        cut_end=6.00,
+        silence_spans=[(1.50, 6.20)],
+    )
+    assert result == (
+        (pytest.approx(1.50), pytest.approx(1.625)),
+        (pytest.approx(6.075), pytest.approx(6.20)),
+    )
+
+
 # ---- subtract_spans ----
 
 def test_subtract_spans_splits_interval():
