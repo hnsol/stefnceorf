@@ -56,6 +56,7 @@ from .review import (
     REVIEW_WAV_SUFFIX,
     build_review_data,
     chunk_output_starts,
+    compute_display_order,
     map_source_sample,
     render_html,
 )
@@ -409,7 +410,11 @@ def _line_index(lines: list[str]) -> dict[str, int]:
 def _insert_position(
     lines: list[str], order: list[str], seg_id: str
 ) -> int:
-    """復活行の挿入位置（json 順で直後の生存行の前、無ければ直前の生存行の後ろ）。"""
+    """復活行の挿入位置（order 上で直後の生存行の前、無ければ直前の生存行の後ろ）。
+
+    order は既定では json 順。画面から表示順（order）が渡された場合はそちらを
+    使う（表示上の位置へ復活させるため）。
+    """
     index = _line_index(lines)
     pos = order.index(seg_id)
     for other in order[pos + 1:]:
@@ -430,21 +435,27 @@ def _replace_body(line: str, new_body: str) -> str:
 
 
 def apply_toggles(
-    raw_text: str, data: dict, fillers: set[str], toggles: list[dict]
+    raw_text: str, data: dict, fillers: set[str], toggles: list[dict],
+    order: list[str] | None = None,
 ) -> str:
     """raw TXT にトグル状態を局所適用した新しいテキストを返す。
 
     現在の状態と一致するトグルは何もしない（未変更行はバイト単位で不変）。
     行の削除/復活を先に処理してから、単語（〔〕）のトグルを適用する。
+
+    order は画面の表示順（全セグメント ID の順列）。渡された場合は json 順の
+    代わりに復活位置の基準として使い、最後に行の並べ替えも適用する。省略時は
+    json 順の従来動作（並べ替えは行わない）。
     """
     segments = {seg["id"]: seg for seg in data.get("segments", [])}
-    order = [seg["id"] for seg in data.get("segments", [])]
+    json_order = [seg["id"] for seg in data.get("segments", [])]
+    rank_order = json_order if order is None else list(order)
     lines = raw_text.splitlines(keepends=True)
     eol = detect_newline(raw_text)
 
     line_toggles = [t for t in toggles if t.get("type", "line") == "line"]
     word_toggles = [t for t in toggles if t.get("type") == "word"]
-    rank = {seg_id: i for i, seg_id in enumerate(order)}
+    rank = {seg_id: i for i, seg_id in enumerate(rank_order)}
     line_toggles.sort(key=lambda t: rank.get(t["id"], 0))
 
     for toggle in line_toggles:
@@ -462,7 +473,9 @@ def apply_toggles(
                 new_line = _replace_body(
                     new_line, set_line_bracket(line_body(new_line), seg, False)
                 )
-                lines = _insert_line(lines, order, toggle["id"], new_line, eol)
+                lines = _insert_line(
+                    lines, rank_order, toggle["id"], new_line, eol
+                )
                 continue
             i = index[toggle["id"]]
             lines[i] = _replace_body(
@@ -474,7 +487,8 @@ def apply_toggles(
             del lines[index[toggle["id"]]]
         elif not delete and not present:
             lines = _insert_line(
-                lines, order, toggle["id"], standard_line(seg, fillers) + eol, eol
+                lines, rank_order, toggle["id"],
+                standard_line(seg, fillers) + eol, eol,
             )
 
     for toggle in word_toggles:
@@ -492,7 +506,35 @@ def apply_toggles(
         )
         lines[i] = _replace_body(lines[i], new_body)
 
+    if order is not None:
+        lines = _reorder_lines(lines, order)
     return "".join(lines)
+
+
+def _reorder_lines(lines: list[str], order: list[str]) -> list[str]:
+    """セグメント行だけを order の順に並べ替える（行のバイト列は変えない）。
+
+    「セグメント行がある位置（スロット）」の集合は変えず、その中身だけを詰め
+    替える。空行・メモ行などセグメント行でない行は元の位置に残る（手編集した
+    区切りの空行を移動で巻き込まないため）。
+
+    改行は行本体ではなくスロット側の性質として扱う（末尾に改行が無いファイル
+    では最終スロットだけ改行なしのまま保つ。_insert_line の末尾改行の扱いと
+    同じ考え方）。順序が変わっていなければ結果はバイト単位で元と同一になる。
+    """
+    slots = [i for i, line in enumerate(lines) if line_segment_id(line) is not None]
+    by_id: dict[str, str] = {}
+    for i in slots:
+        by_id[line_segment_id(lines[i])] = lines[i]
+    ordered = [by_id[seg_id] for seg_id in order if seg_id in by_id]
+    if len(ordered) != len(slots):
+        return lines  # ID の重複などで対応が崩れている場合は触らない
+    out = list(lines)
+    for slot, line in zip(slots, ordered):
+        body, _line_eol = split_eol(line)
+        _slot_body, slot_eol = split_eol(lines[slot])
+        out[slot] = body + slot_eol
+    return out
 
 
 def _insert_line(
@@ -612,16 +654,19 @@ class HlystSession:
         return f"/audio/{name}?token={quote(self.token)}"
 
     def review_data(self, text: str, plan) -> dict:
-        kept_ids = {seg_id for seg_id, _t, _b in parse_edited_txt(text)}
+        # 表示順は常に現在の TXT の行順から作る（json 順で描くと、手で
+        # 並べ替え済みの TXT を初回保存で黙って巻き戻してしまうため）。
+        kept_order = [seg_id for seg_id, _t, _b in parse_edited_txt(text)]
         return build_review_data(
             plan,
             self.context.data,
-            kept_ids,
+            set(kept_order),
             source_audio=self.audio_url("source"),
             review_audio=self.audio_url("review"),
             serve=True,
             requested=requested_state(text, self.context.data, self.fillers),
             token=self.token,
+            display_order=compute_display_order(kept_order, self.context.data),
         )
 
     def html(self) -> str:
@@ -636,16 +681,18 @@ class HlystSession:
     # -- 試聴
 
     def preview(
-        self, toggles: list[dict], target: dict, pad_s: float = PREVIEW_PAD_DEFAULT_S
+        self, toggles: list[dict], target: dict, pad_s: float = PREVIEW_PAD_DEFAULT_S,
+        order: list[str] | None = None,
     ) -> dict:
         """トグル反映済みの計画から対象周辺の窓 wav を作って返す。
 
         pad_s は試聴窓の前後余白（秒）。呼び出し側（HTTP ハンドラ）が
-        PREVIEW_PAD_OPTIONS で検証済みの値を渡す前提。
+        PREVIEW_PAD_OPTIONS で検証済みの値を渡す前提。order は画面の表示順
+        （省略時は現在の TXT の並びのまま）。
         """
         with self.lock:
             text = apply_toggles(
-                self.raw_text, self.context.data, self.fillers, toggles
+                self.raw_text, self.context.data, self.fillers, toggles, order
             )
             plan = self.plan_for(text)
             data = self.review_data(text, plan)
@@ -687,10 +734,12 @@ class HlystSession:
                 "画面を閉じて `sc review --serve` をやり直してください"
             )
 
-    def _apply_toggles_text(self, toggles: list[dict]) -> str:
-        """トグルを raw TXT へ局所適用した新しいテキストを返す。"""
+    def _apply_toggles_text(
+        self, toggles: list[dict], order: list[str] | None = None
+    ) -> str:
+        """トグルと並び順を raw TXT へ局所適用した新しいテキストを返す。"""
         return apply_toggles(
-            self.raw_text, self.context.data, self.fillers, toggles
+            self.raw_text, self.context.data, self.fillers, toggles, order
         )
 
     def _write_if_changed(self, text: str) -> bool:
@@ -726,11 +775,11 @@ class HlystSession:
                 f"{exc}"
             ) from exc
 
-    def save(self, toggles: list[dict]) -> dict:
-        """トグル状態を .sc.txt へ局所パッチし、review.wav を作り直す。"""
+    def save(self, toggles: list[dict], order: list[str] | None = None) -> dict:
+        """トグル状態と並び順を .sc.txt へ局所パッチし、review.wav を作り直す。"""
         with self.lock:
             self._check_external_change()
-            self._write_if_changed(self._apply_toggles_text(toggles))
+            self._write_if_changed(self._apply_toggles_text(toggles, order))
             self._refresh_after_save()
             data = self.review_data(self.raw_text, self.plan)
             return {
@@ -751,7 +800,7 @@ class HlystSession:
             / f"{self.context.base_name}.logic.fcpxml"
         )
 
-    def export(self, toggles: list[dict]) -> dict:
+    def export(self, toggles: list[dict], order: list[str] | None = None) -> dict:
         """未保存変更があれば保存してから Logic 用 FCPXML を書き出す。
 
         変更が無く review.wav も最新なら TXT・review.wav・version を触らず
@@ -760,7 +809,9 @@ class HlystSession:
         """
         with self.lock:
             self._check_external_change()
-            saved = self._write_if_changed(self._apply_toggles_text(toggles))
+            saved = self._write_if_changed(
+                self._apply_toggles_text(toggles, order)
+            )
 
             review_updated = False
             if saved or self.review_stale:
@@ -1110,6 +1161,7 @@ class _Handler(BaseHTTPRequestHandler):
             toggles = _validate_toggles(
                 payload.get("toggles"), self.session.context.data
             )
+            order = _validate_order(payload.get("order"), self.session.context.data)
         except ValueError as exc:
             self._error(400, str(exc))
             return
@@ -1127,11 +1179,13 @@ class _Handler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     self._error(400, str(exc))
                     return
-                self._send_json(200, self.session.preview(toggles, target, pad_s))
+                self._send_json(
+                    200, self.session.preview(toggles, target, pad_s, order)
+                )
             elif parsed.path == "/save":
-                self._send_json(200, self.session.save(toggles))
+                self._send_json(200, self.session.save(toggles, order))
             else:
-                self._send_json(200, self.session.export(toggles))
+                self._send_json(200, self.session.export(toggles, order))
         except ExportRefreshError as exc:
             # review.wav が古いままなので plan 由来のデータは返さない。
             # txt_saved は「今回実際に TXT を書いたか」。
@@ -1213,6 +1267,33 @@ def _validate_toggles(toggles, data: dict) -> list[dict]:
                 raise ValueError("word index が不正です")
             entry["word"] = word
         out.append(entry)
+    return out
+
+
+def _validate_order(order, data: dict) -> list[str] | None:
+    """POST の order（表示順）を検証して返す（未指定は None＝並べ替えなし）。
+
+    受け付けるのは既知セグメント ID の完全な順列だけ（未知 ID・重複・欠落は
+    拒否）。部分列を許すと「画面に無い行をどこへ置くか」が曖昧になり、TXT の
+    行順を静かに壊しかねないため。
+    """
+    if order is None:
+        return None
+    if not isinstance(order, list):
+        raise ValueError("order が配列ではありません")
+    known = {seg["id"] for seg in data.get("segments", [])}
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in order:
+        if not isinstance(item, str) or item not in known:
+            raise ValueError(f"json に存在しない ID です: [{item}]")
+        if item in seen:
+            raise ValueError(f"order の ID が重複しています: [{item}]")
+        seen.add(item)
+        out.append(item)
+    if seen != known:
+        missing = ", ".join(sorted(known - seen))
+        raise ValueError(f"order に含まれない ID があります: [{missing}]")
     return out
 
 

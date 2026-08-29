@@ -462,7 +462,14 @@ def _html(tmp_path, body=_FULL_TXT):
 def _transcript_html(html):
     """#transcript のマークアップ部分だけを取り出す（埋め込み JSON を除く）。"""
     body = html.split('<div id="transcript">')[1]
-    return body.split('\n</div>\n<script id="sc-data"')[0]
+    return body.split('\n</div>\n<p class="kbd">')[0]
+
+
+def _header_rows(html):
+    """sticky ヘッダーの2行（.hrow）のマークアップを順に返す。"""
+    header = html.split('<header class="header">')[1].split("</header>")[0]
+    rows = header.split('<div class="hrow">')
+    return rows[1], rows[2]
 
 
 def _payload_json(html):
@@ -471,12 +478,29 @@ def _payload_json(html):
     return json.loads(payload.split("</script>")[0])
 
 
-def test_html_is_self_contained_without_cdn(tmp_path):
+_FONTS_LINK = (
+    '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+)
+
+
+def _without_fonts_link(html):
+    """Google Fonts の link 行だけを除いた HTML（外部依存の検査用）。"""
+    return "\n".join(
+        line for line in html.split("\n") if not line.startswith(_FONTS_LINK)
+    )
+
+
+def test_html_is_self_contained_except_font_link(tmp_path):
+    """外部参照は Google Fonts の stylesheet link 1本だけ（読めなくても成立する）。"""
     html, _rd = _html(tmp_path)
-    assert "http://" not in html
-    assert "https://" not in html
-    assert "<script src=" not in html
-    assert "<link " not in html
+    assert _FONTS_LINK in html
+    assert html.count("<link ") == 1
+    rest = _without_fonts_link(html)
+    assert "http://" not in rest
+    assert "https://" not in rest
+    assert "<script src=" not in rest
+    # Web フォントが読めない環境でも既存のフォールバックで表示できる
+    assert '"Hiragino Sans", sans-serif' in html
 
 
 def test_html_embeds_review_data(tmp_path):
@@ -680,8 +704,15 @@ def test_review_unknown_id_raises(tmp_path):
 def test_state_label_combinations():
     assert review.state_label(True, True) == "削除"
     assert review.state_label(True, False) == "unsafeのため保持"
-    assert review.state_label(False, False) == "保持"
+    assert review.state_label(False, False) == ""
     assert review.state_label(False, True) == "削除（手動編集）"
+
+
+def test_state_css_class_combinations():
+    assert review.state_css_class(True, True) == "del"
+    assert review.state_css_class(True, False) == "unsafe"
+    assert review.state_css_class(False, False) == ""
+    assert review.state_css_class(False, True) == "manual"
 
 
 def test_state_label_unrecognized_effective_delete_is_just_deleted():
@@ -748,7 +779,7 @@ def test_unrecognized_label_plain_uses_bracket_format():
 def test_html_title_is_hlyst(tmp_path):
     html, _rd = _html(tmp_path)
     assert "<title>Hlyst — input</title>" in html
-    assert "<h1>Hlyst — A/B試聴・編集</h1>" in html
+    assert '<h1 class="title">Hlyst — A/B試聴・編集</h1>' in html
     assert "削除のON/OFFを切り替え、現在案を試聴して保存します。" in html
 
 
@@ -805,8 +836,8 @@ def test_serve_html_shows_state_labels(tmp_path):
         tmp_path, "[0001] あ〔えー〕い\n[0002] ⚠\n[0003] う\n",
     )
     transcript = _transcript_html(html)
-    assert '<span class="state" data-i="0">保持</span>' in transcript
-    assert '<span class="state" data-i="3">削除</span>' in transcript
+    assert '<span class="state" data-i="0"></span>' in transcript
+    assert '<span class="state del" data-i="3">削除</span>' in transcript
 
 
 def test_serve_html_shows_unsafe_state(tmp_path):
@@ -827,9 +858,11 @@ def test_serve_html_includes_save_controls_and_script(tmp_path):
 
 def test_serve_html_has_no_cdn(tmp_path):
     html, _rd = _serve_html(tmp_path)
-    assert "http://" not in html
-    assert "https://" not in html
-    assert "<script src=" not in html
+    rest = _without_fonts_link(html)
+    assert "http://" not in rest
+    assert "https://" not in rest
+    assert "<script src=" not in rest
+    assert html.count("<link ") == 1
 
 
 def test_serve_html_embeds_token(tmp_path):
@@ -869,6 +902,26 @@ def test_serve_html_state_span_has_unsafe_class(tmp_path):
     assert 'class="state unsafe" data-i="0"' in transcript
 
 
+def test_deleted_and_manual_states_are_bordered_badges(tmp_path):
+    """削除／削除（手動編集）は枠付きの小バッジ。unsafe はテキストのまま。"""
+    html, _rd = _html(tmp_path)
+    assert ".state.del, .state.manual {" in html
+    assert "border: 1px solid var(--text-muted)" in html
+    assert ".state.manual { border-color: var(--yellow); color: var(--yellow); }" \
+        in html
+
+
+def test_segment_markup_shows_manual_delete_badge_class():
+    """OFF なのに音が無い（手動編集）は state manual クラスになる。"""
+    seg = {
+        "index": 0, "id": "0001", "kind": "speech", "reason": None,
+        "effective_delete": True, "requested_delete": False, "deleted": True,
+        "ts": "00:00", "words": [], "label": "あ",
+    }
+    markup = review._segment_markup(seg, serve=True)
+    assert '<span class="state manual" data-i="0">削除（手動編集）</span>' in markup
+
+
 def test_segment_markup_shows_deleted_label_for_plain_unrecognized():
     """UTS でない無印の未認識行も、実際に削除できれば「削除」と表示する。"""
     seg = {
@@ -877,7 +930,7 @@ def test_segment_markup_shows_deleted_label_for_plain_unrecognized():
         "ts": "00:02", "words": [], "label": "⚠ 未認識区間 1.0秒（音声保持）",
     }
     markup = review._segment_markup(seg, serve=True)
-    assert '<span class="state" data-i="0">削除</span>' in markup
+    assert '<span class="state del" data-i="0">削除</span>' in markup
 
 
 def test_segment_markup_shows_pause_label_when_unsafe_reason_is_pause():
@@ -936,32 +989,33 @@ def test_serve_script_clears_preview_cache_on_toggle_and_save(tmp_path):
     assert html.count("clearPreviewCache();") >= 3
 
 
-def test_html_has_seek_buttons_for_both_players(tmp_path):
+def test_html_has_one_seek_group_for_the_shown_player(tmp_path):
+    """シークは1組だけ置き、表示中（モード）のプレイヤーへ効かせる。"""
     html, _rd = _html(tmp_path)
-    assert html.count('data-player="src"') == 4
-    assert html.count('data-player="out"') == 4
-    assert 'data-seek="-10"' in html
-    assert 'data-seek="-5"' in html
-    assert 'data-seek="5"' in html
-    assert 'data-seek="10"' in html
+    assert html.count('class="seek-btn"') == 4
+    assert "data-player=" not in html
+    for seek in ("-10", "-5", "5", "10"):
+        assert f'data-seek="{seek}"' in html
+    assert "var audio = players[viewMode];" in html
 
 
-def test_html_controls_is_two_player_rows(tmp_path):
+def test_html_header_is_two_rows(tmp_path):
     html, _rd = _html(tmp_path)
-    assert html.count('class="player-row"') == 2
+    assert html.count('<div class="hrow">') == 2
+    row1, row2 = _header_rows(html)
+    assert 'class="title"' in row1 and 'id="audio-src"' in row1
+    assert 'class="mode"' in row2 and 'class="seek-btn"' in row2
 
 
 # ---- 試聴範囲切替・絶対時刻表示・保存ボタン移設・クリック挙動（UI改修） ----
 
 def test_serve_html_has_pad_range_buttons_default_4s(tmp_path):
     html, _rd = _serve_html(tmp_path)
-    transcript_area = html.split('<div class="player-row preview-panel">')[1].split(
-        "</div>"
-    )[0]
-    assert 'data-pad="2"' in transcript_area
-    assert 'data-pad="4"' in transcript_area
-    assert 'data-pad="8"' in transcript_area
-    assert 'class="padbtn active" data-pad="4"' in transcript_area
+    _row1, row2 = _header_rows(html)
+    assert 'data-pad="2"' in row2
+    assert 'data-pad="4"' in row2
+    assert 'data-pad="8"' in row2
+    assert 'class="padbtn active" data-pad="4"' in row2
 
 
 def test_serve_html_has_absolute_time_placeholders(tmp_path):
@@ -970,15 +1024,13 @@ def test_serve_html_has_absolute_time_placeholders(tmp_path):
     assert 'id="abs-center"' in html
 
 
-def test_serve_html_save_button_is_in_first_player_row(tmp_path):
-    """保存ボタンは3段目ではなく1段目（原音プレイヤー行）にある。"""
+def test_serve_html_save_button_is_in_first_header_row(tmp_path):
+    """保存ボタンはヘッダー1行目の右端（2行目・本文側には出さない）。"""
     html, _rd = _serve_html(tmp_path)
-    row1 = html.split('class="player-row"')[1].split('class="player-row"')[0]
+    row1, row2 = _header_rows(html)
     assert 'id="save"' in row1
-    preview_panel = html.split('<div class="player-row preview-panel">')[1].split(
-        "</div>"
-    )[0]
-    assert 'id="save"' not in preview_panel
+    assert 'id="save"' not in row2
+    assert 'id="save"' not in _transcript_html(html)
 
 
 def test_serve_html_save_button_default_label(tmp_path):
@@ -1007,18 +1059,18 @@ def test_note_removed_from_both_modes(tmp_path):
     assert 'class="note"' not in serve_html
 
 
-def test_control_order_speed_save_export_notice(tmp_path):
-    """配置は 1段目: 速度→保存→通知、2段目: FCPXML書き出し（4段構成を守る）。"""
+def test_control_order_save_first_row_export_second_row(tmp_path):
+    """1行目: 保存（通知はその左隣）、2行目: 比較→試聴（現在案→前後）→速度→絶対時刻→XML出力。"""
     html, _rd = _serve_html(tmp_path)
-    rows = html.split('class="player-row"')
-    row1, row2 = rows[1], rows[2]
-    speed_i = row1.index("speed-select")
-    save_i = row1.index('id="save"')
-    msg_i = row1.index('id="save-msg"')
+    row1, row2 = _header_rows(html)
     # 通知はボタンの左隣（XML出力の通知と同じ配置規則）
-    assert speed_i < msg_i < save_i
+    assert row1.index('id="save-msg"') < row1.index('id="save"')
     assert 'id="export"' not in row1
-    assert 'id="export"' in row2
+    assert row2.index('data-mode="preview"') < row2.index('data-pad="2"')
+    assert row2.index('data-pad="8"') < row2.index("speed-select")
+    assert row2.index("speed-select") < row2.index('id="abs-target"')
+    assert row2.index('id="abs-target"') < row2.index('id="export"')
+    assert row2.index('id="export-msg"') < row2.index('id="export"')
 
 
 def test_export_busy_kind_disables_controls(tmp_path):
@@ -1099,12 +1151,13 @@ def test_js_refresh_failure_commits_baseline_only(tmp_path):
 
 # ---- 再生速度コントロール（Hlyst UX 改修・Commit3でコンパクト化） ----
 
-def test_serve_html_has_speed_buttons_in_first_row_left_of_save(tmp_path):
-    """速度コントロール（select + toggle）は1段目、保存ボタンの左に置かれる。"""
+def test_serve_html_has_speed_controls_in_second_header_row(tmp_path):
+    """速度コントロール（select + toggle）はヘッダー2行目、試聴グループ（前後）の右に置かれる。"""
     html, _rd = _serve_html(tmp_path)
-    row1 = html.split('class="player-row"')[1].split('class="player-row"')[0]
-    assert row1.index('class="speed-select"') < row1.index('id="save"')
-    assert row1.index('class="speed-toggle"') < row1.index('id="save"')
+    row1, row2 = _header_rows(html)
+    assert 'class="speed-select"' in row2 and 'class="speed-toggle"' in row2
+    assert 'class="speed-select"' not in row1
+    assert row2.index('class="padbtn"') < row2.index('class="speed-toggle"')
 
 
 def test_static_html_has_no_speed_buttons(tmp_path):
@@ -1145,8 +1198,10 @@ def test_serve_script_speed_toggle_reapplies_immediately(tmp_path):
 def test_speed_controls_have_no_padbtn_class(tmp_path):
     """速度UI（select/toggle）は試聴範囲ボタンの .padbtn クラスを持たない。"""
     html, _rd = _serve_html(tmp_path)
-    row1 = html.split('class="player-row"')[1].split('class="player-row"')[0]
-    assert 'class="padbtn' not in row1
+    _row1, row2 = _header_rows(html)
+    speed_markup = row2.split('class="speed-controls"')[1].split("</span>\n")[0]
+    assert 'class="padbtn' not in speed_markup
+    assert "data-pad=" not in speed_markup
 
 
 def test_pad_handler_targets_only_data_pad_elements(tmp_path):
@@ -1195,12 +1250,12 @@ def test_speed_handlers_do_not_modify_pad_active(tmp_path):
 def test_speed_select_and_toggle_defaults(tmp_path):
     """候補値 x1.25/x1.5/x1.75/x2.0・既定 x1.5・toggle は OFF 表示で始まる。"""
     html, _rd = _serve_html(tmp_path)
-    row1 = html.split('class="player-row"')[1].split('class="player-row"')[0]
-    select_markup = row1.split('class="speed-select"')[1].split("</select>")[0]
+    _row1, row2 = _header_rows(html)
+    select_markup = row2.split('class="speed-select"')[1].split("</select>")[0]
     for speed in ("1.25", "1.5", "1.75", "2"):
         assert f'value="{speed}"' in select_markup
     assert 'value="1.5" selected' in select_markup
-    toggle_markup = row1.split('class="speed-toggle"')[1].split("</button>")[0]
+    toggle_markup = row2.split('class="speed-toggle"')[1].split("</button>")[0]
     assert toggle_markup.endswith(">OFF")
 
 
@@ -1292,22 +1347,96 @@ def test_busy_disables_pad_buttons(tmp_path):
 
 # ---- 3段UIを1行構成へ整理（Hlyst UX 改修 Task 3） ----
 
-def test_serve_ui_has_three_compact_player_rows(tmp_path):
+def test_serve_ui_keeps_three_audio_elements_in_one_slot(tmp_path):
+    """audio は3要素のまま1つのスロットへ置き、モードで表示だけを切り替える。"""
     html, _rd = _serve_html(tmp_path)
-    assert html.count('class="player-row') == 3
+    row1, _row2 = _header_rows(html)
+    transport = row1.split('<div class="transport">')[1].split("</div>")[0]
+    assert transport.count("<audio ") == 3
+    assert 'id="audio-preview"' in transport
+    # 既定表示は保存済みだけ（他2つは .shown を持たない）
+    assert transport.count('class="player shown"') == 1
+    assert 'id="audio-out" controls preload="metadata"' in transport
     assert "対象 原音" in html
-    assert "現在案" in html
     assert 'id="abs-window"' not in html
     assert 'id="abs-pos"' not in html
     assert "Option(Alt)+クリック" not in html
 
 
-def test_top_player_labels_are_short_and_equal_width(tmp_path):
-    html, _rd = _serve_html(tmp_path)
-    assert ">原音</button>" in html
-    assert ">保存済み</button>" in html
-    mode_css = html.split(".mode {")[1].split("}")[0]
+def test_mode_segmented_control_labels(tmp_path):
+    """モードは 原音 / 保存済み（+ serve では 現在案）の segmented control。"""
+    serve_html, _rd = _serve_html(tmp_path)
+    _row1, row2 = _header_rows(serve_html)
+    assert ">原音</button>" in row2
+    assert ">保存済み</button>" in row2
+    assert 'data-mode="preview"' in row2
+    assert ">現在案</button>" in row2
+    mode_css = serve_html.split(".mode {")[1].split("}")[0]
     assert "width:" in mode_css
+
+    static_html, _rd2 = _html(tmp_path)
+    assert 'data-mode="preview"' not in static_html
+
+
+def test_header_row2_groups_compare_and_preview(tmp_path):
+    """serve のヘッダー2行目は「比較」（原音/保存済み）と「試聴」（現在案＋前後）の
+    2グループに分かれ、現在案ボタンは seg の外・初期状態は disabled。"""
+    serve_html, _rd = _serve_html(tmp_path)
+    _row1, row2 = _header_rows(serve_html)
+    assert '<span class="label">比較</span>' in row2
+    assert '<span class="label">試聴</span>' in row2
+    assert row2.index('<span class="label">比較</span>') < row2.index('class="seg"')
+    preview_btn = row2.split('id="mode-preview"')[1].split("</button>")[0]
+    assert "disabled" in preview_btn
+    assert 'title="編集中（未保存）の現在案を前後のみ試聴"' in preview_btn
+    # 現在案ボタンは .seg（原音/保存済み）の外側に置かれる
+    seg_block = row2.split('class="seg"')[1].split("</span>")[0]
+    assert "mode-preview" not in seg_block
+    # 「範囲」ではなく「前後」に改称
+    assert '<span class="label">前後</span>' in row2
+    assert "範囲" not in row2
+
+    static_html, _rd2 = _html(tmp_path)
+    _srow1, srow2 = _header_rows(static_html)
+    assert '<span class="label">比較</span>' not in srow2
+    assert '<span class="label">試聴</span>' not in srow2
+    assert 'id="mode-preview"' not in srow2
+    assert '<span class="label">前後</span>' not in srow2
+
+
+def test_preview_mode_button_enabled_after_first_preview(tmp_path):
+    """現在案ボタンは /preview 成功後の応答処理で disabled を解除する。"""
+    html, _rd = _serve_html(tmp_path)
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    preview_success = serve_script.split("post(\"/preview\"")[1].split(".catch(")[0]
+    assert "previewModeBtn.disabled = false;" in preview_success
+
+
+def test_mode_switch_only_changes_visible_player(tmp_path):
+    """現在案モードを選んでもクリック再生の対象（mode）は src/out のまま。"""
+    html, _rd = _serve_html(tmp_path)
+    body = html.split("function setViewMode(next, syncMode) {")[1].split("\n  }")[0]
+    assert 'if (syncMode && next !== "preview") { mode = next; }' in body
+    assert '"shown"' in body
+    assert ".play()" not in body
+    assert ".currentTime" not in body
+
+
+def test_mode_button_click_syncs_mode(tmp_path):
+    """モードボタンのクリックは syncMode=true で setViewMode を呼ぶ。"""
+    html, _rd = _serve_html(tmp_path)
+    assert 'setViewMode(btn.dataset.mode, true);' in html
+
+
+def test_player_play_event_syncs_view_without_changing_mode(tmp_path):
+    """再生開始したプレイヤーへヘッダー表示を自動追従させる（mode は変えない）。"""
+    html, _rd = _serve_html(tmp_path)
+    body = html.split(
+        'eachPlayer(function (p, key) {\n'
+        '    p.addEventListener("play", function () { setViewMode(key, false); });\n'
+        '  });'
+    )
+    assert len(body) == 2
 
 
 # ---- 行クリックで3プレイヤーを同じ比較位置へ揃える（Hlyst UX 改修 Task 4） ----
@@ -1416,14 +1545,114 @@ def test_serve_script_pauses_other_audio_players(tmp_path):
     assert "other.pause();" in html
 
 
-def test_space_toggles_last_player_but_ignores_controls(tmp_path):
+def test_space_toggles_view_mode_player_in_both_modes(tmp_path):
+    """Space は lastPlayer（直近に鳴らした audio）ではなく、表示中の
+    プレイヤー（players[viewMode]）の再生/停止を切り替える。本文スクリプト
+    （静的/serve 共通）に実装し、表示と鳴る音を一致させる。"""
+    for html in (_html(tmp_path)[0], _serve_html(tmp_path)[0]):
+        keydown = _keydown_body(html, html)
+        assert 'if (ev.code === "Space") {' in keydown
+        assert "var audio = players[viewMode];" in keydown
+        assert 'if (viewMode === "preview" && !audio.currentSrc) { return; }' in keydown
+        assert "ev.preventDefault();" in keydown
+        assert "audio.pause();" in keydown
+        assert "audio.play()" in keydown
+
+
+def test_serve_script_has_no_last_player_based_space(tmp_path):
+    """旧 lastPlayer 基準の Space 処理・変数は serve スクリプトから消えている。"""
     html, _rd = _serve_html(tmp_path)
-    assert 'document.addEventListener("keydown"' in html
-    assert 'ev.code !== "Space"' in html
-    assert 'closest("input, button, select, textarea, audio' in html
-    assert "ev.preventDefault();" in html
-    assert "lastPlayer.pause();" in html
-    assert "lastPlayer.play();" in html
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    assert "lastPlayer" not in serve_script
+    assert 'ev.code === "Space"' not in serve_script
+    assert "lastPlayer" not in html
+
+
+# ---- キーボード操作（J/K・X/P/S）とヒント行 ----
+
+def _keydown_body(html, script):
+    """指定スクリプト内の keydown ハンドラ本体を取り出す。"""
+    return script.split('document.addEventListener("keydown", function (ev) {')[
+        1
+    ].split("\n  });")[0]
+
+
+def test_jk_moves_active_row_in_both_modes(tmp_path):
+    """J/K は静的モードでも効き、再生はクリックと同じ経路へ委ねる。"""
+    for html in (_html(tmp_path)[0], _serve_html(tmp_path)[0]):
+        body = html.split("function moveActiveRow(delta) {")[1].split("\n  }")[0]
+        assert "#transcript .active" in html
+        assert 'row.dispatchEvent(new MouseEvent("click"' in body
+        assert 'moveActiveRow(key === "j" ? 1 : -1);' in html
+
+
+def test_mode_shortcut_keys_click_mode_buttons_in_both_modes(tmp_path):
+    """H/L は setViewMode を直接呼ばず、モードボタン列を並び順の系列として
+    1つ左/右の .mode ボタンへ合成クリックを送る（disabled は候補から除外、
+    端では止まる＝ラップしない）。"""
+    for html in (_html(tmp_path)[0], _serve_html(tmp_path)[0]):
+        body = html.split("function moveMode(delta) {")[1].split("\n  }")[0]
+        assert 'function (b) { return !b.disabled; }' in body
+        assert 'document.querySelector(".mode.active")' in body
+        assert (
+            "next = index < 0\n"
+            "      ? (delta > 0 ? 0 : buttons.length - 1)\n"
+            "      : Math.min(Math.max(index + delta, 0), buttons.length - 1);"
+            in body
+        )
+        assert "buttons[next].click();" in body
+        assert 'moveMode(key === "h" ? -1 : 1);' in html
+
+
+def test_keyboard_shortcuts_ignore_focused_inputs(tmp_path):
+    """入力要素にフォーカスがある間はショートカットを発火させない。"""
+    html, _rd = _serve_html(tmp_path)
+    assert html.count("function isTypingTarget(ev) {") == 2
+    assert html.count(
+        'closest("input, button, select, textarea, audio, [contenteditable]")'
+    ) == 2
+
+
+def test_serve_keyboard_has_delete_preview_save_shortcuts(tmp_path):
+    """--serve では X=削除トグル / P=現在案を試聴 / S=保存。"""
+    html, _rd = _serve_html(tmp_path)
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    keydown = _keydown_body(html, serve_script)
+    assert 'if (key === "x") {' in keydown
+    assert "toggleActiveLineDelete();" in keydown
+    assert 'else if (key === "p") {' in keydown
+    assert "playCurrentPlan(currentTarget);" in keydown
+    assert 'else if (key === "s") {' in keydown
+    assert "saveBtn.click();" in keydown
+    # 削除トグルは change を発火させ、クリック時と同じ経路（試聴の再生成）を通す
+    toggle_body = html.split("function toggleActiveLineDelete() {")[1].split("\n  }")[0]
+    assert "if (!line || busy) { return; }" in toggle_body
+    assert 'box.dispatchEvent(new Event("change", { bubbles: true }));' in toggle_body
+
+
+def test_static_mode_has_no_serve_only_shortcuts(tmp_path):
+    """静的モードには serve 専用キーの処理を出さない（Space は本文スクリプト
+    側の共通機能のため静的モードにも存在する）。"""
+    html, _rd = _html(tmp_path)
+    assert "toggleActiveLineDelete" not in html
+    assert 'ev.code === "Space"' in html
+    assert 'key === "s"' not in html
+
+
+def test_keyboard_hint_row_lists_serve_only_keys_only_in_serve(tmp_path):
+    static_html, _rd = _html(tmp_path)
+    serve_html, _rd2 = _serve_html(tmp_path)
+    assert '<p class="kbd">' in static_html
+    assert "<b>J</b> / <b>K</b>" in static_html
+    assert "<b>H</b> / <b>L</b> 表示切替" in static_html
+    assert "<b>H</b> / <b>L</b> 表示切替" in serve_html
+    # Space は本文スクリプト側の共通機能のため静的/serve 両方のヒントに出す
+    for key in ("<b>Space</b>",):
+        assert key in static_html
+        assert key in serve_html
+    for key in ("<b>X</b>", "<b>P</b>", "<b>S</b>"):
+        assert key not in static_html
+        assert key in serve_html
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node が見つからない")
@@ -1444,3 +1673,215 @@ def test_generated_scripts_are_valid_javascript(tmp_path):
         assert proc.returncode == 0, proc.stderr
         checked += 1
     assert checked == 2
+
+
+# ---- 表示順（order）と行の並び替えUI ----
+
+def _line_ids(html, rd):
+    """#transcript に描かれた .line の並びをセグメント ID 列で返す。"""
+    transcript = _transcript_html(html)
+    indices = re.findall(r'<div class="line[^"]*" data-i="(\d+)"', transcript)
+    return [rd["segments"][int(i)]["id"] for i in indices]
+
+
+def _ordered_html(tmp_path, body, serve=False):
+    """本番と同じ経路（TXT の行順を display_order へ）で HTML を作る。"""
+    _make_project(tmp_path)
+    txt = _write_txt(tmp_path, body)
+    plan = render.build_edit_plan(str(txt))
+    data = json.loads((tmp_path / "input.sc.json").read_text(encoding="utf-8"))
+    kept_order = [sid for sid, _t, _b in render.parse_edited_txt(
+        txt.read_text(encoding="utf-8"))]
+    rd = review.build_review_data(
+        plan, data, set(kept_order),
+        "/audio/source?token=t" if serve else "input.wav",
+        "/audio/review?token=t" if serve else "input.review.wav",
+        serve=serve, token="t" if serve else None,
+        display_order=review.compute_display_order(kept_order, data),
+    )
+    return review.render_html(rd), rd
+
+
+def _data_json(tmp_path):
+    _make_project(tmp_path)
+    return json.loads((tmp_path / "input.sc.json").read_text(encoding="utf-8"))
+
+
+def test_compute_display_order_keeps_txt_order(tmp_path):
+    data = _data_json(tmp_path)
+    order = review.compute_display_order(
+        ["0003", "0001", "0002", "0004"], data
+    )
+    assert order == ["0003", "0001", "0002", "0004"]
+
+
+def test_compute_display_order_inserts_deleted_near_json_neighbours(tmp_path):
+    """削除済みは json 順で直後の生存行の前（無ければ直前の生存行の後ろ）。"""
+    data = _data_json(tmp_path)
+    order = review.compute_display_order(["0003", "0001"], data)
+    assert order == ["0002", "0003", "0004", "0001"]
+
+
+def test_compute_display_order_all_deleted_is_json_order(tmp_path):
+    data = _data_json(tmp_path)
+    assert review.compute_display_order([], data) == [
+        "0001", "0002", "0003", "0004"
+    ]
+
+
+def test_review_data_order_defaults_to_json_order(tmp_path):
+    """display_order 未指定は json 順（後方互換）。"""
+    _plan, rd = _build(tmp_path, "[0003] う\n[0001] あえーい\n")
+    assert rd["order"] == ["0001", "0002", "0003", "0004"]
+
+
+def test_payload_carries_display_order(tmp_path):
+    html, _rd = _ordered_html(
+        tmp_path, "[0003] う\n[0001] あえーい\n[0002] ⚠\n[0004] え\n"
+    )
+    assert _payload_json(html)["order"] == ["0003", "0001", "0002", "0004"]
+    # segments は json 順のまま（data-i の意味を変えない）
+    assert [s["id"] for s in _payload_json(html)["segments"]] == [
+        "0001", "0002", "0003", "0004"
+    ]
+
+
+def test_transcript_rows_follow_display_order(tmp_path):
+    html, rd = _ordered_html(
+        tmp_path, "[0003] う\n[0001] あえーい\n[0002] ⚠\n[0004] え\n"
+    )
+    assert _line_ids(html, rd) == ["0003", "0001", "0002", "0004"]
+
+
+def _markup_review(order):
+    """_transcript_markup 用の最小レビューデータ（出力時刻だけを持たせる）。"""
+    def _seg_stub(seg_id, index, output):
+        return {
+            "id": seg_id, "index": index, "kind": "speech", "reason": None,
+            "requested_delete": False, "effective_delete": False,
+            "ts": "00:00", "output": output, "source": 0.0,
+            "words": [], "label": seg_id,
+        }
+
+    return {
+        "serve": False,
+        "order": order,
+        "segments": [
+            _seg_stub("0001", 0, 5.0),   # 表示は2番目だが原音では先頭
+            _seg_stub("0002", 1, 0.0),
+        ],
+        "trims": [
+            {"index": 0, "ts": "00:03", "output": 4.0, "removed": 1.0},
+        ],
+    }
+
+
+def test_transcript_markup_interleaves_trims_by_output_time():
+    """トリムは原音時刻ではなく出力時刻で差し込む（並べ替え後も位置が合う）。"""
+    markup = review._transcript_markup(_markup_review(["0002", "0001"]))
+    rows = [row for row in markup.split("\n") if row]
+    assert '[0002]' in rows[0]
+    assert 'class="trim"' in rows[1]
+    assert '[0001]' in rows[2]
+
+
+def test_transcript_markup_places_trim_first_on_tie():
+    """出力時刻が同じならトリムを先に出す。"""
+    data = _markup_review(["0002", "0001"])
+    data["trims"][0]["output"] = 0.0
+    markup = review._transcript_markup(data)
+    rows = [row for row in markup.split("\n") if row]
+    assert 'class="trim"' in rows[0]
+    assert '[0002]' in rows[1]
+
+
+def test_serve_html_has_move_buttons(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    transcript = _transcript_html(html)
+    assert '<span class="mv">' in transcript
+    assert '<button type="button" class="up" data-i="0"' in transcript
+    assert '<button type="button" class="down" data-i="0"' in transcript
+    assert ".mv button:disabled { opacity: .4; cursor: default; }" in html
+
+
+def test_static_html_has_no_move_buttons(tmp_path):
+    html, _rd = _html(tmp_path)
+    assert 'class="mv"' not in _transcript_html(html)
+
+
+def test_move_buttons_disabled_when_requested_delete(tmp_path):
+    html, _rd = _serve_html(
+        tmp_path, "[0001] あえーい\n[0003] う\n[0004] え\n"
+    )
+    transcript = _transcript_html(html)
+    # 0002（削除指定）は disabled、0001（保持）は有効
+    assert '<button type="button" class="up" data-i="1"' \
+        ' aria-label="この行を上へ" disabled>' in transcript
+    assert '<button type="button" class="up" data-i="0"' \
+        ' aria-label="この行を上へ">' in transcript
+
+
+def test_serve_script_tracks_order_in_dirty_state(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    snapshot_body = html.split("function snapshot() {")[1].split("\n  }\n")[0]
+    assert 's["O"] = DATA.order.join("\\n");' in snapshot_body
+
+
+def test_serve_script_move_handler_rebuilds_order(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    serve_script = html.split("if (!DATA.serve) { return; }")[1]
+    click_handler = serve_script.split(
+        'document.getElementById("transcript").addEventListener("click"'
+    )[1].split("}, true);")[0]
+    mv_branch = click_handler.split('closest(".mv button")')[1].split("\n    }")[0]
+    assert "ev.stopPropagation();" in mv_branch
+    assert "if (busy || mvBtn.disabled) { return; }" in mv_branch
+    assert "moveLine(" in mv_branch
+
+    move_body = serve_script.split("function moveLine(line, dir) {")[1].split(
+        "\n  }\n"
+    )[0]
+    assert "rebuildOrder();" in move_body
+    assert "updateSaveButton();" in move_body
+    assert "clearPreviewCache();" in move_body
+    assert "runPreview(" not in move_body      # 移動では自動プレビューしない
+    assert "savedPositions" not in move_body   # 保存済み位置は触らない
+
+
+def test_serve_script_skips_trim_and_deleted_rows_when_swapping(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    body = html.split("function swapSibling(line, dir) {")[1].split("\n  }\n")[0]
+    assert 'node.classList.contains("line") && !rowDeleted(node)' in body
+
+
+def test_serve_script_apply_states_syncs_badge_classes(tmp_path):
+    """トグルで requested/effective が変わったとき state の del/manual/unsafe が
+    正しく付け外しされる（stateClass の判定を stateLabel と揃える）。"""
+    html, _rd = _serve_html(tmp_path)
+    state_class_body = html.split("function stateClass(requested, effective) {")[
+        1
+    ].split("\n  }\n")[0]
+    assert 'return "del";' in state_class_body
+    assert 'return "unsafe";' in state_class_body
+    assert 'return "manual";' in state_class_body
+    apply_states = html.split("function applyStates() {")[1].split("\n  }\n")[0]
+    assert 'state.classList.toggle("unsafe", cls === "unsafe");' in apply_states
+    assert 'state.classList.toggle("del", cls === "del");' in apply_states
+    assert 'state.classList.toggle("manual", cls === "manual");' in apply_states
+
+
+def test_serve_script_syncs_move_buttons_with_state_and_busy(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    apply_states = html.split("function applyStates() {")[1].split("\n  }\n")[0]
+    assert "btn.disabled = busy || seg.requested_delete;" in apply_states
+    busy_body = html.split("function setControlsBusy(value, kind) {")[1].split(
+        "\n  }\n"
+    )[0]
+    assert "btn.disabled = value || (line ? rowDeleted(line) : false);" in busy_body
+
+
+def test_serve_script_posts_order(tmp_path):
+    html, _rd = _serve_html(tmp_path)
+    assert 'post("/save", { toggles: toggles(), order: DATA.order })' in html
+    assert 'post("/export", { toggles: toggles(), order: DATA.order })' in html
+    assert "toggles: toggles(), order: DATA.order, target: target" in html

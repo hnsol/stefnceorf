@@ -211,6 +211,36 @@ def _unrecognized_label(seg: dict, duration: float) -> str:
     return f"{FILLER_OPEN}未認識 {duration:.1f}秒{FILLER_CLOSE}"
 
 
+def compute_display_order(kept_order: list[str], data: dict) -> list[str]:
+    """画面の表示順（全セグメント ID の順列）を返す（純関数）。
+
+    TXT に残っている行はその並び（＝出力順）をそのまま使い、削除済みの行は
+    serve.apply_toggles の復活位置（_insert_position）と同じ規則で差し込む:
+    json 順で直後にくる生存行の前、無ければ直前の生存行の後ろ、どちらも無ければ
+    末尾。削除済みが連続する場合は json 順に並ぶ（先に挿入した行も基準になる）。
+    """
+    json_order = [seg["id"] for seg in data.get("segments", [])]
+    kept = [seg_id for seg_id in kept_order if seg_id in set(json_order)]
+    out = list(kept)
+    placed = set(out)
+    for i, seg_id in enumerate(json_order):
+        if seg_id in placed:
+            continue
+        pos = len(out)
+        for other in json_order[i + 1:]:
+            if other in placed:
+                pos = out.index(other)
+                break
+        else:
+            for other in reversed(json_order[:i]):
+                if other in placed:
+                    pos = out.index(other) + 1
+                    break
+        out.insert(pos, seg_id)
+        placed.add(seg_id)
+    return out
+
+
 def build_review_data(
     plan: EditPlan,
     data: dict,
@@ -220,6 +250,7 @@ def build_review_data(
     serve: bool = False,
     requested: dict | None = None,
     token: str | None = None,
+    display_order: list[str] | None = None,
 ) -> dict:
     """EditPlan と json から HTML へ渡すレビューデータを構築する。
 
@@ -235,6 +266,10 @@ def build_review_data(
     requested は serve モードで raw TXT から算出したものを
     {"segments": {id: bool}, "words": {id: {word_index: bool}}} で渡す。
     None のときは TXT 上の行の有無・写像の被覆から推定する（静的モード）。
+
+    display_order は画面の表示順（compute_display_order の戻り値）。segments は
+    json 順のまま（data-i の意味を変えない）で、表示順は payload の "order" が
+    持つ。None のときは json 順をそのまま表示順にする。
     """
     samplerate = plan.samplerate
     segments = data.get("segments", [])
@@ -383,9 +418,24 @@ def build_review_data(
             }
         )
 
+    # 表示順は必ず全 ID の順列にする（欠けている ID は json 順で末尾へ足す）。
+    json_ids = [seg["id"] for seg in segments]
+    order_ids: list[str] = []
+    if display_order:
+        known = set(json_ids)
+        taken: set[str] = set()
+        for seg_id in display_order:
+            if seg_id in known and seg_id not in taken:
+                order_ids.append(seg_id)
+                taken.add(seg_id)
+        order_ids.extend(seg_id for seg_id in json_ids if seg_id not in taken)
+    else:
+        order_ids = list(json_ids)
+
     return {
         "base": plan.base_name,
         "serve": bool(serve),
+        "order": order_ids,
         "token": token,
         "source_audio": source_audio,
         "review_audio": review_audio,
@@ -442,7 +492,8 @@ def state_label(
     "pause"（元位置のポーズを確保できない）→「ポーズ不足のため保持」、それ
     以外（境界RMS等）→「unsafeのため保持」。OFF なのに音が無い（手でテキスト
     を消した等）→「削除（手動編集）」。kind/reason は将来の分岐用に引数として
-    残すが、現状の判定には使わない。
+    残すが、現状の判定には使わない。保持（無指定・音あり）は例外ではないため
+    表示しない（空文字）。
     """
     if requested and effective:
         return "削除"
@@ -452,7 +503,26 @@ def state_label(
         return "unsafeのため保持"
     if effective:
         return "削除（手動編集）"
-    return "保持"
+    return ""
+
+
+def state_css_class(
+    requested: bool,
+    effective: bool,
+    unsafe_reason: str | None = None,
+) -> str:
+    """state_label と同じ判定から `.state` に足す状態クラスを返す（純関数）。
+
+    "del"（削除）/ "manual"（削除・手動編集）は枠付きバッジ、"unsafe" は
+    現行どおり赤太字テキストのまま（バッジ化しない）。保持は空文字。
+    """
+    if requested and effective:
+        return "del"
+    if requested and not effective:
+        return "unsafe"
+    if effective:
+        return "manual"
+    return ""
 
 
 def _segment_markup(seg: dict, serve: bool = False) -> str:
@@ -481,6 +551,17 @@ def _segment_markup(seg: dict, serve: bool = False) -> str:
         parts.append(
             f'<input type="checkbox" class="del" data-i="{seg["index"]}"'
             f' aria-label="この行を削除"{checked}>'
+        )
+        # 行の並び替え（▲▼）。削除指定中の行は TXT 上に行が無く移動が無意味な
+        # ため disabled にする（busy 中の無効化はスクリプト側が行う）。
+        disabled = " disabled" if seg["requested_delete"] else ""
+        parts.append(
+            f'<span class="mv">'
+            f'<button type="button" class="up" data-i="{seg["index"]}"'
+            f' aria-label="この行を上へ"{disabled}>{_ICON_UP}</button>'
+            f'<button type="button" class="down" data-i="{seg["index"]}"'
+            f' aria-label="この行を下へ"{disabled}>{_ICON_DOWN}</button>'
+            f'</span>'
         )
     parts.extend([
         f'<span class="ts">{escape(seg["ts"])}</span>',
@@ -512,8 +593,10 @@ def _segment_markup(seg: dict, serve: bool = False) -> str:
         parts.append(escape(seg["label"]))
     parts.append("</span>")
     if serve:
-        is_unsafe = seg["requested_delete"] and not seg["effective_delete"]
-        state_classes = "state unsafe" if is_unsafe else "state"
+        state_cls = state_css_class(
+            seg["requested_delete"], seg["effective_delete"], seg.get("unsafe_reason")
+        )
+        state_classes = f"state {state_cls}" if state_cls else "state"
         label = state_label(
             seg["requested_delete"], seg["effective_delete"], seg["kind"], seg["reason"],
             seg.get("unsafe_reason"),
@@ -533,19 +616,30 @@ def _trim_markup(trim: dict) -> str:
         f'<div class="trim" data-t="{trim["index"]}">'
         f'<span class="ts">{escape(trim["ts"])}</span>'
         f'<span class="sid">[--]</span>'
-        f'<span class="text">✂ 無音トリム -{trim["removed"]:.1f}秒</span>'
+        f'<span class="text">{_ICON_SCISSORS}無音トリム -{trim["removed"]:.1f}秒</span>'
         "</div>"
     )
 
 
 def _transcript_markup(review: dict) -> str:
-    """トランスクリプト全体（無音トリムマーカーを原音時刻順に差し込む）。"""
-    trims = sorted(review["trims"], key=lambda t: t["source"])
+    """トランスクリプト全体（表示順に並べ、無音トリムを出力時刻順に差し込む）。
+
+    行は review["order"]（表示順＝TXT の行順）で走査する。segments は json 順
+    なので id → セグメントの対応表で引く。無音トリムは出力（編集後）時刻で
+    interleave する（並べ替え後は原音時刻の比較では位置がずれるため）。同時刻の
+    ときはトリムを先に出す。
+    """
+    trims = sorted(review["trims"], key=lambda t: t["output"])
     serve = bool(review.get("serve"))
+    by_id = {seg["id"]: seg for seg in review["segments"]}
+    order = review.get("order") or [seg["id"] for seg in review["segments"]]
     blocks: list[str] = []
     ti = 0
-    for seg in review["segments"]:
-        while ti < len(trims) and trims[ti]["source"] < seg["source"]:
+    for seg_id in order:
+        seg = by_id.get(seg_id)
+        if seg is None:
+            continue
+        while ti < len(trims) and trims[ti]["output"] <= seg["output"]:
             blocks.append(_trim_markup(trims[ti]))
             ti += 1
         blocks.append(_segment_markup(seg, serve))
@@ -554,14 +648,37 @@ def _transcript_markup(review: dict) -> str:
     return "\n".join(blocks)
 
 
+# 文字グリフ（✂ / ▲▼）は環境差が大きいため inline SVG に置き換える。色は
+# currentColor で親の文字色（トリムの緑・並び替えの muted）へ追従させる。
+_ICON_SCISSORS = (
+    '<svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none"'
+    ' stroke="currentColor" stroke-width="1.5" aria-hidden="true">'
+    '<circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>'
+    '<path d="M20 4 L8.1 15.9 M14.5 14.5 L20 20 M8.1 8.1 L12 12"/></svg>'
+)
+# ▲▼ の代替。8px と小さいので stroke は太め（モック準拠）にして視認性を保つ。
+_ICON_UP = (
+    '<svg class="icon" width="8" height="8" viewBox="0 0 24 24" fill="none"'
+    ' stroke="currentColor" stroke-width="3" aria-hidden="true">'
+    '<path d="M6 15 L12 9 L18 15"/></svg>'
+)
+_ICON_DOWN = (
+    '<svg class="icon" width="8" height="8" viewBox="0 0 24 24" fill="none"'
+    ' stroke="currentColor" stroke-width="3" aria-hidden="true">'
+    '<path d="M6 9 L12 15 L18 9"/></svg>'
+)
+
+
 _HTML_TEMPLATE = Template("""<!DOCTYPE html>
 <html lang="ja">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>$title</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Zen+Kaku+Gothic+New:wght@400;500;700&family=Zen+Old+Mincho:wght@600;700&display=swap">
 <style>
-/* Flexoki カラースキーム（light/dark）をカスタムプロパティで切替 */
+/* Flexoki カラースキーム（light/dark）をカスタムプロパティで切替。
+   コンポーネント側では hex を直書きしない（配色の変更点をここに集約する）。 */
 :root {
   color-scheme: light dark;
   --bg: #FFFCF0;           /* paper */
@@ -569,6 +686,7 @@ _HTML_TEMPLATE = Template("""<!DOCTYPE html>
   --border: #DAD8CE;       /* base-150 */
   --text: #100F0F;         /* black */
   --text-muted: #6F6E69;   /* base-600 */
+  --primary: #1A4F8C;      /* 見出し・アクティブ状態・保存ボタン */
   --accent: #205EA6;       /* blue-600 */
   --accent-tint-weak: rgba(32,94,166,.10);
   --accent-tint-strong: rgba(32,94,166,.22);
@@ -581,6 +699,10 @@ _HTML_TEMPLATE = Template("""<!DOCTYPE html>
   --red: #AF3029;          /* red-600 */
   --yellow: #AD8301;       /* yellow-600 */
   --yellow-tint: rgba(173,131,1,.14);
+  /* Web フォントが読めない環境（オフライン）では後続のフォールバックが効く */
+  --font-sans: "Zen Kaku Gothic New", -apple-system, "Hiragino Sans", sans-serif;
+  --font-serif: "Zen Old Mincho", "Hiragino Mincho ProN", serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -589,6 +711,7 @@ _HTML_TEMPLATE = Template("""<!DOCTYPE html>
     --border: #403E3C;     /* base-800 */
     --text: #CECDC3;       /* base-200 */
     --text-muted: #B7B5AC; /* base-300 */
+    --primary: #4385BE;    /* blue-400 */
     --accent: #4385BE;     /* blue-400 */
     --accent-tint-weak: rgba(67,133,190,.16);
     --accent-tint-strong: rgba(67,133,190,.30);
@@ -601,50 +724,134 @@ _HTML_TEMPLATE = Template("""<!DOCTYPE html>
   }
 }
 body {
-  font-family: -apple-system, "Hiragino Sans", sans-serif;
-  margin: 0 auto; padding: 1rem; max-width: 60rem; line-height: 1.7;
+  font-family: var(--font-sans);
+  margin: 0 auto; padding: 0 1.5rem 1rem; max-width: 80rem; line-height: 1.8;
   background: var(--bg); color: var(--text);
 }
-h1 { font-size: 1.2rem; margin: 0 0 .1rem; }
-.subtitle { font-size: .85rem; color: var(--text-muted); margin: 0 0 .5rem; }
-/* 操作エリアはスクロールしても画面上部に固定する */
-.controls {
-  position: sticky; top: 0; z-index: 10; background: var(--surface);
-  padding: .5rem 0 .25rem; border-bottom: 1px solid var(--border);
-  margin-bottom: .75rem;
+.mono { font-family: var(--font-mono); letter-spacing: 0; }
+/* ヘッダー（2行）はスクロールしても画面上部に固定する。背景は不透明にして
+   下をスクロールする行が透けないようにする。 */
+.header {
+  position: sticky; top: 0; z-index: 10; background: var(--bg);
+  padding: .75rem 0 .6rem; border-bottom: 1px solid var(--text);
+  display: flex; flex-direction: column; gap: .5rem;
 }
-.player-row {
-  display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
-  margin-bottom: .5rem;
+.hrow { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .75rem; }
+h1.title {
+  font-family: var(--font-serif); font-size: 1rem; font-weight: 600;
+  color: var(--primary); margin: 0; white-space: nowrap;
 }
-.player-row audio { height: 2rem; }
-.seek { display: flex; gap: .25rem; }
+.subtitle {
+  font-family: var(--font-mono); font-size: .7rem; color: var(--text-muted);
+  margin: 0;
+}
+/* アクティブな audio だけを表示するスロット（3要素は DOM に残す）。 */
+.transport {
+  flex: 1; min-width: 16rem; display: flex; align-items: center;
+  border: 1px solid var(--border); border-radius: .15rem; padding: .3rem .5rem;
+}
+.transport audio { display: none; }
+.transport audio.shown { display: block; width: 100%; height: 2rem; }
+/* モード切替（原音 / 保存済み）は segmented control。現在案は seg から独立した
+   単体ボタン（.mode-solo）で、比較の2択とは見た目のグループを分ける。 */
+.seg {
+  display: flex; border: 1px solid var(--border); border-radius: .15rem;
+  overflow: hidden;
+}
 .mode {
-  font: inherit; padding: .25rem .75rem; cursor: pointer; width: 6rem; text-align: center;
-  border: 1px solid currentColor; background: transparent; border-radius: .25rem;
+  font: inherit; font-size: .75rem; padding: .3rem .5rem; cursor: pointer;
+  width: 5rem; text-align: center; border: none; border-right: 1px solid var(--border);
+  background: transparent; color: var(--text);
 }
-.mode.active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
-.seek-btn {
-  font: inherit; font-size: .75rem; padding: .15rem .5rem; cursor: pointer;
-  border: 1px solid var(--border); background: transparent; border-radius: .25rem;
+.mode:last-child { border-right: none; }
+.mode.active { background: var(--primary); color: var(--on-accent); }
+/* ヘッダー2行目のグループ（比較 / 試聴）とその間の区切り線。 */
+.group { display: flex; align-items: center; gap: .4rem; }
+.group-divider { align-self: stretch; border-left: 1px solid var(--border); margin: 0 .1rem; }
+.mode-solo {
+  width: auto; border: 1px solid var(--border); border-radius: .15rem;
+}
+.mode-solo:disabled { opacity: .5; cursor: default; }
+.seek { display: flex; gap: .25rem; }
+.seek-btn, .padbtn, .speed-select, .speed-toggle {
+  font-family: var(--font-mono); font-size: .7rem; padding: .25rem .5rem;
+  cursor: pointer; box-sizing: border-box;
+  border: 1px solid var(--border); background: transparent; border-radius: .15rem;
   color: var(--text);
 }
-.seek-btn:hover { border-color: var(--accent); }
-.legend { font-size: .8rem; margin: 0 0 1rem; padding: 0; list-style: none; }
-.legend li { display: inline-block; margin-right: 1rem; }
-.stats {
-  font-size: .8rem; margin: 0 0 1rem; padding: .5rem .75rem;
-  background: var(--surface); border: 1px solid var(--border); white-space: pre-wrap;
+.seek-btn:hover { border-color: var(--primary); }
+.label { font-size: .75rem; color: var(--text-muted); white-space: nowrap; }
+/* 保存ボタン（1行目右端）と XML出力（2行目右端）。通知は各ボタンの左隣。 */
+.save-area {
+  display: flex; align-items: center; gap: .5rem; margin-left: auto;
 }
-#transcript { border-top: 1px solid var(--border); }
+#save, #export {
+  font: inherit; font-size: .8rem; padding: .3rem 1rem; cursor: pointer;
+  border-radius: .15rem; box-sizing: border-box; height: 2rem; min-width: 7em;
+  border: 1px solid var(--border); background: transparent; color: var(--text);
+}
+#save:disabled, #export:disabled { opacity: .5; cursor: default; }
+#save.dirty {
+  background: var(--primary); color: var(--on-accent); border-color: var(--primary);
+  font-weight: 700;
+}
+.msg { font-size: .75rem; color: var(--text-muted); }
+.msg.error { color: var(--red); }
+/* 再生速度: select（速度値）＋ toggle（OFF x1.0 / ON x選択値）。
+   .padbtn は付けない（試聴範囲ボタンの誤反応バグの再発防止のため selector を分離）。 */
+.speed-controls, .pad-select {
+  display: flex; align-items: center; gap: .25rem; white-space: nowrap;
+}
+.speed-toggle { width: 3.4em; text-align: center; color: var(--text-muted); }
+.speed-toggle.active {
+  border-color: var(--text); background: var(--surface); font-weight: 700;
+  color: var(--text);
+}
+.speed-select:disabled, .speed-toggle:disabled { opacity: .5; cursor: default; }
+/* 範囲選択はアクション色を使わず、中立色の segmented control にする */
+.padbtn.active { border-color: var(--text); background: var(--surface); font-weight: 700; }
+.padbtn:disabled { opacity: .5; cursor: default; }
+.abs-times {
+  font-family: var(--font-mono); font-size: .7rem; color: var(--text-muted);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.abs-times b { color: var(--text); font-weight: 400; }
+/* ステータスバー（ヘッダー直下・1行）: 現在案の状態ラベル ＋ 統計 */
+.statusbar {
+  display: flex; align-items: center; gap: .25rem 1.25rem; flex-wrap: wrap;
+  padding: .3rem 0; border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono); font-size: .7rem; color: var(--text-muted);
+}
+.statusbar .cur { color: var(--red); font-weight: 500; }
+.legend {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .25rem 1.25rem;
+  font-size: .75rem; color: var(--text-muted);
+  margin: 0; padding: .5rem 0; list-style: none;
+}
+.legend li { display: inline-flex; align-items: center; }
+/* 凡例内のサンプルは行レイアウト（flex）を持ち込まず inline で見せる */
+.legend .trim, .legend .line {
+  display: inline-flex; align-items: center; gap: 0;
+  padding: 0; border: none; cursor: default;
+}
+#transcript { border-top: 1px solid var(--text); }
 .line, .trim {
   display: flex; gap: .5rem; align-items: baseline; cursor: pointer;
-  padding: .15rem .25rem; border-bottom: 1px solid var(--border);
+  padding: .25rem .25rem; border-bottom: 1px solid var(--border);
 }
 .line:hover, .trim:hover { background: var(--accent-tint-weak); }
-.line.active, .trim.active { background: var(--accent-tint-strong); }
-.ts { font-variant-numeric: tabular-nums; color: var(--text-muted); font-size: .8rem; min-width: 3.5rem; }
-.sid { color: var(--text-muted); font-size: .75rem; min-width: 3.5rem; opacity: .7; }
+/* active 行は左端に 2px の --primary バー（inset box-shadow で行幅を変えない） */
+.line.active, .trim.active {
+  background: var(--accent-tint-weak); box-shadow: inset 2px 0 0 var(--primary);
+}
+.ts {
+  font-family: var(--font-mono); font-size: .7rem; color: var(--text-muted);
+  font-variant-numeric: tabular-nums; min-width: 3.5rem;
+}
+.sid {
+  font-family: var(--font-mono); font-size: .7rem; color: var(--text-muted);
+  min-width: 3rem; opacity: .7;
+}
 .text { flex: 1; }
 /* 削除済み行（.sc.txt に無い行）は取消線 */
 .line.deleted .text { text-decoration: line-through; opacity: .55; }
@@ -658,145 +865,128 @@ h1 { font-size: 1.2rem; margin: 0 0 .1rem; }
 /* 削除指定したが安全判定で保持された状態は破線アウトライン＋状態ラベル赤太字で示す
    （フィラー提案の塗りつぶしと表現チャネルを分け、.line.uts より後に置き優先させる） */
 .w.unsafe, .line.unsafe {
-  /* offset は負にして枠を要素の内側に描く。外側に描くと sticky コントロールの
+  /* offset は負にして枠を要素の内側に描く。外側に描くと sticky ヘッダーの
      背景で覆えず、下をスクロールする行の枠線が左右にはみ出て見える */
   outline: 1px dashed var(--red); outline-offset: -1px; background: none;
 }
 /* 枠が文字に重ならないよう単語には左右の余白を持たせる。凡例サンプルは
-   inline-block＋上下余白で、枠と文字の間隔を実表示と同等に確保する */
+   inline-flex＋上下余白で、枠と文字の間隔を実表示と同等に確保する */
 .w.unsafe { padding: 0 .2em; }
 .legend .w.unsafe { display: inline-block; padding: .1em .4em; }
-.trim { color: var(--green); font-size: .85rem; }
-/* --serve（Hlyst 対話モード）専用 */
-/* 保存ボタン（と速度コントロール）は1段目右端に、余白/区切りで原音プレイヤーと分離する */
-.save-area {
-  display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-left: auto;
-  padding-left: .75rem; border-left: 1px solid var(--border);
+.trim { color: var(--green); font-size: .8rem; }
+.trim .icon { vertical-align: -.15em; margin-right: .25rem; }
+.state {
+  font-family: var(--font-mono); font-size: .7rem; color: var(--text-muted);
+  min-width: 8rem; text-align: right; align-self: center;
 }
-/* 再生速度: select（速度値）＋ toggle（OFF x1.0 / ON x選択値）（保存ボタンの左）。
-   .padbtn は付けない（試聴範囲ボタンの誤反応バグの再発防止のため selector を分離）。 */
-.speed-controls {
-  display: flex; align-items: center; gap: .25rem; font-size: .8rem;
-  color: var(--text-muted); white-space: nowrap;
-}
-/* select と toggle は高さを揃える（幅は違ってよい）。toggle は ON/OFF どちらの
-   文言でも大きさが変わらないよう固定幅にする */
-.speed-select, .speed-toggle {
-  font: inherit; font-size: .75rem; cursor: pointer; box-sizing: border-box;
-  height: 1.7rem; padding: 0 .4rem;
-  border: 1px solid var(--border); background: transparent; border-radius: .25rem;
-  color: var(--text);
-}
-.speed-toggle { width: 3.4em; text-align: center; }
-.speed-toggle.active {
-  border-color: var(--text); background: var(--surface); font-weight: 700;
-}
-.speed-select:disabled, .speed-toggle:disabled { opacity: .5; cursor: default; }
-/* 保存と XML出力 は縦横の大きさを揃える（保存が「変更を保存（N件）」のときだけ
-   幅が伸びるのは許容） */
-#save, #export {
-  font: inherit; padding: .25rem 1rem; cursor: pointer; border-radius: .25rem;
-  border: 1px solid currentColor; background: transparent;
-  box-sizing: border-box; height: 2.1rem; min-width: 7em;
-}
-#save:disabled, #export:disabled { opacity: .5; cursor: default; }
-#save.dirty { background: var(--green); color: var(--on-accent); border-color: var(--green); }
-.msg { font-size: .8rem; }
-.msg.error { color: var(--red); }
-/* 3段目: 現在案プレビュー（状態ラベル・audio・試聴範囲切替・対象/現在案の絶対時刻）。
-   デスクトップでは1行に収め、狭い画面だけ折り返す。 */
-.preview-panel {
-  display: flex; flex-wrap: nowrap; align-items: center; gap: .5rem 1rem;
-  margin-bottom: .75rem;
-}
-@media (max-width: 40rem) {
-  .preview-panel { flex-wrap: wrap; }
-}
-.preview-panel .state-label {
-  font-size: .85rem; color: var(--text-muted); white-space: nowrap;
-}
-.pad-select {
-  display: flex; align-items: center; gap: .25rem; font-size: .8rem;
-  color: var(--text-muted); white-space: nowrap;
-}
-.padbtn {
-  font: inherit; font-size: .75rem; padding: .15rem .6rem; cursor: pointer;
-  border: 1px solid var(--border); background: transparent; border-radius: .25rem;
-  color: var(--text);
-}
-/* 範囲選択はアクション色（青）を使わず、中立色の segmented control にする */
-.padbtn.active {
-  border-color: var(--text); background: var(--surface); font-weight: 700;
-}
-.abs-times {
-  font-size: .8rem; font-variant-numeric: tabular-nums; color: var(--text-muted);
-  white-space: nowrap;
-}
-.abs-times b { color: var(--text); font-weight: 400; }
-.state { font-size: .75rem; color: var(--text-muted); min-width: 8rem; text-align: right; }
 .state.unsafe { color: var(--red); font-weight: 700; }
+/* 「保持」は表示しない（例外だけ目立たせる）。削除／削除（手動編集）は
+   行本文の取消線と対で読める中立バッジにする。枠を text 幅まで縮めるため
+   min-width を解除し inline-block にする（unsafe は従来どおり全幅のまま）。 */
+.state.del, .state.manual {
+  display: inline-block; min-width: 0; border: 1px solid var(--text-muted);
+  color: var(--text-muted); padding: 0 .3em; border-radius: .15rem;
+}
+.state.manual { border-color: var(--yellow); color: var(--yellow); }
 label.wt { display: inline; }
 label.wt input { margin: 0 .1em 0 .2em; vertical-align: middle; }
-.line > input.del { margin: 0; align-self: center; }
+.line > input.del { margin: 0; align-self: center; accent-color: var(--primary); }
+/* 行の並び替えボタン（▲▼相当のSVG）。チェックボックスの隣に置き、行の高さを
+   変えないよう小さめにする。削除指定中／busy 中は disabled。 */
+.mv { display: flex; gap: .1rem; align-self: center; flex: none; }
+.mv button {
+  width: 1.15rem; height: 1rem; padding: 0; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--border); background: transparent;
+  border-radius: .15rem; color: var(--text-muted);
+}
+.mv button:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+.mv button:disabled { opacity: .4; cursor: default; }
+/* キーボード操作のヒント行。長いトランスクリプトでも見えるよう画面下部に
+   sticky 固定する（背景は不透明にして下を通る行が透けないようにする）。 */
+.kbd {
+  position: sticky; bottom: 0; z-index: 10; background: var(--bg);
+  display: flex; flex-wrap: wrap; gap: .25rem 1.25rem; margin: 0;
+  padding: .4rem 0; border-top: 1px solid var(--border);
+  font-family: var(--font-mono); font-size: .625rem; color: var(--text-muted);
+}
+.kbd b {
+  font-weight: 500; color: var(--text); border: 1px solid var(--border);
+  border-radius: .15rem; padding: 0 .3rem; background: var(--surface);
+}
 </style>
 </head>
 <body>
-<h1>$h1</h1>
-<p class="subtitle">$subtitle</p>
-<div class="controls">
-<div class="player-row">
-  <button type="button" class="mode" data-mode="src">原音</button>
-  <audio id="audio-src" controls preload="metadata" src="$source_audio"></audio>
-  <span class="seek">
-    <button type="button" class="seek-btn" data-player="src" data-seek="-10">−10s</button>
-    <button type="button" class="seek-btn" data-player="src" data-seek="-5">−5s</button>
-    <button type="button" class="seek-btn" data-player="src" data-seek="5">＋5s</button>
-    <button type="button" class="seek-btn" data-player="src" data-seek="10">＋10s</button>
-  </span>
+<header class="header">
+<div class="hrow">
+  <h1 class="title">$h1</h1>
+  <p class="subtitle">$subtitle</p>
+  <div class="transport">
+    <audio id="audio-src" controls preload="metadata" src="$source_audio" class="player"></audio>
+    <audio id="audio-out" controls preload="metadata" src="$review_audio" class="player shown"></audio>
+$audio_preview
+  </div>
 $save_area
 </div>
-<div class="player-row">
-  <button type="button" class="mode active" data-mode="out">保存済み</button>
-  <audio id="audio-out" controls preload="metadata" src="$review_audio"></audio>
-  <span class="seek">
-    <button type="button" class="seek-btn" data-player="out" data-seek="-10">−10s</button>
-    <button type="button" class="seek-btn" data-player="out" data-seek="-5">−5s</button>
-    <button type="button" class="seek-btn" data-player="out" data-seek="5">＋5s</button>
-    <button type="button" class="seek-btn" data-player="out" data-seek="10">＋10s</button>
+<div class="hrow">
+$compare_group  <span class="seek">
+    <button type="button" class="seek-btn" data-seek="-10">−10s</button>
+    <button type="button" class="seek-btn" data-seek="-5">−5s</button>
+    <button type="button" class="seek-btn" data-seek="5">＋5s</button>
+    <button type="button" class="seek-btn" data-seek="10">＋10s</button>
   </span>
+$transport_extra
 $export_area
 </div>
-$preview_panel
+</header>
+<div class="statusbar">
+$status_extra
+  <span class="stats">$stats</span>
+</div>
 <ul class="legend">
+  <li>凡例</li>
   <li><span class="w suggest">フィラー提案</span></li>
   <li><span class="w cut">カット済み</span></li>
-  <li><span class="line uts" style="display:inline">未転写発話候補</span></li>
+  <li><span class="line uts">未転写発話候補</span></li>
   <li><span class="w unsafe state">削除指定→安全判定で保持</span></li>
-  <li><span class="trim" style="display:inline">✂ 無音トリム</span></li>
+  <li><span class="trim">$scissors_icon無音トリム</span></li>
 $click_legend
 </ul>
-</div>
-<pre class="stats">$stats</pre>
 <div id="transcript">
 $transcript
 </div>
+<p class="kbd">$kbd_hints</p>
 <script id="sc-data" type="application/json">$data</script>
 <script>
 (function () {
   "use strict";
   var DATA = JSON.parse(document.getElementById("sc-data").textContent);
+  // preview は --serve のときだけ存在する（静的モードでは null）。
   var players = {
     src: document.getElementById("audio-src"),
-    out: document.getElementById("audio-out")
+    out: document.getElementById("audio-out"),
+    preview: document.getElementById("audio-preview")
   };
+  // mode: クリック再生の対象（src / out のみ。既存セマンティクスを保つ）
+  // viewMode: ヘッダーのスロットに表示中の audio（src / out / preview）
   var mode = "out";
+  var viewMode = "out";
   var stopAt = null;
   var current = null;
 
+  function eachPlayer(fn) {
+    Object.keys(players).forEach(function (key) {
+      if (players[key]) { fn(players[key], key); }
+    });
+  }
+
+  function pauseOthers(active) {
+    eachPlayer(function (p) { if (p !== active) { p.pause(); } });
+  }
+
   function play(t) {
     var audio = players[mode];
-    var other = players[mode === "src" ? "out" : "src"];
-    other.pause();
+    pauseOthers(audio);
     var from = Math.max(0, t - DATA.pad);
     stopAt = t + DATA.pad;
     current = audio;
@@ -804,8 +994,8 @@ $transcript
     audio.play();
   }
 
-  Object.keys(players).forEach(function (key) {
-    players[key].addEventListener("timeupdate", function () {
+  eachPlayer(function (p) {
+    p.addEventListener("timeupdate", function () {
       if (current === this && stopAt !== null && this.currentTime >= stopAt) {
         this.pause();
         stopAt = null;
@@ -838,26 +1028,42 @@ $transcript
     play(mode === "src" ? target.source : target.output);
   });
 
+  // モード切替は「ヘッダーに表示する audio」の切替（viewMode）と、
+  // 「クリック再生の対象を追従させるか」（syncMode）を分離する。
+  // syncMode=true はモードボタンのクリック由来で、src/out のときだけ mode
+  // を追従させ、現在案（preview）を選んでも行クリックの再生対象は直前の
+  // まま変えない（試聴のトリガは --serve 側）。
+  // syncMode=false は再生開始への自動追従（下の play イベント購読）用で、
+  // 表示だけを切り替え、mode（src/out の選択）には触れない。
+  function setViewMode(next, syncMode) {
+    if (!players[next]) { return; }
+    viewMode = next;
+    if (syncMode && next !== "preview") { mode = next; }
+    Array.prototype.forEach.call(
+      document.querySelectorAll(".mode"),
+      function (b) { b.classList.toggle("active", b.dataset.mode === next); }
+    );
+    eachPlayer(function (p, key) { p.classList.toggle("shown", key === next); });
+  }
+
   Array.prototype.forEach.call(
     document.querySelectorAll(".mode"),
     function (btn) {
-      btn.addEventListener("click", function () {
-        Array.prototype.forEach.call(
-          document.querySelectorAll(".mode"),
-          function (b) { b.classList.remove("active"); }
-        );
-        btn.classList.add("active");
-        mode = btn.dataset.mode;
-      });
+      btn.addEventListener("click", function () { setViewMode(btn.dataset.mode, true); });
     }
   );
 
-  // シークボタン（原音・編集後それぞれの currentTime を加減、0〜duration にクランプ）
+  // 再生が始まったプレイヤーへヘッダー表示を自動追従させる（mode は変えない）。
+  eachPlayer(function (p, key) {
+    p.addEventListener("play", function () { setViewMode(key, false); });
+  });
+
+  // シークボタン（表示中のプレイヤーの currentTime を加減、0〜duration にクランプ）
   Array.prototype.forEach.call(
     document.querySelectorAll(".seek-btn"),
     function (btn) {
       btn.addEventListener("click", function () {
-        var audio = players[btn.dataset.player];
+        var audio = players[viewMode];
         if (!audio) { return; }
         var dur = isFinite(audio.duration) ? audio.duration : Infinity;
         var next = audio.currentTime + Number(btn.dataset.seek);
@@ -865,6 +1071,82 @@ $transcript
       });
     }
   );
+
+  // J/K で active 行を移動して再生する。実際の再生はクリックと同じ経路に
+  // 委ねる（--serve では capture 段のハンドラが現在案プレビューへ振り替える）
+  // ため、行要素へ合成クリックを送るだけにして分岐を二重に持たない。
+  function transcriptRows() {
+    return document.querySelectorAll("#transcript .line, #transcript .trim");
+  }
+
+  function moveActiveRow(delta) {
+    var rows = transcriptRows();
+    if (!rows.length) { return; }
+    var cur = document.querySelector("#transcript .active");
+    var index = Array.prototype.indexOf.call(rows, cur);
+    var next = index < 0
+      ? (delta > 0 ? 0 : rows.length - 1)
+      : Math.min(Math.max(index + delta, 0), rows.length - 1);
+    var row = rows[next];
+    row.scrollIntoView({ block: "nearest" });
+    row.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+  }
+
+  // 入力要素（フォーム部品・audio・contenteditable）にフォーカスがある間は
+  // キーボードショートカットを発火させない。
+  function isTypingTarget(ev) {
+    return !!(
+      ev.target && ev.target.closest &&
+      ev.target.closest("input, button, select, textarea, audio, [contenteditable]")
+    );
+  }
+
+  // H/L は表示モード切替（原音/保存済み/現在案を並び順の系列とみなし、
+  // vim 風に1つ左/右へ移動）。setViewMode を直接呼ばず対応する .mode
+  // ボタンへ合成クリックを送ることで、disabled の尊重や active 表示の
+  // 更新をクリック時と同じ経路に一本化する。disabled のボタン（初回試聴前
+  // の現在案）は候補から除外し、存在しないボタン（静的モードの現在案）は
+  // querySelectorAll に現れないため自然に除外される。端では止まる
+  // （ラップしない）。
+  function moveMode(delta) {
+    var buttons = Array.prototype.filter.call(
+      document.querySelectorAll(".mode"),
+      function (b) { return !b.disabled; }
+    );
+    if (!buttons.length) { return; }
+    var cur = document.querySelector(".mode.active");
+    var index = Array.prototype.indexOf.call(buttons, cur);
+    var next = index < 0
+      ? (delta > 0 ? 0 : buttons.length - 1)
+      : Math.min(Math.max(index + delta, 0), buttons.length - 1);
+    buttons[next].click();
+  }
+
+  document.addEventListener("keydown", function (ev) {
+    if (ev.metaKey || ev.ctrlKey || ev.altKey || ev.repeat) { return; }
+    if (isTypingTarget(ev)) { return; }
+    if (ev.code === "Space") {
+      var audio = players[viewMode];
+      // 表示中が現在案 preview で一度も試聴していなければ何もしない（再生する音が無い）。
+      if (viewMode === "preview" && !audio.currentSrc) { return; }
+      ev.preventDefault();
+      if (audio.paused) {
+        audio.play().catch(function () { /* 再生開始前の中断は無視する */ });
+      } else {
+        audio.pause();
+      }
+      return;
+    }
+    var key = (ev.key || "").toLowerCase();
+    if (key === "h" || key === "l") {
+      ev.preventDefault();
+      moveMode(key === "h" ? -1 : 1);
+      return;
+    }
+    if (key !== "j" && key !== "k") { return; }
+    ev.preventDefault();
+    moveActiveRow(key === "j" ? 1 : -1);
+  });
 })();
 </script>
 $serve_script
@@ -873,11 +1155,17 @@ $serve_script
 """)
 
 
-# --serve 時だけ差し込む速度コントロール＋保存ボタン（1段目右端、原音プレイヤー
-# と余白/区切りで分離。配置順は 速度→保存→通知 で固定する）
-_SAVE_AREA = Template("""<span class="save-area">
-  <span class="speed-controls" id="speed-controls">
-    速度
+# --serve 時だけ差し込むヘッダー1行目右端の保存ボタン（通知はボタンの左隣）
+_SAVE_AREA = Template("""  <span class="save-area">
+    <span class="msg" id="save-msg"></span>
+    <button type="button" id="save" disabled>保存済み</button>
+  </span>""")
+
+# --serve 時だけ差し込むヘッダー2行目の中央部（速度・絶対時刻）。試聴範囲
+# （前後 padbtn）は比較/試聴グループ側（_COMPARE_GROUP_SERVE）に属するため
+# ここには含めない。配置順は 速度→絶対時刻 で固定する。
+_TRANSPORT_EXTRA = Template("""  <span class="speed-controls" id="speed-controls">
+    <span class="label">速度</span>
     <select class="speed-select" id="speed-select">
       <option value="1.25">x1.25</option>
       <option value="1.5" selected>x1.5</option>
@@ -886,34 +1174,70 @@ _SAVE_AREA = Template("""<span class="save-area">
     </select>
     <button type="button" class="speed-toggle" id="speed-toggle">OFF</button>
   </span>
-  <span class="msg" id="save-msg"></span>
-  <button type="button" id="save" disabled>保存済み</button>
-</span>""")
+  <span class="abs-times">対象 原音 <b id="abs-target">--:--.-</b> → 現在案 <b id="abs-center">--:--.-</b></span>""")
 
-# --serve 時だけ差し込む FCPXML 書き出しボタン（2段目右端。インタフェースを
-# 4段＝原音/保存済み/現在案/凡例に収めるため、保存済みプレイヤーの行へ置く）。
-# 書き出し結果の通知はボタンの隣に出し、成功時は自動で消す（1段目に出すと
-# 保存ボタン周りを圧迫するため）。
-_EXPORT_AREA = Template("""<span class="save-area">
-  <span class="msg" id="export-msg"></span>
-  <button type="button" id="export" title="$export_title">XML出力</button>
-</span>""")
+# --serve 時だけ差し込むヘッダー2行目右端の FCPXML 書き出しボタン。
+# 書き出し結果の通知はボタンの左隣に出し、成功時は自動で消す（保存と同じ規則）。
+_EXPORT_AREA = Template("""  <span class="save-area">
+    <span class="msg" id="export-msg"></span>
+    <button type="button" id="export" title="$export_title">XML出力</button>
+  </span>""")
 
+# --serve 時だけ差し込むステータスバー左側（現在案の状態ラベルとエラー通知）。
+_STATUS_EXTRA = """  <span class="cur" id="preview-state">現在案：未選択</span>
+  <span class="msg" id="preview-msg"></span>"""
 
-# --serve 時だけ差し込む3段目（現在案の状態ラベル・audio・試聴範囲切替・対象/現在案の絶対時刻）。
-# デスクトップでは1行（nowrap）、狭い画面だけ preview-panel の media query で折り返す。
-_PREVIEW_PANEL = """<div class="player-row preview-panel">
-  <span class="state-label" id="preview-state">現在案：未選択</span>
-  <audio id="audio-preview" controls preload="none"></audio>
-  <span class="pad-select">
-    範囲
-    <button type="button" class="padbtn" data-pad="2">2秒</button>
-    <button type="button" class="padbtn active" data-pad="4">4秒</button>
-    <button type="button" class="padbtn" data-pad="8">8秒</button>
+# --serve 時だけヘッダーへ足す audio（現在案）。
+_AUDIO_PREVIEW = (
+    '    <audio id="audio-preview" controls preload="none" class="player"></audio>'
+)
+
+# ヘッダー2行目の左側（比較 / 試聴）。静的モードは「比較」の2択のみで見出しは
+# 付けない。--serve は「比較」（原音/保存済み）と「試聴」（現在案 ＋ 前後）を
+# ヘアラインで分け、意味の非対称（比較の2択 / 未保存編集の試聴）を構成で示す。
+_COMPARE_GROUP_STATIC = Template("""  <span class="group">
+    <span class="seg">
+      <button type="button" class="mode" data-mode="src">原音</button>
+      <button type="button" class="mode active" data-mode="out">保存済み</button>
+    </span>
   </span>
-  <span class="abs-times">対象 原音 <b id="abs-target">--:--.-</b> → 現在案 <b id="abs-center">--:--.-</b></span>
-  <span class="msg" id="preview-msg"></span>
-</div>"""
+""")
+_COMPARE_GROUP_SERVE = Template("""  <span class="group">
+    <span class="label">比較</span>
+    <span class="seg">
+      <button type="button" class="mode" data-mode="src">原音</button>
+      <button type="button" class="mode active" data-mode="out">保存済み</button>
+    </span>
+  </span>
+  <span class="group-divider"></span>
+  <span class="group">
+    <span class="label">試聴</span>
+    <button type="button" class="mode mode-solo" id="mode-preview" data-mode="preview"
+      disabled title="編集中（未保存）の現在案を前後のみ試聴">現在案</button>
+    <span class="pad-select">
+      <span class="label">前後</span>
+      <button type="button" class="padbtn" data-pad="2">2秒</button>
+      <button type="button" class="padbtn active" data-pad="4">4秒</button>
+      <button type="button" class="padbtn" data-pad="8">8秒</button>
+    </span>
+  </span>
+""")
+
+# キーボード操作ヒント（serve 専用キーは serve のときだけ出す）。
+_KBD_MOVE = "<span><b>J</b> / <b>K</b> 行移動・再生</span>"
+_KBD_HINTS_STATIC = (
+    "<span><b>Space</b> 再生 / 停止</span>"
+    "<span><b>H</b> / <b>L</b> 表示切替</span>"
+    + _KBD_MOVE
+)
+_KBD_HINTS_SERVE = (
+    "<span><b>Space</b> 再生 / 停止</span>"
+    "<span><b>H</b> / <b>L</b> 表示切替</span>"
+    + _KBD_MOVE
+    + "<span><b>X</b> 削除トグル</span>"
+    "<span><b>P</b> 現在案を試聴</span>"
+    "<span><b>S</b> 保存</span>"
+)
 
 
 # --serve 時だけ差し込む対話スクリプト（トグル→即試聴→保存）
@@ -926,6 +1250,7 @@ _SERVE_SCRIPT = """<script>
   var preview = document.getElementById("audio-preview");
   var audioSrc = document.getElementById("audio-src");
   var audioOut = document.getElementById("audio-out");
+  var previewModeBtn = document.getElementById("mode-preview");
   var saveBtn = document.getElementById("save");
   var exportBtn = document.getElementById("export");
   var saveMsg = document.getElementById("save-msg");
@@ -953,16 +1278,13 @@ _SERVE_SCRIPT = """<script>
   var generation = 0;
 
   var allPlayers = [audioSrc, audioOut, preview];
-  // Space キー操作の対象（直近に再生・停止した audio）。既定は現在案 preview。
-  var lastPlayer = preview;
 
   // 排他再生。いずれかの audio が再生開始したら他2つを止める（3つの audio が
-  // 同時に鳴らないようにする）。lastPlayer もその audio に更新する。
+  // 同時に鳴らないようにする）。
   function pauseOtherPlayers(active) {
     allPlayers.forEach(function (other) {
       if (other !== active) { other.pause(); }
     });
-    lastPlayer = active;
   }
 
   allPlayers.forEach(function (player) {
@@ -976,7 +1298,7 @@ _SERVE_SCRIPT = """<script>
   //
   // 状態モデル: selectedSpeed（select の値）／speedEnabled（toggle の状態）／
   // currentSpeed = speedEnabled ? selectedSpeed : 1。速度ハンドラは
-  // playbackRate と表示更新だけを行い、currentPad/currentTarget/lastPlayer・
+  // playbackRate と表示更新だけを行い、currentPad/currentTarget・
   // play/pause/load/src/currentTime・試聴範囲の active には一切触れない
   // （padbtn を共有していた旧速度ボタンが試聴範囲ハンドラに誤反応していた
   // バグの再発防止のため、クラスも selector も完全に分離する）。
@@ -1037,6 +1359,58 @@ _SERVE_SCRIPT = """<script>
     return found;
   }
 
+  // 行要素（.line）に対応する json セグメント（data-i は json 順の index）。
+  function segmentOfLine(el) {
+    return el ? DATA.segments[Number(el.dataset.i)] : null;
+  }
+
+  // その行が削除指定中か（並び替えの可否・スワップ相手の判定に使う）。
+  function rowDeleted(el) {
+    var seg = segmentOfLine(el);
+    return !!(seg && seg.requested_delete);
+  }
+
+  // DOM の行順から DATA.order（全 ID の順列）を作り直す。トリム擬似行は
+  // TXT の行ではないので order には含めない。
+  function rebuildOrder() {
+    var ids = [];
+    Array.prototype.forEach.call(
+      document.querySelectorAll("#transcript .line"),
+      function (el) {
+        var seg = segmentOfLine(el);
+        if (seg) { ids.push(seg.id); }
+      }
+    );
+    DATA.order = ids;
+  }
+
+  // 入れ替え相手の隣接行。トリム擬似行と削除指定中の行は飛ばす（TXT に行が
+  // 無いものと入れ替えても意味が無いため）。端まで到達したら null（no-op）。
+  function swapSibling(line, dir) {
+    var node = dir < 0 ? line.previousElementSibling : line.nextElementSibling;
+    while (node) {
+      if (node.classList.contains("line") && !rowDeleted(node)) { return node; }
+      node = dir < 0 ? node.previousElementSibling : node.nextElementSibling;
+    }
+    return null;
+  }
+
+  // 行を1つ上（dir<0）／下（dir>0）へ動かす。自動プレビューはしない
+  // （▲▼は連打されるため。保存/クリック時に現在の順序で作り直される）。
+  function moveLine(line, dir) {
+    var other = swapSibling(line, dir);
+    if (!other) { return; }
+    var parent = line.parentNode;
+    if (dir < 0) {
+      parent.insertBefore(line, other);
+    } else {
+      parent.insertBefore(other, line);
+    }
+    rebuildOrder();
+    updateSaveButton();
+    clearPreviewCache();
+  }
+
   function snapshot() {
     var s = {};
     DATA.segments.forEach(function (seg) {
@@ -1045,6 +1419,8 @@ _SERVE_SCRIPT = """<script>
         if (w.suggest) { s["W" + seg.id + ":" + w.index] = w.requested_delete; }
       });
     });
+    // 並び順は1つのキーにまとめる（何行動かしても dirty 件数は1件）。
+    s["O"] = DATA.order.join("\\n");
     return s;
   }
 
@@ -1117,6 +1493,15 @@ _SERVE_SCRIPT = """<script>
       document.querySelectorAll(".speed-select, .speed-toggle"),
       function (el) { el.disabled = value; }
     );
+    // 並び替えボタンは busy 解除時に一律 enable してはいけない（削除指定中の
+    // 行は常に disabled のまま）。busy と行の削除指定の論理和で決める。
+    Array.prototype.forEach.call(
+      document.querySelectorAll(".mv button"),
+      function (btn) {
+        var line = btn.closest(".line");
+        btn.disabled = value || (line ? rowDeleted(line) : false);
+      }
+    );
     updateSaveButton();
     updateExportButton();
   }
@@ -1187,24 +1572,41 @@ _SERVE_SCRIPT = """<script>
       return unsafeReason === "pause" ? "ポーズ不足のため保持" : "unsafeのため保持";
     }
     if (effective) { return "削除（手動編集）"; }
-    return "保持";
+    return ""; // 保持は例外ではないため表示しない
+  }
+
+  // state_css_class（Python 側）と同じ判定。del/manual は枠付きバッジ、
+  // unsafe は赤太字テキストのまま（バッジ化しない）。
+  function stateClass(requested, effective) {
+    if (requested && effective) { return "del"; }
+    if (requested) { return "unsafe"; }
+    if (effective) { return "manual"; }
+    return "";
   }
 
   function applyStates() {
     DATA.segments.forEach(function (seg) {
       var line = document.querySelector('.line[data-i="' + seg.index + '"]');
       if (!line) { return; }
-      var isUnsafe = seg.requested_delete && !seg.effective_delete;
+      var cls = stateClass(seg.requested_delete, seg.effective_delete);
+      var isUnsafe = cls === "unsafe";
       line.classList.toggle("deleted", seg.effective_delete);
       line.classList.toggle("unsafe", isUnsafe);
       var box = line.querySelector("input.del");
       if (box) { box.checked = seg.requested_delete; }
+      // 削除指定中の行は並び替えできない（busy 中も操作させない）。
+      Array.prototype.forEach.call(
+        line.querySelectorAll(".mv button"),
+        function (btn) { btn.disabled = busy || seg.requested_delete; }
+      );
       var state = line.querySelector(".state");
       if (state) {
         state.textContent = stateLabel(
           seg.requested_delete, seg.effective_delete, seg.unsafe_reason
         );
-        state.classList.toggle("unsafe", isUnsafe);
+        state.classList.toggle("unsafe", cls === "unsafe");
+        state.classList.toggle("del", cls === "del");
+        state.classList.toggle("manual", cls === "manual");
       }
       seg.words.forEach(function (w) {
         var span = line.querySelector('.w[data-w="' + w.index + '"]');
@@ -1337,7 +1739,7 @@ _SERVE_SCRIPT = """<script>
         mergeSavedStates(payload.segments);
         applyStates();
         if (payload.stats) {
-          document.querySelector(".stats").textContent = payload.stats.join("\\n");
+          document.querySelector(".stats").textContent = payload.stats.join(" · ");
         }
       }
     }
@@ -1367,7 +1769,9 @@ _SERVE_SCRIPT = """<script>
     setControlsBusy(true, "preview");
     noteState("試聴を生成中…");
     clearPreviewError();
-    post("/preview", { toggles: toggles(), target: target, pad_s: requestPad })
+    post("/preview", {
+      toggles: toggles(), order: DATA.order, target: target, pad_s: requestPad
+    })
       .then(function (payload) {
         // この応答より後に新しい操作（トグル/保存）が始まっていたら、
         // 画面の状態を巻き戻さないよう破棄する。
@@ -1392,6 +1796,9 @@ _SERVE_SCRIPT = """<script>
         updateAbsTimes(entry);
         preview.src = url;
         preview.load();
+        // 初回の試聴生成が完了するまで「現在案」ボタンは disabled のまま
+        // （src が無い preview を選ばせないため）。以降は毎回 no-op。
+        previewModeBtn.disabled = false;
         var playing = preview.play();
         if (playing && playing.catch) { playing.catch(function () {}); }
       })
@@ -1470,6 +1877,15 @@ _SERVE_SCRIPT = """<script>
   // 通常クリック＝3段目「現在案プレビュー」。無音トリムは対象が無いため上段
   // プレイヤーの既定動作（本文スクリプト側）に委ねる。
   document.getElementById("transcript").addEventListener("click", function (ev) {
+    // 並び替え（▲▼）は再生を伴わない操作なので、行クリックの再生経路へは
+    // 一切渡さない（本文スクリプト側の既定動作も止める）。
+    var mvBtn = ev.target.closest(".mv button");
+    if (mvBtn) {
+      ev.stopPropagation();
+      if (busy || mvBtn.disabled) { return; }
+      moveLine(mvBtn.closest(".line"), mvBtn.classList.contains("up") ? -1 : 1);
+      return;
+    }
     if (ev.target.closest("input, label.wt")) { return; }
     if (ev.target.closest(".trim")) { return; }
     var line = ev.target.closest(".line");
@@ -1553,7 +1969,7 @@ _SERVE_SCRIPT = """<script>
     if (busy || !dirty) { return; }
     var myGeneration = ++generation;
     setControlsBusy(true, "save");
-    post("/save", { toggles: toggles() })
+    post("/save", { toggles: toggles(), order: DATA.order })
       .then(function (payload) {
         if (myGeneration !== generation) { return; }
         // /save は常に TXT を書き保存済み音声を作り直す（既存契約は
@@ -1585,7 +2001,7 @@ _SERVE_SCRIPT = """<script>
     if (busy) { return; }
     var myGeneration = ++generation;
     setControlsBusy(true, "export");
-    post("/export", { toggles: toggles() })
+    post("/export", { toggles: toggles(), order: DATA.order })
       .then(function (payload) {
         if (myGeneration !== generation) { return; }
         applyReviewPayload(payload, { commitBaseline: payload.txt_saved === true });
@@ -1603,24 +2019,44 @@ _SERVE_SCRIPT = """<script>
       });
   });
 
-  // Space キーで lastPlayer（直近に操作した audio）を再生/停止する。
-  // フォーム操作・修飾キー・キーリピート中は横取りしない。
-  document.addEventListener("keydown", function (ev) {
-    if (ev.code !== "Space") { return; }
-    if (ev.metaKey || ev.ctrlKey || ev.altKey || ev.repeat) { return; }
-    if (
+  // active 行（トリム擬似行は対象外）の削除チェックボックスを反転する。
+  // change を明示的に発火させ、クリック操作と同じ経路（試聴の再生成・保存
+  // ボタン更新）を通す。busy 中と disabled のチェックボックスは無視する。
+  function toggleActiveLineDelete() {
+    var line = document.querySelector("#transcript .line.active");
+    if (!line || busy) { return; }
+    var box = line.querySelector("input.del");
+    if (!box || box.disabled) { return; }
+    box.checked = !box.checked;
+    box.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  // 入力要素にフォーカスがある間はキーボードショートカットを発火させない。
+  function isTypingTarget(ev) {
+    return !!(
       ev.target && ev.target.closest &&
       ev.target.closest("input, button, select, textarea, audio, [contenteditable]")
-    ) {
-      return;
-    }
-    // 現在案 preview が一度も生成されていなければ何もしない（再生する音が無い）。
-    if (lastPlayer === preview && !preview.currentSrc) { return; }
-    ev.preventDefault();
-    if (lastPlayer.paused) {
-      lastPlayer.play();
-    } else {
-      lastPlayer.pause();
+    );
+  }
+
+  // X/P/S は --serve 専用の操作（削除トグル／現在案を試聴／保存）。
+  // J/K（行移動）・Space（再生/停止）は本文スクリプト側が持つ。
+  // 修飾キー・キーリピート中は横取りしない。
+  document.addEventListener("keydown", function (ev) {
+    if (ev.metaKey || ev.ctrlKey || ev.altKey || ev.repeat) { return; }
+    if (isTypingTarget(ev)) { return; }
+    var key = (ev.key || "").toLowerCase();
+    if (key === "x") {
+      ev.preventDefault();
+      toggleActiveLineDelete();
+    } else if (key === "p") {
+      ev.preventDefault();
+      if (busy || !currentTarget) { return; }
+      playCurrentPlan(currentTarget);
+    } else if (key === "s") {
+      ev.preventDefault();
+      if (saveBtn.disabled) { return; }
+      saveBtn.click();
     }
   });
 
@@ -1658,12 +2094,20 @@ def render_html(review: dict) -> str:
         subtitle=escape(HLYST_SUBTITLE),
         save_area=save_area,
         export_area=export_area,
-        preview_panel=_PREVIEW_PANEL if serve else "",
+        transport_extra=_TRANSPORT_EXTRA.substitute() if serve else "",
+        status_extra=_STATUS_EXTRA if serve else "",
+        audio_preview=_AUDIO_PREVIEW if serve else "",
+        compare_group=(
+            _COMPARE_GROUP_SERVE.substitute() if serve else _COMPARE_GROUP_STATIC.substitute()
+        ),
+        kbd_hints=_KBD_HINTS_SERVE if serve else _KBD_HINTS_STATIC,
+        scissors_icon=_ICON_SCISSORS,
         click_legend=click_legend,
         serve_script=_SERVE_SCRIPT if serve else "",
         source_audio=escape(review["source_audio"], quote=True),
         review_audio=escape(review["review_audio"], quote=True),
-        stats=escape("\n".join(review["stats"])),
+        # ステータスバーは1行のため、複数行の統計を中黒で連結して1行にする
+        stats=escape(" · ".join(review["stats"])),
         transcript=_transcript_markup(review),
         data=_embed_json(review),
     )
@@ -1708,19 +2152,20 @@ def review(
 
     json_path = out_dir / f"{plan.base_name}.sc.json"
     data = json.loads(json_path.read_text(encoding="utf-8"))
-    kept_ids = {
+    kept_order = [
         seg_id
         for seg_id, _text, _brackets in parse_edited_txt(
             plan.txt_path.read_text(encoding="utf-8")
         )
-    }
+    ]
 
     review_data = build_review_data(
         plan,
         data,
-        kept_ids,
+        set(kept_order),
         source_audio=_relative_media(plan.source_wav, out_dir),
         review_audio=_relative_media(wav_path, out_dir),
+        display_order=compute_display_order(kept_order, data),
     )
     html_path.write_text(render_html(review_data), encoding="utf-8")
 

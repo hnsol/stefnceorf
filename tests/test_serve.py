@@ -496,6 +496,164 @@ def test_apply_toggles_error_when_word_manually_deleted(tmp_path):
         )
 
 
+# ---- 行の並び替え（order） ----
+
+def _apply_ordered(tmp_path, text, toggles, order):
+    return serve.apply_toggles(text, _data(tmp_path), _fillers(), toggles, order)
+
+
+_JSON_ORDER = ["0001", "0002", "0003", "0004"]
+
+
+def test_validate_order_absent_is_none(tmp_path):
+    _make_project(tmp_path)
+    assert serve._validate_order(None, _data(tmp_path)) is None
+
+
+def test_validate_order_accepts_permutation(tmp_path):
+    _make_project(tmp_path)
+    order = ["0003", "0001", "0004", "0002"]
+    assert serve._validate_order(order, _data(tmp_path)) == order
+
+
+def test_validate_order_rejects_unknown_id(tmp_path):
+    _make_project(tmp_path)
+    with pytest.raises(ValueError, match="存在しない"):
+        serve._validate_order(["0001", "0002", "0003", "9999"], _data(tmp_path))
+
+
+def test_validate_order_rejects_missing_id(tmp_path):
+    _make_project(tmp_path)
+    with pytest.raises(ValueError, match="含まれない"):
+        serve._validate_order(["0001", "0002", "0003"], _data(tmp_path))
+
+
+def test_validate_order_rejects_duplicate(tmp_path):
+    _make_project(tmp_path)
+    with pytest.raises(ValueError, match="重複"):
+        serve._validate_order(
+            ["0001", "0001", "0002", "0003", "0004"], _data(tmp_path)
+        )
+
+
+def test_validate_order_rejects_non_list(tmp_path):
+    _make_project(tmp_path)
+    with pytest.raises(ValueError, match="配列"):
+        serve._validate_order("0001", _data(tmp_path))
+
+
+def test_apply_toggles_order_unchanged_keeps_bytes_identical(tmp_path):
+    """表示順が現状どおりなら1バイトも変わらない（保存も .bak も起きない）。"""
+    _make_project(tmp_path)
+    text = (
+        "[0001 0:00] あ、〔えー〕い。\n"
+        "[0002 0:02] 〔未転写発話 1.0秒〕\n"
+        "\n"
+        "[0003 0:03] う！\n"
+        "[0004 0:07] そう〔あの〕ね\n"
+    )
+    out = _apply_ordered(
+        tmp_path, text, _all_toggles(tmp_path, text), list(_JSON_ORDER)
+    )
+    assert out == text
+
+
+def test_apply_toggles_order_moves_line_up(tmp_path):
+    """上へ移動しても行のバイト列は同一で、空行は元の位置に残る。"""
+    _make_project(tmp_path)
+    text = (
+        "[0001 0:00] あ、〔えー〕い。\n"
+        "[0002 0:02] 〔未転写発話 1.0秒〕\n"
+        "\n"
+        "[0003 0:03] う！\n"
+        "[0004 0:07] そう〔あの〕ね\n"
+    )
+    out = _apply_ordered(
+        tmp_path, text, [], ["0003", "0001", "0002", "0004"]
+    )
+    lines = out.splitlines(keepends=True)
+    assert [serve.line_segment_id(x) for x in lines] == [
+        "0003", "0001", None, "0002", "0004"
+    ]
+    assert lines[0] == "[0003 0:03] う！\n"   # 移動した行の本文は不変
+    assert lines[2] == "\n"                   # 空行はバイト位置を維持
+
+
+def test_apply_toggles_order_moves_line_down(tmp_path):
+    _make_project(tmp_path)
+    out = _apply_ordered(
+        tmp_path, _TXT, [], ["0002", "0001", "0003", "0004"]
+    )
+    lines = out.splitlines(keepends=True)
+    assert [serve.line_segment_id(x) for x in lines] == [
+        "0002", "0001", "0003", "0004"
+    ]
+    assert set(lines) == set(_TXT.splitlines(keepends=True))
+
+
+def test_apply_toggles_order_is_idempotent(tmp_path):
+    """同じ order を2回適用しても結果は変わらない（冪等）。"""
+    _make_project(tmp_path)
+    order = ["0004", "0001", "0002", "0003"]
+    once = _apply_ordered(tmp_path, _TXT, [], order)
+    twice = _apply_ordered(tmp_path, once, [], order)
+    assert twice == once
+
+
+def test_apply_toggles_order_with_delete_in_same_call(tmp_path):
+    """削除と移動を同時に指定しても、残った行が order どおりに並ぶ。"""
+    _make_project(tmp_path)
+    out = _apply_ordered(
+        tmp_path, _TXT,
+        [{"type": "line", "id": "0003", "delete": True}],
+        ["0004", "0001", "0002", "0003"],
+    )
+    assert [serve.line_segment_id(x) for x in out.splitlines()] == [
+        "0004", "0001", "0002"
+    ]
+
+
+def test_apply_toggles_order_restores_line_at_display_position(tmp_path):
+    """order 付きの復活は json 順ではなく表示順の位置へ挿入される。"""
+    _make_project(tmp_path)
+    text = "[0001 0:00] あ〔えー〕い\n[0004 0:07] そう〔あの〕ね\n"
+    out = _apply_ordered(
+        tmp_path, text,
+        [{"type": "line", "id": "0003", "delete": False}],
+        ["0003", "0001", "0002", "0004"],
+    )
+    lines = out.splitlines()
+    assert [serve.line_segment_id(x) for x in lines] == ["0003", "0001", "0004"]
+    assert lines[0] == "[0003 0:03] う"
+
+
+def test_apply_toggles_order_ignores_deleted_ids(tmp_path):
+    """order に削除済み ID が混ざっていても、残っている行だけが並べ替えられる。"""
+    _make_project(tmp_path)
+    text = "[0001 0:00] あ〔えー〕い\n[0004 0:07] そう〔あの〕ね\n"
+    out = _apply_ordered(
+        tmp_path, text, [], ["0002", "0004", "0003", "0001"]
+    )
+    assert [serve.line_segment_id(x) for x in out.splitlines()] == ["0004", "0001"]
+
+
+def test_apply_toggles_order_keeps_missing_final_newline(tmp_path):
+    """末尾に改行が無いファイルは、並べ替え後も末尾だけ改行なしのまま。"""
+    _make_project(tmp_path)
+    text = "[0001 0:00] あ〔えー〕い\n[0003 0:03] う"
+    out = _apply_ordered(
+        tmp_path, text, [], ["0003", "0001", "0002", "0004"]
+    )
+    assert out == "[0003 0:03] う\n[0001 0:00] あ〔えー〕い"
+
+
+def test_apply_toggles_without_order_keeps_txt_order(tmp_path):
+    """order 省略時は並べ替えを行わない（後方互換）。"""
+    _make_project(tmp_path)
+    text = "[0003 0:03] う\n[0001 0:00] あ〔えー〕い\n"
+    assert _apply(tmp_path, text, []) == text
+
+
 # ---- requested_state ----
 
 def test_requested_state_reflects_brackets_and_missing_lines(tmp_path):
@@ -1885,3 +2043,78 @@ def test_export_serialized_with_preview_and_save(tmp_path, monkeypatch):
     session.save(toggles)
     session.export(toggles)
     assert seen == [True, True, True]
+
+
+# ---- 並び替えの HTTP 経路とセッション反映 ----
+
+def test_save_endpoint_reorders_txt(server):
+    """order 付きの /save で .sc.txt の行順が入れ替わる。"""
+    httpd, _url, txt = server
+    session = httpd.session
+    toggles = _all_toggles(_txt_dir(_txt_path(httpd)), session.raw_text)
+    status, _h, body = _post(
+        httpd, "/save",
+        {"toggles": toggles, "order": ["0003", "0001", "0002", "0004"]},
+    )
+    assert status == 200
+    assert json.loads(body)["version"] >= 2
+    lines = txt.read_text(encoding="utf-8").splitlines()
+    assert [serve.line_segment_id(x) for x in lines] == [
+        "0003", "0001", "0002", "0004"
+    ]
+
+
+def test_save_endpoint_rejects_invalid_order(server):
+    """未知 ID・欠落を含む order は 400 で拒否し、TXT を書かない。"""
+    httpd, _url, txt = server
+    before = txt.read_bytes()
+    for bad in (["0001", "0002", "0003", "9999"], ["0001", "0002"], "0001"):
+        status, _h, body = _post(
+            httpd, "/save", {"toggles": [], "order": bad}
+        )
+        assert status == 400
+        assert json.loads(body)["error"]
+    assert txt.read_bytes() == before
+
+
+def test_save_with_order_preserves_hand_edits(tmp_path):
+    """並び替えても手編集した本文・空行はバイト単位で保たれる（往復）。"""
+    text = (
+        "[0001 0:00] あ、〔えー〕い。\n"
+        "[0002 0:02] 〔未転写発話 1.0秒〕\n"
+        "\n"
+        "[0003 0:03] う！！\n"
+        "[0004 0:07] そう〔あの〕ね\n"
+    )
+    session, txt = _session(tmp_path, text)
+    toggles = _all_toggles(tmp_path, session.raw_text)
+    session.save(toggles, ["0003", "0001", "0002", "0004"])
+    moved = txt.read_text(encoding="utf-8")
+    assert moved.splitlines(keepends=True)[0] == "[0003 0:03] う！！\n"
+    assert "[0001 0:00] あ、〔えー〕い。\n" in moved
+
+    # 元の順序へ戻すと、最初のテキストへバイト単位で一致する
+    session.save(_all_toggles(tmp_path, moved), list(_JSON_ORDER))
+    assert txt.read_text(encoding="utf-8") == text
+
+
+def test_save_with_unchanged_order_does_not_write(tmp_path):
+    """順序が変わらない order を渡しても書き込み・.bak は起きない。"""
+    session, txt = _session(tmp_path)
+    before = txt.read_bytes()
+    version = session.version
+    session.save(_all_toggles(tmp_path, session.raw_text), list(_JSON_ORDER))
+    assert txt.read_bytes() == before
+    assert not (tmp_path / "input.sc.txt.bak").exists()
+    assert session.version == version + 1  # review.wav の作り直しだけは走る
+
+
+def test_review_data_order_follows_txt(tmp_path):
+    """表示順は json 順ではなく現在の TXT の行順（削除済みは近傍規則で挿入）。"""
+    text = "[0003 0:03] う\n[0001 0:00] あ〔えー〕い\n"
+    session, _txt = _session(tmp_path, text)
+    data = session.review_data(session.raw_text, session.plan)
+    # 0002 は json 順で直後の生存行 0003 の前、0004 は直前の生存行 0003 の後ろ
+    assert data["order"] == ["0002", "0003", "0004", "0001"]
+    # segments は json 順のまま（data-i の意味を変えない）
+    assert [s["id"] for s in data["segments"]] == list(_JSON_ORDER)
