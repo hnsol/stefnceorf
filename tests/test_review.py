@@ -1329,6 +1329,18 @@ def test_review_data_exposes_center_positions(tmp_path):
         assert {"center", "output_center"} <= set(seg["words"][0])
 
 
+def test_saved_positions_output_start_reuses_existing_output_field(tmp_path):
+    """savedPositions の outputStart は新規フィールドではなく既存の
+    seg.output / w.output をそのまま参照する（O キー／Shift+クリック用）。"""
+    html, _rd = _serve_html(tmp_path)
+    capture_body = html.split("function capturePositions(segments) {")[1].split(
+        "\n  }"
+    )[0]
+    assert "outputStart: seg.output" in capture_body
+    assert "outputStart: w.output" in capture_body
+    assert "output_start" not in html
+
+
 # ---- preview範囲変更の競合をなくす（Hlyst UX 改修 Task 2） ----
 
 def test_preview_freezes_pad_for_request_and_cache_key(tmp_path):
@@ -1483,10 +1495,14 @@ def _shift_branch(html):
 def test_shift_click_plays_saved_without_preview(tmp_path):
     html, _rd = _serve_html(tmp_path)
     branch = _shift_branch(html)
-    assert "audioOut.play" in branch
+    assert "playSavedFrom(target)" in branch
     assert "playCurrentPlan" not in branch
     assert "post(" not in branch
     assert "previewCache" not in branch
+    play_saved_from_body = html.split(
+        "function playSavedFrom(target) {"
+    )[1].split("\n  }")[0]
+    assert "audioOut.play" in play_saved_from_body
 
 
 def test_shift_click_sets_active_target(tmp_path):
@@ -1521,19 +1537,25 @@ def test_shift_click_respects_busy_guard(tmp_path):
 
 def test_shift_click_without_saved_position_does_not_play(tmp_path):
     html, _rd = _serve_html(tmp_path)
-    branch = _shift_branch(html)
-    assert "savedPositionFor(target)" in branch
-    assert "notePreviewError(" in branch
-    guard = branch.split("if (!savedPositionFor(target)) {")[1].split("}")[0]
+    play_saved_from_body = html.split(
+        "function playSavedFrom(target) {"
+    )[1].split("\n  }")[0]
+    assert "savedPositionFor(target)" in play_saved_from_body
+    assert "notePreviewError(" in play_saved_from_body
+    guard = play_saved_from_body.split("if (!saved) {")[1].split("}")[0]
     assert "audioOut.play" not in guard
 
 
 def test_serve_ui_has_shift_click_legend(tmp_path):
     html, _rd = _serve_html(tmp_path)
-    assert "Shift+クリックで保存済みを再生" in html
+    # 旧: 凡例（<ul class="legend">）に載せていたが、下部キーボードヒントへ移した
+    # （重複表示を避けるため凡例側は削除）。
+    legend = html.split('<ul class="legend">')[1].split("</ul>")[0]
+    assert "Shift" not in legend
+    assert "保存済みをクリック位置から再生" in html
 
     static_html, _srd = _html(tmp_path)
-    assert "Shift+クリックで保存済みを再生" not in static_html
+    assert "保存済みをクリック位置から再生" not in static_html
 
 
 # ---- 排他再生とSpaceキー操作（Hlyst UX 改修 Task 5） ----
@@ -1614,7 +1636,7 @@ def test_keyboard_shortcuts_ignore_focused_inputs(tmp_path):
 
 
 def test_serve_keyboard_has_delete_preview_save_shortcuts(tmp_path):
-    """--serve では X=削除トグル / P=現在案を試聴 / S=保存。"""
+    """--serve では X=削除トグル / P=現在案を試聴 / S=保存 / O=保存済みをその位置から。"""
     html, _rd = _serve_html(tmp_path)
     serve_script = html.split("if (!DATA.serve) { return; }")[1]
     keydown = _keydown_body(html, serve_script)
@@ -1624,6 +1646,8 @@ def test_serve_keyboard_has_delete_preview_save_shortcuts(tmp_path):
     assert "playCurrentPlan(currentTarget);" in keydown
     assert 'else if (key === "s") {' in keydown
     assert "saveBtn.click();" in keydown
+    assert 'else if (key === "o") {' in keydown
+    assert "playSavedFrom(currentTarget);" in keydown
     # 削除トグルは change を発火させ、クリック時と同じ経路（試聴の再生成）を通す
     toggle_body = html.split("function toggleActiveLineDelete() {")[1].split("\n  }")[0]
     assert "if (!line || busy) { return; }" in toggle_body

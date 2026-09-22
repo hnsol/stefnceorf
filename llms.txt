@@ -12,7 +12,7 @@ Stefnceorf transcribes a WAV with Whisper (mlx-whisper on Apple Silicon GPU), re
 
 1. Record → noise reduction (Audacity) → `sc episode.wav` → import the FCPXML into Logic Pro (primary one-command flow)
 2. Optional fine control: `sc transcribe input.wav`, then edit `.sc.txt` in any text editor (delete lines/words, reorder lines)
-3. `sc review input.sc.txt` — Hlyst, a single-transport browser A/B workspace for original-vs-edited listening from a real render; `--serve` adds checkbox toggles, keyboard editing (Space/J/K/H/L/X/P/S), line reordering, instant preview, saving back to `.sc.txt`, and in-browser FCPXML export
+3. `sc review input.sc.txt` — Hlyst, a single-transport browser A/B workspace for original-vs-edited listening from a real render; `--serve` adds checkbox toggles, keyboard editing (Space/J/K/H/L/X/P/S/O), line reordering, instant preview, saving back to `.sc.txt`, and in-browser FCPXML export
 4. `sc render input.sc.txt` (edited WAV) or `sc logic input.sc.txt` (FCPXML for Logic Pro)
 
 ## Key Capabilities

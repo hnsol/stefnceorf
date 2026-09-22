@@ -1237,6 +1237,8 @@ _KBD_HINTS_SERVE = (
     + "<span><b>X</b> 削除トグル</span>"
     "<span><b>P</b> 現在案を試聴</span>"
     "<span><b>S</b> 保存</span>"
+    "<span><b>O</b> 保存済みをその位置から</span>"
+    "<span><b>Shift＋クリック</b> 保存済みをクリック位置から再生</span>"
 )
 
 
@@ -1654,7 +1656,7 @@ _SERVE_SCRIPT = """<script>
     return found;
   }
 
-  // 保存済み位置表（L<id> / W<id>:<word> -> {sourceCenter, outputCenter}）。
+  // 保存済み位置表（L<id> / W<id>:<word> -> {sourceCenter, outputCenter, outputStart}）。
   // /save 成功時（mergeSavedStates）だけ再構築する。preview の応答では
   // 触らない（未保存の試聴で保存済み位置がずれて見えることを防ぐ）。
   var savedPositions = {};
@@ -1664,12 +1666,14 @@ _SERVE_SCRIPT = """<script>
     segments.forEach(function (seg) {
       savedPositions["L" + seg.id] = {
         sourceCenter: seg.source_center,
-        outputCenter: seg.output_center
+        outputCenter: seg.output_center,
+        outputStart: seg.output
       };
       seg.words.forEach(function (w) {
         savedPositions["W" + seg.id + ":" + w.index] = {
           sourceCenter: w.center,
-          outputCenter: w.output_center
+          outputCenter: w.output_center,
+          outputStart: w.output
         };
       });
     });
@@ -1859,6 +1863,23 @@ _SERVE_SCRIPT = """<script>
     return savedPositions[targetKey(target)] || null;
   }
 
+  // 保存済み（review.wav）を対象の開始位置ちょうどから再生する。pad 秒手前
+  // ではなく対象そのものの開始位置（savedPositions[...].outputStart、既存の
+  // seg.output / w.output をそのまま使う）へシークする点が primeComparisonPlayers
+  // との違い。Shift+クリックと O キーの両方から呼ばれる共通経路。
+  function playSavedFrom(target) {
+    var saved = savedPositionFor(target);
+    if (!saved) {
+      notePreviewError("保存済み位置が不明です");
+      return;
+    }
+    try {
+      audioOut.currentTime = saved.outputStart;
+    } catch (e) { /* metadata 未読込 */ }
+    var playing = audioOut.play();
+    if (playing && playing.catch) { playing.catch(function () {}); }
+  }
+
   function setActiveLine(el) {
     var prev = document.querySelector(".line.active, .trim.active");
     if (prev) { prev.classList.remove("active"); }
@@ -1911,12 +1932,7 @@ _SERVE_SCRIPT = """<script>
     if (ev.shiftKey) {
       ev.preventDefault();          // Shift+click の既定動作（選択拡張）の抑止。
                                      // mousedown 起点のテキスト選択の完全防止は狙わない
-      if (!savedPositionFor(target)) {
-        notePreviewError("保存済み位置が不明です");
-        return;
-      }
-      var playing = audioOut.play();
-      if (playing && playing.catch) { playing.catch(function () {}); }
+      playSavedFrom(target);
       return;                       // preview へは進まない
     }
     playCurrentPlan(target);
@@ -2039,8 +2055,8 @@ _SERVE_SCRIPT = """<script>
     );
   }
 
-  // X/P/S は --serve 専用の操作（削除トグル／現在案を試聴／保存）。
-  // J/K（行移動）・Space（再生/停止）は本文スクリプト側が持つ。
+  // X/P/S/O は --serve 専用の操作（削除トグル／現在案を試聴／保存／保存済みを
+  // その位置から再生）。J/K（行移動）・Space（再生/停止）は本文スクリプト側が持つ。
   // 修飾キー・キーリピート中は横取りしない。
   document.addEventListener("keydown", function (ev) {
     if (ev.metaKey || ev.ctrlKey || ev.altKey || ev.repeat) { return; }
@@ -2057,6 +2073,13 @@ _SERVE_SCRIPT = """<script>
       ev.preventDefault();
       if (saveBtn.disabled) { return; }
       saveBtn.click();
+    } else if (key === "o") {
+      ev.preventDefault();
+      if (!currentTarget) {
+        notePreviewError("対象が選択されていません");
+        return;
+      }
+      playSavedFrom(currentTarget);
     }
   });
 
@@ -2077,8 +2100,9 @@ def render_html(review: dict) -> str:
     # serve（Hlyst 対話モード）はクリック＝現在案 preview 専用のため、静的モード専用の
     # 固定 pad 秒クリック説明はここでは出さない（serve モードへ固定の「前後2秒」を
     # 表示しない）。
+    # serve モードの Shift+クリック説明は下部キーボードヒントへ移した（重複表示を避ける）。
     click_legend = (
-        "<li>Shift+クリックで保存済みを再生</li>"
+        ""
         if serve
         else f'<li>行・単語をクリックすると前後 {review["pad"]:g} 秒を再生します</li>'
     )
