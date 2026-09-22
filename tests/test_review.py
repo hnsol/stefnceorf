@@ -1331,7 +1331,7 @@ def test_review_data_exposes_center_positions(tmp_path):
 
 def test_saved_positions_output_start_reuses_existing_output_field(tmp_path):
     """savedPositions の outputStart は新規フィールドではなく既存の
-    seg.output / w.output をそのまま参照する（O キー／Shift+クリック用）。"""
+    seg.output / w.output をそのまま参照する（O キー／Option+クリック用）。"""
     html, _rd = _serve_html(tmp_path)
     capture_body = html.split("function capturePositions(segments) {")[1].split(
         "\n  }"
@@ -1462,23 +1462,23 @@ def test_normal_click_primes_source_and_saved_then_plays_preview(tmp_path):
     click_handler = serve_script.split(
         'document.getElementById("transcript").addEventListener("click"'
     )[1].split("}, true);")[0]
-    assert "ev.altKey" not in click_handler
-    # 通常クリック経路（shift 分岐の外）に playCurrentPlan があること
-    before_shift, after_shift = click_handler.split("if (ev.shiftKey) {", 1)
-    normal_path = before_shift + after_shift[len(_shift_branch(html)) + 1:]
+    assert "ev.shiftKey" not in click_handler
+    # 通常クリック経路（alt 分岐の外）に playCurrentPlan があること
+    before_alt, after_alt = click_handler.split("if (ev.altKey) {", 1)
+    normal_path = before_alt + after_alt[len(_alt_branch(html)) + 1:]
     assert "playCurrentPlan(target);" in normal_path
-    assert "playCurrentPlan(target);" not in _shift_branch(html)
+    assert "playCurrentPlan(target);" not in _alt_branch(html)
 
 
-# ---- Shift+クリックで保存済みを再生（Hlyst: Shift+クリックで保存済みを再生） ----
+# ---- Option+クリックで保存済みを再生（Hlyst: Option+クリックで保存済みを再生） ----
 
 
-def _shift_branch(html):
+def _alt_branch(html):
     serve_script = html.split("if (!DATA.serve) { return; }")[1]
     click_handler = serve_script.split(
         'document.getElementById("transcript").addEventListener("click"'
     )[1].split("}, true);")[0]
-    after_if = click_handler.split("if (ev.shiftKey) {", 1)[1]
+    after_if = click_handler.split("if (ev.altKey) {", 1)[1]
     depth = 1
     end = 0
     for i, ch in enumerate(after_if):
@@ -1492,9 +1492,9 @@ def _shift_branch(html):
     return after_if[:end]
 
 
-def test_shift_click_plays_saved_without_preview(tmp_path):
+def test_alt_click_plays_saved_without_preview(tmp_path):
     html, _rd = _serve_html(tmp_path)
-    branch = _shift_branch(html)
+    branch = _alt_branch(html)
     assert "playSavedFrom(target)" in branch
     assert "playCurrentPlan" not in branch
     assert "post(" not in branch
@@ -1505,25 +1505,25 @@ def test_shift_click_plays_saved_without_preview(tmp_path):
     assert "audioOut.play" in play_saved_from_body
 
 
-def test_shift_click_sets_active_target(tmp_path):
+def test_alt_click_sets_active_target(tmp_path):
     html, _rd = _serve_html(tmp_path)
     serve_script = html.split("if (!DATA.serve) { return; }")[1]
     click_handler = serve_script.split(
         'document.getElementById("transcript").addEventListener("click"'
     )[1].split("}, true);")[0]
-    normal_path = click_handler.split("if (ev.shiftKey) {")[0]
-    shift_branch = _shift_branch(html)
-    # 通常・Shift 両経路が共通関数 selectTarget( を1回だけ通る
-    # （呼び出し箇所は shift 分岐に入る前の共通処理に1箇所だけ存在する）。
+    normal_path = click_handler.split("if (ev.altKey) {")[0]
+    alt_branch = _alt_branch(html)
+    # 通常・Option 両経路が共通関数 selectTarget( を1回だけ通る
+    # （呼び出し箇所は alt 分岐に入る前の共通処理に1箇所だけ存在する）。
     assert normal_path.count("selectTarget(line, target)") == 1
-    assert "selectTarget(" not in shift_branch
+    assert "selectTarget(" not in alt_branch
     play_current_plan_body = html.split(
         "function playCurrentPlan(target) {"
     )[1].split("\n  }")[0]
     assert "currentTarget =" not in play_current_plan_body
 
 
-def test_shift_click_respects_busy_guard(tmp_path):
+def test_alt_click_respects_busy_guard(tmp_path):
     html, _rd = _serve_html(tmp_path)
     serve_script = html.split("if (!DATA.serve) { return; }")[1]
     click_handler = serve_script.split(
@@ -1531,11 +1531,11 @@ def test_shift_click_respects_busy_guard(tmp_path):
     )[1].split("}, true);")[0]
     busy_idx = click_handler.index("if (busy) {")
     target_idx = click_handler.index("var target = wordData")
-    shift_idx = click_handler.index("if (ev.shiftKey) {")
-    assert busy_idx < target_idx < shift_idx
+    alt_idx = click_handler.index("if (ev.altKey) {")
+    assert busy_idx < target_idx < alt_idx
 
 
-def test_shift_click_without_saved_position_does_not_play(tmp_path):
+def test_alt_click_without_saved_position_does_not_play(tmp_path):
     html, _rd = _serve_html(tmp_path)
     play_saved_from_body = html.split(
         "function playSavedFrom(target) {"
@@ -1546,12 +1546,12 @@ def test_shift_click_without_saved_position_does_not_play(tmp_path):
     assert "audioOut.play" not in guard
 
 
-def test_serve_ui_has_shift_click_legend(tmp_path):
+def test_serve_ui_has_alt_click_legend(tmp_path):
     html, _rd = _serve_html(tmp_path)
     # 旧: 凡例（<ul class="legend">）に載せていたが、下部キーボードヒントへ移した
     # （重複表示を避けるため凡例側は削除）。
     legend = html.split('<ul class="legend">')[1].split("</ul>")[0]
-    assert "Shift" not in legend
+    assert "Option" not in legend
     assert "保存済みをクリック位置から再生" in html
 
     static_html, _srd = _html(tmp_path)

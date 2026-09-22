@@ -1238,7 +1238,7 @@ _KBD_HINTS_SERVE = (
     "<span><b>P</b> 現在案を試聴</span>"
     "<span><b>S</b> 保存</span>"
     "<span><b>O</b> 保存済みをその位置から</span>"
-    "<span><b>Shift＋クリック</b> 保存済みをクリック位置から再生</span>"
+    "<span><b>Option＋クリック</b> 保存済みをクリック位置から再生</span>"
 )
 
 
@@ -1858,7 +1858,7 @@ _SERVE_SCRIPT = """<script>
     }
   }
 
-  // 対象に保存済み位置があるかどうか（Shift+クリック再生の可否判定に使う）。
+  // 対象に保存済み位置があるかどうか（Option+クリック再生の可否判定に使う）。
   function savedPositionFor(target) {
     return savedPositions[targetKey(target)] || null;
   }
@@ -1866,7 +1866,7 @@ _SERVE_SCRIPT = """<script>
   // 保存済み（review.wav）を対象の開始位置ちょうどから再生する。pad 秒手前
   // ではなく対象そのものの開始位置（savedPositions[...].outputStart、既存の
   // seg.output / w.output をそのまま使う）へシークする点が primeComparisonPlayers
-  // との違い。Shift+クリックと O キーの両方から呼ばれる共通経路。
+  // との違い。Option+クリックと O キーの両方から呼ばれる共通経路。
   function playSavedFrom(target) {
     var saved = savedPositionFor(target);
     if (!saved) {
@@ -1887,7 +1887,7 @@ _SERVE_SCRIPT = """<script>
   }
 
   // active 行表示と currentTarget（範囲2/4/8秒変更時の再プライム対象）の更新を
-  // 一箇所にまとめる。通常クリック・Shift+クリックの両経路がここを1回だけ通る。
+  // 一箇所にまとめる。通常クリック・Option+クリックの両経路がここを1回だけ通る。
   function selectTarget(line, target) {
     setActiveLine(line);
     currentTarget = target;
@@ -1929,9 +1929,10 @@ _SERVE_SCRIPT = """<script>
       : { type: "line", id: seg.id };
     selectTarget(line, target);
     primeComparisonPlayers(target, currentPad);
-    if (ev.shiftKey) {
-      ev.preventDefault();          // Shift+click の既定動作（選択拡張）の抑止。
-                                     // mousedown 起点のテキスト選択の完全防止は狙わない
+    if (ev.altKey) {
+      ev.preventDefault();          // Option(Alt)+click には非リンク要素で横取りすべき
+                                     // ブラウザ既定動作は無いが、他の修飾キー分岐と
+                                     // 挙動を揃えるため一貫して呼んでおく。
       playSavedFrom(target);
       return;                       // preview へは進まない
     }
@@ -2100,7 +2101,7 @@ def render_html(review: dict) -> str:
     # serve（Hlyst 対話モード）はクリック＝現在案 preview 専用のため、静的モード専用の
     # 固定 pad 秒クリック説明はここでは出さない（serve モードへ固定の「前後2秒」を
     # 表示しない）。
-    # serve モードの Shift+クリック説明は下部キーボードヒントへ移した（重複表示を避ける）。
+    # serve モードの Option+クリック説明は下部キーボードヒントへ移した（重複表示を避ける）。
     click_legend = (
         ""
         if serve
