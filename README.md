@@ -27,9 +27,9 @@ A local, free, privacy-first alternative to [Descript](https://www.descript.com/
 > **Requires Apple Silicon Mac** (M1/M2/M3/M4). Intel Macs are not supported. See [FAQ](#can-i-use-stefnceorf-on-windows-or-linux) for cross-platform options.
 
 <p align="center">
-  <img src="assets/hlyst-screenshot.png" alt="Hlyst — browser page for A/B listening and editing: original, saved edit, and current-plan players; per-cut checkboxes; safety-kept cuts highlighted" width="760">
+  <img src="assets/hlyst-screenshot.png" alt="Hlyst — full-width browser workspace with a single transport, original/saved mode switch, per-cut checkboxes, one-line stats bar, and keyboard hints" width="760">
 </p>
-<p align="center"><em>Hlyst (<code>sc review --serve</code>) — toggle each cut with a checkbox, A/B the real render instantly, save back to the transcript.</em></p>
+<p align="center"><em>Hlyst (<code>sc review --serve</code>) — keyboard-driven A/B editing (Space/J/K/H/L/X/P/S) with in-browser FCPXML export, no need to leave the browser.</em></p>
 
 ## Quick Start
 
@@ -64,7 +64,7 @@ sc logic episode.sc.txt         # generates episode.logic.fcpxml for Logic Pro
 - **Verbatim mode** — Transcribes filler words and hesitations that Whisper normally absorbs, enabling accurate filler detection. Enabled by default. Since v0.3.0 it uses the fast `turbo` model with a per-chunk filler prompt — in A/B tests across three episodes it captured more fillers than the previous `large-v3` approach while running twice as fast.
 - **Hallucination detection & rescue** — Automatically detects Whisper hallucinations, rescues the affected audio by re-transcribing with safe settings.
 - **Untranscribed speech detection & guarded cuts** — Short vocalizations (100–150 ms "uh"s, breaths, backchannels) that Whisper skips are detected and marked for deletion by default as `〔未認識 N.N秒〕` lines in the transcript. A marked span is only actually cut when a 0.25-second pause can be preserved from detected silence around it — otherwise the audio is kept for safety. Remove the brackets to keep a span, or pass `--no-auto-uts` for detection-only behavior (audio always preserved).
-- **Hlyst — browser A/B listening & editing** — `sc review episode.sc.txt` renders the edited audio for real and generates a browser page (named Hlyst, Old English for "listening") for original-vs-edited A/B comparison. With `--serve`, Hlyst becomes interactive: toggle each cut with a checkbox, preview the current plan instantly, and save back to `.sc.txt`. Use `--no-open` to skip auto-opening the browser.
+- **Hlyst — browser A/B listening & editing** — `sc review episode.sc.txt` renders the edited audio for real and generates a full-width browser workspace (named Hlyst, Old English for "listening") built around a single transport with an original/saved mode switch and a one-line stats bar. Every action has a keyboard shortcut (Space to play, J/K to move between lines, H/L to switch mode). With `--serve`, Hlyst becomes interactive: toggle each cut with a checkbox (X), reorder lines (▲▼), preview the current plan (P), save back to `.sc.txt` (S), and export FCPXML directly from the browser. Use `--no-open` to skip auto-opening the browser.
 - **Quality preservation** — WAV render output matches original sample rate and bit depth. Equal-power crossfade at cut boundaries prevents click noise.
 - **Japanese & English** — Full support for both languages with language-specific filler dictionaries.
 - **Text-based editing** — For finer control, edit the generated transcript in any text editor. Delete text to delete audio, rearrange lines to reorder segments — and the edited audio comes out sounding natural, because cuts snap to pause boundaries and silence troughs with crossfades. Since v0.3.0 the transcript also reads cleanly (turbo's natural orthography). See [Text-Based Editing](#text-based-editing-optional).
@@ -79,7 +79,7 @@ sc logic episode.sc.txt         # generates episode.logic.fcpxml for Logic Pro
 | **Privacy** | Audio never leaves your machine | Audio uploaded to servers | Local processing | Local processing |
 | **Japanese support** | Native (transcription + filler detection) | Limited | None | None |
 | **Filler removal** | Automatic (auto) / semi-automatic (step-by-step) | Automatic | Manual | Manual |
-| **Edit preview** | Browser A/B page + interactive editor (`sc review --serve`) | In-app playback | In-app playback | In-app playback |
+| **Edit preview** | Browser A/B workspace with keyboard editing (`sc review --serve`) | In-app playback | In-app playback | In-app playback |
 | **Logic Pro integration** | FCPXML export with click-free edge snapping | No | No | No |
 | **AI agent customization** | Yes — CLAUDE.md, AGENTS.md, test suite | No | No | No |
 | **Interface** | CLI | GUI application | GUI application | GUI application |
@@ -107,7 +107,7 @@ The repository includes:
 - **`CLAUDE.md`** — Project context and conventions for Claude Code
 - **`AGENTS.md`** — Workflow instructions for AI coding agents
 - **Comprehensive test suite** — Unit tests, CLI tests, and acceptance tests
-- **Clean Python codebase** — ~7,000 lines across 7 modules, well-structured for AI modification
+- **Clean Python codebase** — ~8,000 lines across 8 modules, well-structured for AI modification
 
 Example prompts for your AI agent:
 
@@ -229,11 +229,13 @@ Produces `input.edited.wav` (or the path given by `-o`). Cuts are made from the 
 sc review input.sc.txt [--serve] [--port N] [--no-open] [--gap-threshold 1.2] [--gap-max 0.7]
 ```
 
-Generates `input.review.wav` (a real render of the current `.sc.txt`) and `input.review.html` — the Hlyst page (Old English *hlyst* "listening") — then opens it in your browser (`--no-open` to suppress). The page shows the timestamped transcript with deleted lines struck through and fillers, untranscribed-speech candidates, and silence trims highlighted — click a line or word to play a few seconds around it, comparing original and edited audio at adjustable playback speed (x1.0–x2.0). Cuts that were requested but kept by the safety guard (not enough surrounding pause) are highlighted as such.
+Generates `input.review.wav` (a real render of the current `.sc.txt`) and `input.review.html` — the Hlyst page (Old English *hlyst* "listening") — then opens it in your browser (`--no-open` to suppress).
 
-Without `--serve`, the page is read-only: to change a decision, edit `.sc.txt` and run `sc review` again.
+Hlyst is a full-width workspace built around a single transport with a mode switch, rather than separate stacked players. A "Compare" group switches between original and saved audio; clicking a line or word plays a window around it (±2/4/8 s), with skip buttons (−10s/−5s/+5s/+10s) and a speed control (x1.25–x2.0, with an ON/OFF toggle — OFF plays at normal speed). A one-line stats bar under the header summarizes filler removals, untranscribed-speech cuts, unrecognized cuts, silence trims, and the overall duration change; per-line badges only appear for exceptions (deletion, manual edit, safety-kept). Cuts that were requested but kept by the safety guard (not enough surrounding pause) are highlighted as such. Shift-click a line or word to play the saved edit from that comparison position instead of the current-plan preview.
 
-With `--serve`, Hlyst becomes an interactive editor backed by a local server (127.0.0.1 only; `--port` defaults to an automatically chosen free port). Toggle each deletion with a checkbox, preview the resulting current plan instantly around the change (±2/4/8 s window), then save: only the affected lines in `.sc.txt` are patched (a `.bak` backup is created) and `review.wav` is re-rendered. Press Ctrl-C to stop the server.
+Without `--serve`, the page is read-only. Keyboard shortcuts are Space (play/stop the visible player), H/L (switch mode), and J/K (move between lines and play). To change a decision, edit `.sc.txt` and run `sc review` again.
+
+With `--serve`, Hlyst becomes an interactive editor backed by a local server (127.0.0.1 only; `--port` defaults to an automatically chosen free port). A second "Preview" mode group appears for the current plan (an unsaved-edit preview, disabled until first played). Additional keyboard shortcuts: X toggles deletion on the current line, P previews the current plan, and S saves. Each row has ▲▼ buttons to reorder lines directly in the browser; the new order is written back as the line order in `.sc.txt` on save. The save button patches only the affected lines in `.sc.txt` (a `.bak` backup is created) and re-renders `review.wav`; its notice appears next to the button and clears automatically after 5 seconds. An XML export button (also `--serve`-only) saves any unsaved changes, re-renders if needed, and writes `{base}.logic.fcpxml` directly from the browser — no need to run `sc logic` separately; its success notice also clears after 5 seconds, while errors stay visible. Press Ctrl-C to stop the server.
 
 Note the A/B reflects `sc render` output exactly; the Logic Pro FCPXML keeps deletions as timeline gaps, so playback in Logic differs — do the final check in Logic.
 
@@ -282,7 +284,7 @@ No. The default `sc episode.wav` workflow handles everything automatically — f
 
 ### Can I preview my edits before rendering or sending to Logic Pro?
 
-Yes. Run `sc review episode.sc.txt` to open Hlyst, a browser page for A/B listening — original audio versus a real render of your current edits. Click any transcript line or highlighted filler to hear a few seconds around it. With `--serve`, Hlyst becomes interactive: toggle each cut with a checkbox, preview instantly, and save the decisions back to `.sc.txt` without leaving the browser.
+Yes. Run `sc review episode.sc.txt` to open Hlyst, a full-width browser workspace for A/B listening — original audio versus a real render of your current edits, with a single transport and keyboard shortcuts (Space/H/L/J/K). With `--serve`, Hlyst becomes interactive: toggle each cut (X), preview the current plan (P), save the decisions back to `.sc.txt` (S), and export FCPXML directly — saving and rendering to Logic Pro both complete without leaving the browser.
 
 ### Does Stefnceorf delete sounds that Whisper didn't transcribe?
 
@@ -298,7 +300,7 @@ Input must be WAV. Apply noise reduction beforehand (e.g., with Audacity). Stefn
 
 ### Can AI coding agents modify this codebase?
 
-Yes. The repository includes `CLAUDE.md` and `AGENTS.md` with project context and workflow instructions. The codebase is intentionally simple (~7,000 lines of Python) with comprehensive tests, making it well-suited for AI-assisted modification.
+Yes. The repository includes `CLAUDE.md` and `AGENTS.md` with project context and workflow instructions. The codebase is intentionally simple (~8,000 lines of Python) with comprehensive tests, making it well-suited for AI-assisted modification.
 
 ## Accuracy & Limitations
 
