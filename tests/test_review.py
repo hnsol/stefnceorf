@@ -850,9 +850,10 @@ def test_serve_html_shows_unsafe_state(tmp_path):
 def test_serve_html_includes_save_controls_and_script(tmp_path):
     html, _rd = _serve_html(tmp_path)
     assert 'id="save"' in html
+    assert 'title="保存と同時に .logic.fcpxml も書き出します"' in html
     assert 'id="audio-preview"' in html
     assert '"/preview"' in html
-    assert '"/save"' in html
+    assert '"/export"' in html
     assert "X-Hlyst-Token" in html
 
 
@@ -1035,7 +1036,10 @@ def test_serve_html_save_button_is_in_first_header_row(tmp_path):
 
 def test_serve_html_save_button_default_label(tmp_path):
     html, _rd = _serve_html(tmp_path)
-    assert '<button type="button" id="save" disabled>保存済み</button>' in html
+    assert (
+        '<button type="button" id="save" disabled '
+        'title="保存と同時に .logic.fcpxml も書き出します">保存済み</button>'
+    ) in html
 
 
 # ---- FCPXML 書き出しコントロール（Hlyst UX 改修） ----
@@ -1906,6 +1910,10 @@ def test_serve_script_syncs_move_buttons_with_state_and_busy(tmp_path):
 
 def test_serve_script_posts_order(tmp_path):
     html, _rd = _serve_html(tmp_path)
-    assert 'post("/save", { toggles: toggles(), order: DATA.order })' in html
+    save_body = html.split('saveBtn.addEventListener("click", function () {')[1].split(
+        "\n  });\n"
+    )[0]
+    assert 'post("/export", { toggles: toggles(), order: DATA.order })' in save_body
+    assert '"/save"' not in save_body
     assert 'post("/export", { toggles: toggles(), order: DATA.order })' in html
     assert "toggles: toggles(), order: DATA.order, target: target" in html

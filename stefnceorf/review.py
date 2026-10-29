@@ -1158,7 +1158,7 @@ $serve_script
 # --serve 時だけ差し込むヘッダー1行目右端の保存ボタン（通知はボタンの左隣）
 _SAVE_AREA = Template("""  <span class="save-area">
     <span class="msg" id="save-msg"></span>
-    <button type="button" id="save" disabled>保存済み</button>
+    <button type="button" id="save" disabled title="保存と同時に .logic.fcpxml も書き出します">保存済み</button>
   </span>""")
 
 # --serve 時だけ差し込むヘッダー2行目の中央部（速度・絶対時刻）。試聴範囲
@@ -1275,7 +1275,7 @@ _SERVE_SCRIPT = """<script>
   // 対象の行/単語をクリックしたときに再生する（key -> {url, ...}）。
   // キーには pad を含める（対象・pad・編集状態が一致する場合のみ再利用する）。
   var previewCache = {};
-  // /preview, /save の応答が世代遅れ（その後に新しい操作が始まっている）なら
+  // /preview, /export の応答が世代遅れ（その後に新しい操作が始まっている）なら
   // 状態を巻き戻さないよう、リクエストごとに世代IDを振って照合する。
   var generation = 0;
 
@@ -1657,7 +1657,7 @@ _SERVE_SCRIPT = """<script>
   }
 
   // 保存済み位置表（L<id> / W<id>:<word> -> {sourceCenter, outputCenter, outputStart}）。
-  // /save 成功時（mergeSavedStates）だけ再構築する。preview の応答では
+  // 保存（/export）成功時（mergeSavedStates）だけ再構築する。preview の応答では
   // 触らない（未保存の試聴で保存済み位置がずれて見えることを防ぐ）。
   var savedPositions = {};
 
@@ -1700,7 +1700,7 @@ _SERVE_SCRIPT = """<script>
     });
   }
 
-  // /save 成功時だけ使う。全状態を確定させ、保存済み位置表を再構築する。
+  // 保存（/export）成功時だけ使う。全状態を確定させ、保存済み位置表を再構築する。
   function mergeSavedStates(segments) {
     var byId = {};
     segments.forEach(function (s) { byId[s.id] = s; });
@@ -1727,7 +1727,7 @@ _SERVE_SCRIPT = """<script>
     capturePositions(DATA.segments);
   }
 
-  // /save・/export の応答を画面へ反映する共通経路。txt_saved（保存 baseline
+  // 保存ボタン・XML出力ボタン（共に /export）の応答を画面へ反映する共通経路。txt_saved（保存 baseline
   // の基準）と review_updated（review.wav 再生成の成否）は独立した2軸のため、
   // それぞれ opts.commitBaseline と payload.review_updated の厳密比較
   // （=== true）で個別に判定する。segments が無い応答（review.wav 再生成
@@ -1840,7 +1840,7 @@ _SERVE_SCRIPT = """<script>
   // 原音・保存済みプレイヤーを対象の比較窓開始位置へシークする（play() は
   // 呼ばない。実際の再生は現在案 preview だけが行う）。原音は対象そのものの
   // source_center（保存の有無に関わらず不変）を使い、保存済みは
-  // savedPositions（/save 成功時にしか更新されない）の output_center だけを
+  // savedPositions（保存＝/export 成功時にしか更新されない）の output_center だけを
   // 使う。未保存の現在案 output を保存済みプレイヤーのシークに使わない。
   function primeComparisonPlayers(target, pad) {
     var seg = segmentById(target.id);
@@ -1986,26 +1986,16 @@ _SERVE_SCRIPT = """<script>
     if (busy || !dirty) { return; }
     var myGeneration = ++generation;
     setControlsBusy(true, "save");
-    post("/save", { toggles: toggles(), order: DATA.order })
+    post("/export", { toggles: toggles(), order: DATA.order })
       .then(function (payload) {
         if (myGeneration !== generation) { return; }
-        // /save は常に TXT を書き保存済み音声を作り直す（既存契約は
-        // {version, txt_path, segments, stats, warnings} のまま txt_saved /
-        // review_updated を含まないため、ここで相当する true を明示して
-        // applyReviewPayload へ寄せる）。
-        applyReviewPayload(
-          {
-            version: payload.version,
-            segments: payload.segments,
-            stats: payload.stats,
-            review_updated: true
-          },
-          { commitBaseline: true }
-        );
-        noteSave("保存しました: " + basename(payload.txt_path), false);
+        applyReviewPayload(payload, { commitBaseline: payload.txt_saved === true });
+        noteSave("保存しました（XML出力済み）: " + basename(payload.fcpxml_path), false);
       })
       .catch(function (err) {
         if (myGeneration !== generation) { return; }
+        var payload = err.payload || {};
+        applyReviewPayload(payload, { commitBaseline: payload.txt_saved === true });
         noteSave(err.message, true);
       })
       .then(function () {
