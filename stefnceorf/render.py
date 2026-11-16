@@ -133,6 +133,11 @@ FILLER_EDGE_REL_DB = 8.0          # 発話中央値からこのdB下を「つな
 FILLER_EDGE_FALLBACK_DBFS = -40.0 # 発話中央値が取れない（単語なし等）ときのフォールバック閾値
 FILLER_EDGE_WIN_S = 0.015         # つなぎ目前後のRMS判定窓の半幅
 
+# フィラーのつなぎ目再点検（build_edit_plan_from_text）の最大やり直し回数。
+# 再点検で不安全と分かったフィラーを毎回「残す」に回して計画を作り直すが、
+# やり直しが新たな不安全を生むケースに備え上限で打ち切る（無限ループ防止）。
+FILLER_JOINT_RECHECK_MAX_ATTEMPTS = 3
+
 # `[ID] text` 行のパターン。`[...]` 内の最初の空白区切りトークンをIDとし、以降は無視。
 # 新形式 `[0001 0:12] text` でも旧形式 `[0001] text` でも動く。
 _LINE_RE = re.compile(r"^\[([^\]\s]+)(?:\s+[^\]]*)?\]\s?(.*)$")
@@ -1285,6 +1290,45 @@ def build_edit_plan(
     )
 
 
+def _unsafe_filler_joints(
+    audio, samplerate,
+    out_intervals: list[tuple[float, float]],
+    filler_key_spans: dict[tuple[str, int], tuple[float, float]],
+    filler_edge_threshold_db: float,
+) -> frozenset[tuple[str, int]]:
+    """安全カットした各フィラーについて、実際の出力つなぎ目を再点検する。
+
+    plan_filler_cut の見積もり（想定した隣接語の境界）ではなく、
+    plan_output_intervals が実際に作った出力区間列から、そのフィラーのカット
+    区間 (ss, se) を挟む隣接 2 区間 iv[k], iv[k+1] を探し、その境界
+    r1=iv[k][1], r2=iv[k+1][0] の前後 ±FILLER_EDGE_WIN_S の RMS を見る。
+    近くの行削除・隣接フィラー等で見積もりと実際の境界がずれ、見積もりでは
+    安全でも実際のつなぎ目がうるさいケースを拾う。
+
+    該当する隣接境界が out_intervals に見つからないフィラーは対象外（調べない）。
+    戻り値は「残すべき」と判定した (seg_id, wi) キーの集合。
+    """
+    unsafe: set[tuple[str, int]] = set()
+    for key, (ss, se) in filler_key_spans.items():
+        for k in range(len(out_intervals) - 1):
+            iv_k = out_intervals[k]
+            iv_k1 = out_intervals[k + 1]
+            if (
+                iv_k[1] <= ss + 1e-6
+                and iv_k1[0] >= se - 1e-6
+                and iv_k[0] < ss
+            ):
+                r1, r2 = iv_k[1], iv_k1[0]
+                edge = max(
+                    rms_dbfs_range(audio, samplerate, r1 - FILLER_EDGE_WIN_S, r1 + FILLER_EDGE_WIN_S),
+                    rms_dbfs_range(audio, samplerate, r2 - FILLER_EDGE_WIN_S, r2 + FILLER_EDGE_WIN_S),
+                )
+                if edge > filler_edge_threshold_db:
+                    unsafe.add(key)
+                break
+    return frozenset(unsafe)
+
+
 def build_edit_plan_from_text(
     context: PlanContext,
     edited_text: str,
@@ -1294,7 +1338,45 @@ def build_edit_plan_from_text(
     """PlanContext とメモリ上の編集後テキストから共有編集計画を構築する。
 
     ファイルに書き出されていない編集内容（review --serve のトグル状態）からも
-    同じ計画を作れるようにするため、build_edit_plan の中核をここへ分離している。
+    同じ計画を作れるようにするため、build_edit_plan の中核は _build_edit_plan_once
+    へ分離している。ここでは、安全カットしたフィラーの実際の出力つなぎ目を
+    _unsafe_filler_joints で再点検し、うるさければそのフィラーを残す側へ回して
+    計画を作り直す（最大 FILLER_JOINT_RECHECK_MAX_ATTEMPTS 回）。
+    """
+    force_keep_fillers: frozenset[tuple[str, int]] = frozenset()
+    plan, filler_key_spans, filler_edge_threshold = _build_edit_plan_once(
+        context, edited_text, gap_threshold, gap_max, force_keep_fillers
+    )
+    for _ in range(FILLER_JOINT_RECHECK_MAX_ATTEMPTS):
+        unsafe = _unsafe_filler_joints(
+            context.audio, context.samplerate, plan.output_intervals,
+            filler_key_spans, filler_edge_threshold,
+        )
+        if not unsafe:
+            break
+        force_keep_fillers = force_keep_fillers | unsafe
+        plan, filler_key_spans, filler_edge_threshold = _build_edit_plan_once(
+            context, edited_text, gap_threshold, gap_max, force_keep_fillers
+        )
+    return plan
+
+
+def _build_edit_plan_once(
+    context: PlanContext,
+    edited_text: str,
+    gap_threshold: float,
+    gap_max: float,
+    force_keep_fillers: frozenset[tuple[str, int]],
+) -> tuple[EditPlan, dict[tuple[str, int], tuple[float, float]], float]:
+    """build_edit_plan_from_text の中核。1回分の編集計画を構築する（純関数）。
+
+    force_keep_fillers に含まれる (seg_id, wi) のフィラーは、音響安全判定
+    （plan_filler_cut）を呼ばずに不安全扱い（残す）にする。呼び出し元の
+    つなぎ目再点検で安全と確認できなかったフィラーを計画から除外し直すための
+    再入力用パラメータ。
+
+    戻り値は (EditPlan, 安全カットしたフィラーの (seg_id, wi) → カット区間の
+    対応表, フィラーのつなぎ目判定閾値)。後者2つは呼び出し元の再点検専用。
     """
     data = context.data
     segments = data.get("segments", [])
@@ -1423,6 +1505,9 @@ def build_edit_plan_from_text(
     filler_cut_spans: list[tuple[float, float]] = []
     uts_cut_spans: list[tuple[float, float]] = []
     safe_filler_keys: set[tuple[str, int]] = set()
+    # (seg_id, wi) → カット区間。呼び出し元のつなぎ目再点検専用の対応表
+    # （filler_cut_spans は値一致でキー化できないため別に持つ）。
+    filler_key_spans: dict[tuple[str, int], tuple[float, float]] = {}
     safe_uts_ids: set[str] = set()
     unrecognized_cut_spans: list[tuple[float, float]] = []
     safe_unrecognized_ids: set[str] = set()
@@ -1597,12 +1682,17 @@ def build_edit_plan_from_text(
         for wi in sorted(filler_del):
             lo_s = float(words[wi - 1]["end"]) if wi > 0 else lo_seg
             hi_s = float(words[wi + 1]["start"]) if wi + 1 < len(words) else hi_seg
-            cut = plan_filler_cut(
-                audio, samplerate, words[wi], lo_s, hi_s, filler_edge_threshold
+            forced = (seg_id, wi) in force_keep_fillers
+            cut = (
+                None if forced
+                else plan_filler_cut(
+                    audio, samplerate, words[wi], lo_s, hi_s, filler_edge_threshold
+                )
             )
             if cut is not None:
                 filler_cut_spans.append(cut)
                 safe_filler_keys.add((seg_id, wi))
+                filler_key_spans[(seg_id, wi)] = cut
                 # スナップ値を words[wi]（コピー）へ反映し、以降の
                 # words_to_intervals の隣接クランプにスナップ境界を使わせる。
                 words[wi]["start"], words[wi]["end"] = cut
@@ -1610,9 +1700,12 @@ def build_edit_plan_from_text(
                 filler_del.discard(wi)
                 keep.add(wi)
                 filler_skipped_unsafe += 1
-                all_warnings.append(
+                warning = (
+                    f"[{seg_id}] フィラー〔{word_strs[wi]}〕は切るとつなぎ目に音が残るため残しました"
+                    if forced else
                     f"[{seg_id}] フィラー〔{word_strs[wi]}〕は前後の音声と連続しているため残しました"
                 )
+                all_warnings.append(warning)
 
         # 4b. filler_del をスナップ判定上「残存扱い」にしてブロックスナップ。
         keep, extra = snap_with_filler_exemption(keep, blocks, filler_del)
@@ -1737,7 +1830,7 @@ def build_edit_plan_from_text(
         warn_hot_boundaries(audio, samplerate, out_intervals, cf_flags, rms_threshold)
     )
 
-    return EditPlan(
+    plan = EditPlan(
         txt_path=context.txt_path,
         base_name=context.base_name,
         source_wav=context.source_wav,
@@ -1752,6 +1845,7 @@ def build_edit_plan_from_text(
         stats=stats,
         guarded_cut_reasons=guarded_cut_reasons,
     )
+    return plan, filler_key_spans, filler_edge_threshold
 
 
 def plan_chunk_bounds(

@@ -1687,6 +1687,102 @@ def test_render_filler_continuous_audio_kept(tmp_path, capsys):
     assert "まあ" in err
 
 
+def _write_filler_joint_mismatch_project(tmp_path):
+    """plan_filler_cut の見積もりでは安全だが、実際の出力つなぎ目は
+    うるさくなる構成（隣接行の丸ごと削除によるズレ）を作る。
+
+    0001:[結局(非フィラー)/まあ(フィラー、セグメント末尾)]。0002 は別行の
+    「うるさい」1語で、まあ の直後（0.05秒の無音を挟む）から始まり、丸ごと
+    行削除される。0003「後」は 0002 に無音なしで直結する。
+
+    まあ の安全判定（plan_filler_cut）は hi=0002 の開始位置をそのまま
+    「次の語の開始」とみなして見積もる。その付近には無音があるため見積もりは
+    安全と判定される。だが実際の出力では 0002 も丸ごと削除されるため、
+    まあ の後の本当のつなぎ目は 0002/0003 の境界（無音なし・連続音）になり、
+    実際には不安全。
+    """
+    import soundfile as sf
+
+    sr = 16000
+    total = 3.50
+    audio = np.zeros(int(round(total * sr)))
+
+    def put(s, e, fr, amp=0.3):
+        n = int(round((e - s) * sr))
+        a = int(round(s * sr))
+        t = np.arange(n) / sr
+        audio[a:a + n] = amp * np.sin(2 * np.pi * fr * t)
+
+    put(0.0, 1.0, 220.0)    # 結局
+    put(1.2, 1.45, 440.0)   # まあ（フィラー）
+    put(1.50, 2.50, 300.0)  # うるさい（0002、行削除）
+    put(2.50, 3.50, 660.0)  # 後（0003、うるさい に無音なしで直結）
+
+    wav = tmp_path / "input.wav"
+    sf.write(str(wav), audio, sr, subtype="PCM_16")
+
+    data = {
+        "source_wav": str(wav.resolve()),
+        "language": "ja",
+        "model": "test",
+        "segments": [
+            {"id": "0001", "text": "結局まあ", "words": [
+                {"word": "結局", "start": 0.0, "end": 1.0,
+                 "probability": 0.9, "block": 0},
+                {"word": "まあ", "start": 1.2, "end": 1.45,
+                 "probability": 0.9, "block": 1, "suggest": True},
+            ]},
+            {"id": "0002", "text": "うるさい", "words": [
+                {"word": "うるさい", "start": 1.50, "end": 2.50,
+                 "probability": 0.9, "block": 0},
+            ]},
+            {"id": "0003", "text": "後", "words": [
+                {"word": "後", "start": 2.50, "end": 3.50,
+                 "probability": 0.9, "block": 0},
+            ]},
+        ],
+    }
+    (tmp_path / "input.sc.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] 結局〔まあ〕\n[0003] 後\n", encoding="utf-8")
+    return txt
+
+
+def test_filler_joint_recheck_keeps_filler_when_real_joint_is_loud(tmp_path):
+    """見積もりは安全だが実際の出力つなぎ目がうるさいフィラーは、再点検で
+    「残す」に回って計画が作り直される（filler_cut が減り、新しい警告が出る）。"""
+    txt = _write_filler_joint_mismatch_project(tmp_path)
+    plan = render.build_edit_plan(str(txt))
+
+    assert plan.stats.filler_cut == 0
+    assert plan.stats.filler_skipped_unsafe == 1
+    assert any(
+        "フィラー〔まあ〕は切るとつなぎ目に音が残るため残しました" in w
+        for w in plan.warnings
+    )
+
+
+def test_filler_joint_recheck_noop_when_real_joint_is_quiet(tmp_path):
+    """再点検で引っかかる要素が無い通常ケースでは、計画が従来どおり
+    （フィラーは安全カットされる）になる。"""
+    _write_words_project(
+        tmp_path,
+        [("結局", 0.0, 1.0, 220.0, 0, False),
+         ("まあ", 1.3, 2.0, 440.0, 1, True),
+         ("面倒", 2.3, 3.3, 660.0, 2, False)],
+        silences=[[1.0, 1.3], [2.0, 2.3]],
+    )
+    txt = tmp_path / "input.sc.txt"
+    txt.write_text("[0001] 結局〔まあ〕面倒\n", encoding="utf-8")
+    plan = render.build_edit_plan(str(txt))
+
+    assert plan.stats.filler_cut == 1
+    assert plan.stats.filler_skipped_unsafe == 0
+    assert not any("つなぎ目に音が残るため残しました" in w for w in plan.warnings)
+
+
 def test_render_manual_filler_delete_no_block_wipe(tmp_path, capsys):
     """手動削除フィラー（〔〕でなく文字を直接消す・同ブロックに他語あり）→
     ブロック巻き込みなしで該当フィラーのみ消える。"""
