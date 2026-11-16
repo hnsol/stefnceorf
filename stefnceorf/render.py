@@ -124,6 +124,15 @@ SNAP_RMS_WINDOW_S = 0.015  # 谷探索時のRMS窓半幅（boundary_rms のwindo
 RMS_SAFE_REL_DB = 15.0     # 発話中央値からこのdB下を無音側とみなす（実測: 発話-38dB/無音-73dB帯の中間）
 MIN_FILLER_CUT_S = 0.03    # スナップ後のカット区間がこれ未満なら意味がないのでカットしない
 
+# フィラーカットの安全判定（つなぎ目RMS方式）の定数群。
+# 聴取実験（ep28/ep29、計約210件の人手○×）: 最終的な2つのつなぎ目（フィラー削除＋
+# FILLER_PAUSE_KEEP_S に間を詰めた後）の前後±15msのRMSがどちらも「発話中央値-8dB」
+# 以下なら約9割が自然だった。旧方式（境界のsilences接触／相対RMS）は78%しか当たらず
+# unsafe 判定の多くは実際には切っても自然だったため、つなぎ目そのものを見て判定する。
+FILLER_EDGE_REL_DB = 8.0          # 発話中央値からこのdB下を「つなぎ目が十分静か」とみなす閾値
+FILLER_EDGE_FALLBACK_DBFS = -40.0 # 発話中央値が取れない（単語なし等）ときのフォールバック閾値
+FILLER_EDGE_WIN_S = 0.015         # つなぎ目前後のRMS判定窓の半幅
+
 # `[ID] text` 行のパターン。`[...]` 内の最初の空白区切りトークンをIDとし、以降は無視。
 # 新形式 `[0001 0:12] text` でも旧形式 `[0001] text` でも動く。
 _LINE_RE = re.compile(r"^\[([^\]\s]+)(?:\s+[^\]]*)?\]\s?(.*)$")
@@ -453,20 +462,55 @@ def snap_to_trough(
     return best_t, best_rms
 
 
+def filler_pause_keep_split(
+    gap_start: float, f_start: float, f_end: float, next_start: float,
+    filler_pause_keep: float = FILLER_PAUSE_KEEP_S,
+) -> tuple[float, float]:
+    """フィラー削除ギャップの前後に残す間 (pre_keep, post_keep) を求める（純関数）。
+
+    plan_output_intervals のフィラーポーズ分岐（分岐4）が行う配分ロジックを
+    そのまま切り出したもの: pre_avail = f_start - gap_start, post_avail =
+    next_start - f_end それぞれの範囲で filler_pause_keep を半分ずつ基本配分し、
+    片側が avail 不足なら不足分をもう片方の avail 範囲で再配分する。
+    plan_output_intervals とここ（plan_filler_cut の安全判定）の両方から呼ぶ。
+    """
+    pre_avail = max(0.0, f_start - gap_start)
+    post_avail = max(0.0, next_start - f_end)
+    fhalf = filler_pause_keep / 2.0
+    pre_keep = min(pre_avail, fhalf)
+    post_keep = min(post_avail, fhalf)
+    leftover = filler_pause_keep - pre_keep - post_keep
+    add_pre = min(leftover, pre_avail - pre_keep)
+    pre_keep += add_pre
+    leftover -= add_pre
+    post_keep += min(leftover, post_avail - post_keep)
+    return pre_keep, post_keep
+
+
 def plan_filler_cut(
     audio, samplerate, word: dict,
     lo: float, hi: float,
-    silences: list | None,
-    rms_threshold_db: float,
+    filler_edge_threshold_db: float,
 ) -> tuple[float, float] | None:
     """フィラー word のカット区間を谷スナップ込みで計画する（純関数）。
 
-    start / end それぞれを近傍の RMS 最小点（無音の谷）へスナップし、両端とも
-    安全なら (snapped_start, snapped_end) を返す。安全とは各境界 t について:
-    (1) silences のいずれかの区間 [s,e] で s-SILENCE_EDGE_TOL_S <= t <=
-        e+SILENCE_EDGE_TOL_S（端±許容込みで無音に接する/内部）
-    (2) スナップ後 RMS <= rms_threshold_db
-    のいずれか。加えて snapped_end - snapped_start >= MIN_FILLER_CUT_S を要求する。
+    start / end それぞれを近傍の RMS 最小点（無音の谷）へスナップしたうえで、
+    実際の出力で生じる2つのつなぎ目（フィラー削除＋ FILLER_PAUSE_KEEP_S に
+    間を詰めた後の境界）の前後 ±FILLER_EDGE_WIN_S の RMS がどちらも
+    filler_edge_threshold_db 以下なら安全として (snapped_start, snapped_end) を
+    返す（聴取実験 ep28/ep29 の知見。旧来の「境界が silences に接するか」判定は
+    使わない）。
+
+    つなぎ目の見積もり: plan_output_intervals / words_to_intervals と同じ
+    マージン規則で、前の語の出力区間の終端 gap_start =
+    min(lo + min(TAIL_MARGIN_S, max(MARGIN_S, snapped_start - lo)), snapped_start)
+    とする（前の語とフィラーの間が TAIL_MARGIN_S 以下なら snapped_start に一致）。次側 next_start は
+    max(hi - MARGIN_S, snapped_end) で近似する（hi が次語の start のときは
+    words_to_intervals の次区間の start 計算と一致。hi がセグメント境界
+    hi_seg へフォールバックしているときは近似になる）。
+    filler_pause_keep_split で両つなぎ目の実座標 t1/t2 を求め、そこの RMS を見る。
+
+    加えて snapped_end - snapped_start >= MIN_FILLER_CUT_S を要求する。
     どれかを満たさない、または start/end が None なら None（カットしない）。
 
     lo/hi は隣接語に食い込まないための探索クランプ（lo=前の単語の end もしくは
@@ -483,23 +527,29 @@ def plan_filler_cut(
 
     s_lo = max(lo, start - SNAP_SEARCH_S)
     s_hi = min(start + SNAP_SEARCH_S, end)
-    snapped_start, srms = snap_to_trough(audio, samplerate, start, s_lo, s_hi)
+    snapped_start, _srms = snap_to_trough(audio, samplerate, start, s_lo, s_hi)
 
     e_lo = max(end - SNAP_SEARCH_S, start)
     e_hi = min(hi, end + SNAP_SEARCH_S)
-    snapped_end, erms = snap_to_trough(audio, samplerate, end, e_lo, e_hi)
+    snapped_end, _erms = snap_to_trough(audio, samplerate, end, e_lo, e_hi)
 
-    def _safe(t: float, rms: float) -> bool:
-        if silences is not None:
-            for span in silences:
-                s, e = float(span[0]), float(span[1])
-                if s - SILENCE_EDGE_TOL_S <= t <= e + SILENCE_EDGE_TOL_S:
-                    return True
-        return rms <= rms_threshold_db
-
-    if not (_safe(snapped_start, srms) and _safe(snapped_end, erms)):
-        return None
     if snapped_end - snapped_start < MIN_FILLER_CUT_S:
+        return None
+
+    # 前の語の出力区間の終端（words_to_intervals と同じ式: 前の語 end=lo から
+    # tail_margin まで伸び、フィラー開始 snapped_start でクランプ）。
+    gap_start = min(lo + min(TAIL_MARGIN_S, max(MARGIN_S, snapped_start - lo)), snapped_start)
+    next_start = max(hi - MARGIN_S, snapped_end)
+    pre_keep, post_keep = filler_pause_keep_split(
+        gap_start, snapped_start, snapped_end, next_start, FILLER_PAUSE_KEEP_S
+    )
+    t1 = gap_start + pre_keep
+    t2 = next_start - post_keep
+    edge = max(
+        rms_dbfs_range(audio, samplerate, t1 - FILLER_EDGE_WIN_S, t1 + FILLER_EDGE_WIN_S),
+        rms_dbfs_range(audio, samplerate, t2 - FILLER_EDGE_WIN_S, t2 + FILLER_EDGE_WIN_S),
+    )
+    if edge > filler_edge_threshold_db:
         return None
     return snapped_start, snapped_end
 
@@ -818,7 +868,9 @@ def plan_output_intervals(
        合計を filler_pause_keep に収める。フィラー span の前後で使える無音量
        （pre_avail / post_avail）に応じ、片側 filler_pause_keep/2 を基本とし、
        片側で余った分は他方の avail 範囲で再配分する（合計 =
-       min(pre_avail + post_avail, filler_pause_keep)）。無音中のカットなので
+       min(pre_avail + post_avail, filler_pause_keep)）。配分計算は
+       filler_pause_keep_split に委譲する（plan_filler_cut の安全判定が見積もる
+       つなぎ目座標と同じロジックを共有するため）。無音中のカットなので
        単純結合（cf_flags False）。
     5. g ≤ gap_threshold: ギャップ音声を保持（連続マージ）
        g > gap_threshold: silence_spans とギャップの共通部分のうち gap_max を超える
@@ -866,7 +918,6 @@ def plan_output_intervals(
     cf_flags: list[bool] = []
     pending = [intervals[0][0], intervals[0][1]]
     half = gap_max / 2.0
-    fhalf = filler_pause_keep / 2.0
     def _emit(crossfade: bool) -> None:
         """pending を確定出力する。
 
@@ -901,17 +952,12 @@ def plan_output_intervals(
             # 4. フィラーポーズ分岐（無音中カット → 単純結合）
             f_start = min(max(s, gap_start) for s, e in overlap)
             f_end = max(min(e, next_start) for s, e in overlap)
-            pre_avail = max(0.0, f_start - gap_start)
-            post_avail = max(0.0, next_start - f_end)
-            pre_keep = min(pre_avail, fhalf)
-            post_keep = min(post_avail, fhalf)
-            # 片側の余り（fhalf を使い切れなかった分）を他方の avail 範囲で再配分。
-            # 合計は min(pre_avail + post_avail, filler_pause_keep) に収まる。
-            leftover = filler_pause_keep - pre_keep - post_keep
-            add_pre = min(leftover, pre_avail - pre_keep)
-            pre_keep += add_pre
-            leftover -= add_pre
-            post_keep += min(leftover, post_avail - post_keep)
+            # 配分ロジック（pre_avail/post_avail に応じた基本配分＋片側不足分の
+            # 再配分。合計は min(pre_avail + post_avail, filler_pause_keep)）は
+            # plan_filler_cut の安全判定（つなぎ目の見積もり）と共有する純関数。
+            pre_keep, post_keep = filler_pause_keep_split(
+                gap_start, f_start, f_end, next_start, filler_pause_keep
+            )
             pending[1] = gap_start + pre_keep
             _emit(False)
             pending[:] = [next_start - post_keep, next_end]
@@ -1253,7 +1299,9 @@ def build_edit_plan_from_text(
     data = context.data
     segments = data.get("segments", [])
     # 無音リストは用途ごとに使い分ける（混ぜると別機能の挙動が変わる）。
-    # - block_silences: フィラーの音響安全判定用（粗い silencedetect パス）
+    # - silences: 粗い silencedetect パス。trim_silences の旧 json フォールバック
+    #   専用（フィラーの安全判定は plan_filler_cut のつなぎ目RMS方式に一本化済み
+    #   で、これはもう使わない）
     # - trim_silences: 出力の長無音短縮用（認識用切り詰めと同じ元音源区間）
     # - guard_silences: 未認識/UTS の guarded cut 専用（UTS 検出と同じ細かい
     #   RMS パス）。粗いパスは最小無音長が長く、対象の直近ポーズを拾えない。
@@ -1318,6 +1366,12 @@ def build_edit_plan_from_text(
     rms_threshold = (
         min(RMS_SAFE_DBFS, speech_med - RMS_SAFE_REL_DB)
         if speech_med is not None else RMS_SAFE_DBFS
+    )
+    # フィラーカットのつなぎ目判定専用の閾値（聴取実験 ep28/ep29 準拠）。
+    # guarded cut・warn_hot_boundaries 等、他用途の rms_threshold とは別に保つ。
+    filler_edge_threshold = (
+        speech_med - FILLER_EDGE_REL_DB
+        if speech_med is not None else FILLER_EDGE_FALLBACK_DBFS
     )
 
     plan_intervals: list[tuple[float, float]] = []
@@ -1534,7 +1588,7 @@ def build_edit_plan_from_text(
                 filler_del.add(wi)
 
         # 4c. 音響安全判定＋谷スナップ。カット両境界を近傍の無音の谷へ寄せ、
-        # 両端とも安全（無音接触/相対RMS以下）でカット長が十分なフィラーだけを
+        # 実際の出力つなぎ目（フィラーポーズ配分後の2点）が十分静かなフィラーだけ
         # 精密カット対象にする。unsafe なら keep に戻し警告する。探索は隣接語に
         # 食い込まないよう lo=前語 end / hi=次語 start（無ければセグメント境界）で
         # クランプする。
@@ -1544,7 +1598,7 @@ def build_edit_plan_from_text(
             lo_s = float(words[wi - 1]["end"]) if wi > 0 else lo_seg
             hi_s = float(words[wi + 1]["start"]) if wi + 1 < len(words) else hi_seg
             cut = plan_filler_cut(
-                audio, samplerate, words[wi], lo_s, hi_s, silences, rms_threshold
+                audio, samplerate, words[wi], lo_s, hi_s, filler_edge_threshold
             )
             if cut is not None:
                 filler_cut_spans.append(cut)

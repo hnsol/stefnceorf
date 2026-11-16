@@ -364,6 +364,38 @@ def test_snap_empty_range_returns_t():
     )
 
 
+# ---- filler_pause_keep_split ----
+
+def test_filler_pause_keep_split_only_post_side_has_room():
+    # pre側は余地ゼロ（gap_start=f_start）、post側は十分 → 全額post側に配分
+    pre_keep, post_keep = render.filler_pause_keep_split(
+        gap_start=1.0, f_start=1.0, f_end=1.2, next_start=1.5,
+        filler_pause_keep=0.25,
+    )
+    assert pre_keep == pytest.approx(0.0)
+    assert post_keep == pytest.approx(0.25)
+
+
+def test_filler_pause_keep_split_both_sides_sufficient():
+    # 両側とも fhalf(0.125) 以上の余地 → 基本配分どおり半分ずつ
+    pre_keep, post_keep = render.filler_pause_keep_split(
+        gap_start=1.0, f_start=1.2, f_end=1.3, next_start=1.5,
+        filler_pause_keep=0.25,
+    )
+    assert pre_keep == pytest.approx(0.125)
+    assert post_keep == pytest.approx(0.125)
+
+
+def test_filler_pause_keep_split_both_sides_insufficient():
+    # 両側とも 0.05 しか余地が無い（合計0.10 < 要求0.25）→ 両側とも余地を使い切るだけ
+    pre_keep, post_keep = render.filler_pause_keep_split(
+        gap_start=1.00, f_start=1.05, f_end=1.20, next_start=1.25,
+        filler_pause_keep=0.25,
+    )
+    assert pre_keep == pytest.approx(0.05)
+    assert post_keep == pytest.approx(0.05)
+
+
 # ---- plan_filler_cut ----
 
 def test_plan_filler_cut_snaps_decay_tail_to_safe():
@@ -380,10 +412,11 @@ def test_plan_filler_cut_snaps_decay_tail_to_safe():
     put(1.15, 1.85, 440.0)  # フィラー本体
     put(1.97, 3.0, 660.0)   # 次語（立ち上がりが2.0を跨ぐ）
     word = {"start": 1.0, "end": 2.0}
-    # 旧判定（絶対RMS）では両境界とも発話レベルで unsafe
+    # 旧判定（絶対RMS・silencesなし）では両境界とも発話レベルで unsafe
     assert render.filler_cut_is_safe(audio, sr, word, silences=None) is False
+    # lo は前語の end（1.0）、hi は次語の start（1.97）。lo/hi は実際の呼び出しと同じ「隣語境界」を渡す。
     cut = render.plan_filler_cut(
-        audio, sr, word, lo=0.0, hi=3.0, silences=None, rms_threshold_db=-40.0
+        audio, sr, word, lo=1.0, hi=1.97, filler_edge_threshold_db=-40.0
     )
     assert cut is not None
     s, e = cut
@@ -398,7 +431,7 @@ def test_plan_filler_cut_no_trough_returns_none():
     audio = 0.5 * np.sin(2 * np.pi * 440.0 * t)
     word = {"start": 1.0, "end": 2.0}
     cut = render.plan_filler_cut(
-        audio, sr, word, lo=0.0, hi=3.0, silences=None, rms_threshold_db=-40.0
+        audio, sr, word, lo=0.0, hi=3.0, filler_edge_threshold_db=-40.0
     )
     assert cut is None
 
@@ -409,13 +442,15 @@ def test_plan_filler_cut_too_short_returns_none():
     audio = np.zeros(3 * sr)
     word = {"start": 1.0, "end": 1.02}  # 20ms
     cut = render.plan_filler_cut(
-        audio, sr, word, lo=1.0, hi=1.02, silences=None, rms_threshold_db=-40.0
+        audio, sr, word, lo=1.0, hi=1.02, filler_edge_threshold_db=-40.0
     )
     assert cut is None
 
 
 def test_plan_filler_cut_lo_clamp_prevents_prev_word_intrusion():
     # start 側の谷が lo より手前にある構成。lo で探索下限を絞ると谷に届かず None。
+    # hi は次語の start 相当（2.05）の現実的な値にする（つなぎ目の見積もりに
+    # hi を使うため、遠すぎる hi だと end 側の判定が無関係に落ちてしまう）。
     sr = 16000
     t = np.arange(3 * sr) / sr
     audio = 0.3 * np.sin(2 * np.pi * 440.0 * t)
@@ -424,14 +459,52 @@ def test_plan_filler_cut_lo_clamp_prevents_prev_word_intrusion():
     word = {"start": 1.0, "end": 2.0}
     # lo=0.90 → 谷[0.88,0.94]に届き両端 safe → カット。s は lo を割らない
     cut = render.plan_filler_cut(
-        audio, sr, word, lo=0.90, hi=3.0, silences=None, rms_threshold_db=-40.0
+        audio, sr, word, lo=0.90, hi=2.05, filler_edge_threshold_db=-40.0
     )
     assert cut is not None
     assert cut[0] >= 0.90
     # lo=0.95 → 探索下限が谷より後になり start 側の谷に届かない → None
     assert render.plan_filler_cut(
-        audio, sr, word, lo=0.95, hi=3.0, silences=None, rms_threshold_db=-40.0
+        audio, sr, word, lo=0.95, hi=2.05, filler_edge_threshold_db=-40.0
     ) is None
+
+
+def test_plan_filler_cut_safe_via_joint_estimate_beyond_snap_window():
+    """谷スナップ後の生境界(end側)自体は発話レベルで silences にも接しないが、
+    実際の出力つなぎ目（フィラーポーズ配分後）は次語までの長い間（gap）の
+    奥にある本当の無音に落ち着くため新判定では safe（旧 _safe 相当の判定
+    ――境界点そのものの RMS/silences 接触だけを見る方式――では unsafe で
+    None になっていたはずのケース）。
+
+    構成: フィラー nominal [1.0, 1.3]。end側の谷探索窓 [1.2, 1.4]（= end±0.10
+    を hi でクランプした範囲）全体を発話相当の音で埋め、探索範囲内に無音の谷が
+    無い状態にする。一方、次語の start（hi=2.0）までは [1.4, 2.0] が本当の無音
+    なので、fillerポーズ配分で next_start-post_keep まで間を詰めた実際のつなぎ目
+    t2 はこの無音域に入る。
+    """
+    sr = 16000
+    audio = np.zeros(int(2.5 * sr))
+    t = np.arange(int(0.2 * sr)) / sr
+    a = int(round(1.2 * sr))
+    audio[a:a + len(t)] = 0.1 * np.sin(2 * np.pi * 300.0 * t)  # [1.2, 1.4] 発話相当
+    word = {"start": 1.0, "end": 1.3}
+
+    # 旧方式相当の確認: 素の end=1.3 周辺（谷スナップ後も [1.2,1.4] 内に留まる）は
+    # 発話レベルで silences も無い → unsafe
+    cut_start = 1.0
+    s_lo = max(cut_start, cut_start - render.SNAP_SEARCH_S)
+    s_hi = min(cut_start + render.SNAP_SEARCH_S, 1.3)
+    snapped_start, _ = render.snap_to_trough(audio, sr, cut_start, s_lo, s_hi)
+    e_lo = max(1.3 - render.SNAP_SEARCH_S, cut_start)
+    e_hi = min(2.0, 1.3 + render.SNAP_SEARCH_S)
+    snapped_end, end_rms = render.snap_to_trough(audio, sr, 1.3, e_lo, e_hi)
+    assert end_rms > -40.0  # 生境界スナップ後も静かになっていない
+
+    cut = render.plan_filler_cut(
+        audio, sr, word, lo=1.0, hi=2.0, filler_edge_threshold_db=-40.0
+    )
+    assert cut is not None
+    assert cut == (snapped_start, snapped_end)
 
 
 # ---- plan_guarded_pause ----
@@ -3079,3 +3152,33 @@ def test_window_matches_guarded_cut_boundary(tmp_path):
     # 単純結合（cf_flags=False）の境界は出力側 t=1.125（左保持ポーズ終端）
     window, start = render.render_plan_window(plan, 1.125, 0.2)
     assert np.allclose(window, full[start:start + len(window)], atol=1e-4)
+
+
+def test_plan_filler_cut_long_pre_pause_uses_tail_margin_end():
+    # 前語とフィラーの間が TAIL_MARGIN_S より長いとき、前のつなぎ目は
+    # 「前語 end + TAIL_MARGIN_S」から間を詰めた位置になる。そこに息などの音が
+    # 残るなら、フィラー開始点が静かでも切らない。
+    sr = 16000
+
+    def build(breath: bool):
+        audio = np.zeros(3 * sr)
+
+        def put(s, e, fr, amp=0.5):
+            t = np.arange(int(round((e - s) * sr))) / sr
+            a = int(round(s * sr))
+            audio[a:a + len(t)] = amp * np.sin(2 * np.pi * fr * t)
+
+        put(0.0, 1.0, 220.0)            # 前語（end=1.0）
+        if breath:
+            put(1.0, 1.45, 300.0, 0.3)  # 前語の後の息（間を詰めた後のつなぎ目が鳴っている）
+        put(1.6, 1.9, 440.0)            # フィラー
+        put(2.1, 3.0, 660.0)            # 次語（start=2.1）
+        return audio
+
+    word = {"start": 1.6, "end": 1.9}
+    quiet = render.plan_filler_cut(build(False), sr, word, lo=1.0, hi=2.1,
+                                   filler_edge_threshold_db=-40.0)
+    assert quiet is not None
+    noisy = render.plan_filler_cut(build(True), sr, word, lo=1.0, hi=2.1,
+                                   filler_edge_threshold_db=-40.0)
+    assert noisy is None
