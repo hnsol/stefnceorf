@@ -3454,3 +3454,134 @@ def test_detect_uts_spans_finds_untranscribed_burst(tmp_path):
     assert len(out) == 1
     assert out[0][0] == pytest.approx(1.4, abs=0.02)
     assert out[0][1] == pytest.approx(1.7, abs=0.02)
+
+
+# ---- reattach_misplaced_words（UTS 島への誤タイム単語の付け替え） ----
+
+def test_reattach_next_word_misplaced_into_silence():
+    # ep30 実測: 「という」の実発声は 1751.08-1751.50s だが Whisper は無音側
+    # 1751.5122-1751.6664s を付けた。島の直前語（前の単語）とは十分離れている。
+    words = [_w(1750.5, 1751.0), _w(1751.5122, 1751.6664)]
+    corrected, remaining = transcribe.reattach_misplaced_words(
+        words,
+        [(1751.08, 1751.5)],
+        [(1749.4, 1751.08), (1751.5, 1752.0)],
+    )
+    assert remaining == []
+    assert corrected[0] == words[0]
+    assert corrected[1]["start"] == pytest.approx(1751.08)
+    assert corrected[1]["end"] == pytest.approx(1751.5)
+    # 入力は変更しない
+    assert words[1] == {"start": 1751.5122, "end": 1751.6664}
+
+
+def test_reattach_previous_word_misplaced_into_silence():
+    # 次の単語は遠すぎて使えない（gap > max_gap）ため、前の単語側で付け替える。
+    words = [_w(9.5, 9.8), _w(11.0, 11.5)]
+    corrected, remaining = transcribe.reattach_misplaced_words(
+        words, [(10.0, 10.3)], [(9.5, 9.8)]
+    )
+    assert remaining == []
+    assert corrected[0]["start"] == pytest.approx(10.0)
+    assert corrected[0]["end"] == pytest.approx(10.3)
+    assert corrected[1] == words[1]
+
+
+def test_reattach_skips_word_that_is_not_silent():
+    # 隣接語の区間がほとんど発話（無音被覆率不足）なら付け替えない。
+    words = [_w(0.0, 1.0), _w(1.51, 1.66)]
+    corrected, remaining = transcribe.reattach_misplaced_words(
+        words, [(1.08, 1.5)], [(1.5, 1.53)],  # 単語区間の一部しか無音でない
+    )
+    assert remaining == [(1.08, 1.5)]
+    assert corrected == words
+
+
+def test_reattach_skips_when_gap_too_large():
+    # 単語は完全に無音へ沈んでいる（無音被覆率は満たす）が、島端との距離が
+    # max_gap を超えるため付け替えない。前の単語候補も存在しない。
+    words = [_w(1.9, 2.1)]
+    corrected, remaining = transcribe.reattach_misplaced_words(
+        words, [(1.08, 1.5)], [(1.5, 2.5)],
+    )
+    assert remaining == [(1.08, 1.5)]
+    assert corrected == words
+
+
+def test_reattach_skips_on_ordering_violation():
+    # 次の単語側は無音被覆・gapともに満たすが、付け替えると直前語と重なる
+    # （直前語の end が u_start を超える）ため不採用。前の単語側も
+    # end<=u_start を満たさず候補にならないため、結局付け替えられない。
+    words = [_w(9.9, 10.15), _w(10.35, 10.5)]
+    corrected, remaining = transcribe.reattach_misplaced_words(
+        words, [(10.1, 10.3)], [(10.3, 10.5)],
+    )
+    assert remaining == [(10.1, 10.3)]
+    assert corrected == words
+
+
+def test_reattach_each_word_used_at_most_once():
+    # 1語を2つの島へ使い回さない。2番目の島は別の語が無ければ消えない。
+    words = [_w(0.0, 1.0), _w(1.5, 1.6)]
+    corrected, remaining = transcribe.reattach_misplaced_words(
+        words,
+        [(1.1, 1.3), (1.35, 1.45)],
+        [(1.0, 1.6)],
+    )
+    assert remaining == [(1.35, 1.45)]
+    # 最初の島が先に 1.5-1.6 の単語を使い切るため、2番目の島には使えない。
+    assert corrected[1]["start"] == pytest.approx(1.1)
+    assert corrected[1]["end"] == pytest.approx(1.3)
+
+
+# ---- _reattach_uts_words と最終出力への結線（統合テスト） ----
+
+def test_transcribe_reattaches_misplaced_word_and_drops_uts_segment(
+    tmp_path, monkeypatch
+):
+    """UTS 島の実発声を隣の無音側へ誤タイムした単語は、島へ付け替えられ、
+    UTS候補行も未認識の残余行も作られない（単語自体が独立制御できる）。"""
+    result = {
+        "language": "ja",
+        "segments": [
+            {"text": "前", "words": [
+                {"word": "前", "start": 0.0, "end": 1.0, "probability": 0.9},
+            ]},
+            {"text": "という", "words": [
+                # 実発声は 1.08-1.5 だが Whisper は無音側の時刻を付けている
+                {"word": "という", "start": 1.5122, "end": 1.6664,
+                 "probability": 0.6},
+            ]},
+        ],
+    }
+    fake_mod = types.ModuleType("mlx_whisper")
+    fake_mod.transcribe = lambda *a, **k: result
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_mod)
+    monkeypatch.setattr(transcribe, "_convert_to_16k_mono", lambda p: p)
+    monkeypatch.setattr(transcribe, "_detect_silence", lambda p, **k: "")
+    monkeypatch.setattr(transcribe, "_wav_duration", lambda p: 1.5)
+    monkeypatch.setattr(
+        transcribe,
+        "_detect_uts_spans",
+        lambda wav, segs, cuts, sil: (
+            [(1.08, 1.5)],
+            [(1.0, 1.08), (1.5, 2.0)],
+        ),
+    )
+
+    wav = _make_input(tmp_path)
+    res = transcribe.transcribe(str(wav), lang="ja")
+
+    data = json.loads((tmp_path / "input.sc.json").read_text(encoding="utf-8"))
+    # UTS候補も未認識の残余行も作られない
+    assert all(seg.get("kind") != "unrecognized" for seg in data["segments"])
+    assert res["uts_count"] == 0
+
+    moved = data["segments"][1]["words"][0]
+    assert moved["word"] == "という"
+    assert moved["start"] == pytest.approx(1.08)
+    assert moved["end"] == pytest.approx(1.5)
+
+    txt = (tmp_path / "input.sc.txt").read_text(encoding="utf-8")
+    assert "未転写発話" not in txt
+    assert "未認識" not in txt

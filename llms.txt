@@ -21,7 +21,7 @@ Stefnceorf transcribes a WAV with Whisper (mlx-whisper on Apple Silicon GPU), re
 - Logic Pro FCPXML export with click-free edge snapping (up to 5 ms inward to quiet points at or below -50 dBFS)
 - Automatic filler word removal via editable dictionaries (Japanese えー, まあ, あのー…; English um, uh, er…); a filler is cut only when both resulting joins are quiet (8 dB below median speech level), otherwise kept
 - Verbatim mode (default on) captures fillers Whisper normally absorbs — turbo model with a per-chunk filler prompt
-- Untranscribed speech detection with guarded cuts: short vocalizations Whisper skips are marked for deletion and cut only when a 0.25 s pause can be preserved from detected silence around them; `--no-auto-uts` for detection-only
+- Untranscribed speech detection with guarded cuts: short vocalizations Whisper skips are marked for deletion and cut only when a 0.25 s pause can be preserved from detected silence around them; `--no-auto-uts` for detection-only; a word Whisper timed into the silence next to an uncovered voice island is moved onto that island instead of creating an untranscribed-speech line
 - Hlyst A/B review workspace (`sc review`); `--serve` adds keyboard-driven editing, line reordering, and FCPXML export from the browser, backed by a localhost-only server
 - Whisper hallucination detection with safe-settings rescue re-transcription
 - Non-destructive: cuts come from the original WAV, output keeps sample rate and bit depth, equal-power crossfades prevent clicks

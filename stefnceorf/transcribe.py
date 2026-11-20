@@ -52,6 +52,15 @@ UTS_MIN_ADJACENT_SMALL = 0.15  # 前後の無音のうち短い方に要求す�
 UTS_RMS_WINDOW_MS = 20
 UTS_RMS_MIN_SILENCE_S = 0.10
 
+# UTS 島への誤タイム単語の付け替え設定。
+# Whisper は時々、単語の発声そのものは UTS 島の位置にあるのに、タイムスタンプを
+# 隣接する無音側へずらして出す（実測: 「という」の実発声は 1751.08-1751.50s だが
+# Whisper は 1751.512-1751.666s＝無音側 を付けた）。この場合、島はどの単語にも
+# 覆われず UTS 候補として出てしまい、単語自体は無音区間を時刻として持つ。
+# 隣接語が十分近く・無音に沈んでいるときだけ島へ付け替え、UTS 候補を消す。
+UTS_REATTACH_MAX_GAP_S = 0.3     # 島端と単語の間に許容する最大ギャップ
+UTS_REATTACH_MIN_SILENT_FRAC = 0.8  # 単語区間のうち無音に沈んでいるべき最小割合
+
 # 繰り返し幻覚セグメントの後処理除去（--verbatim の短チャンク turbo が
 # チャンク境界や静音区間でまれに出す繰り返し・定型幻覚への対策。入力側では
 # 完全に防げないため後処理＋レスキューで対処する）
@@ -403,7 +412,19 @@ def _finalize_segment_words(
     cuts: list[tuple[float, float]],
     silences: list[tuple[float, float]],
 ) -> list[dict]:
-    """segmentのwordを最終JSONへ出力する元音源時刻へ変換する。"""
+    """segmentのwordを最終JSONへ出力する元音源時刻へ変換する。
+
+    seg に "_reattached_words"（_reattach_uts_words が付け替え後に書き込む
+    キャッシュ）があれば、それをコピーして返す。UTS 島へ付け替えた単語の
+    新しい時刻は、cuts/silences からの再計算では復元できない（元の単語時刻を
+    上書きした結果のため）。このキャッシュ経由で全呼び出し元（gap保持・
+    ブロック割当・最終JSON書き出し）へ同じ補正済み時刻が伝播する。
+    呼び出し元ごとの破壊的変更（例: "block" キー追加）が互いに影響しないよう、
+    毎回新しい dict のコピーを返す。
+    """
+    cached = seg.get("_reattached_words")
+    if cached is not None:
+        return [dict(word) for word in cached]
     words = [
         {
             "word": word.get("word", ""),
@@ -1288,6 +1309,187 @@ def _detect_uts_spans(
     return uts_spans, rms_silences
 
 
+def _silence_covered_fraction(
+    start: float,
+    end: float,
+    merged_silences: list[tuple[float, float]],
+) -> float:
+    """[start, end] のうち merged_silences（マージ済み・昇順）に沈む割合を返す。
+
+    end <= start（長さ0の単語）は区間ではなく点として扱い、その点が無音に
+    含まれるなら 1.0、そうでなければ 0.0 を返す。
+    """
+    if end <= start:
+        return 1.0 if any(s <= start <= e for s, e in merged_silences) else 0.0
+    covered = 0.0
+    for s, e in merged_silences:
+        if e <= start:
+            continue
+        if s >= end:
+            break
+        covered += min(e, end) - max(s, start)
+    return covered / (end - start)
+
+
+def reattach_misplaced_words(
+    words: list[dict],
+    uts_spans: list[tuple[float, float]],
+    rms_silences: list[tuple[float, float]],
+    max_gap: float = UTS_REATTACH_MAX_GAP_S,
+    min_silent_frac: float = UTS_REATTACH_MIN_SILENT_FRAC,
+) -> tuple[list[dict], list[tuple[float, float]]]:
+    """UTS 島の隣接語がタイムスタンプを誤って無音側に持つ場合、島へ付け替える（純関数）。
+
+    words は元音源時刻（start/end）で開始昇順・非重複とする（_finalize_segment_words
+    の出力をそのまま結合したもの等）。各 dict の他のキーはそのまま保持する。
+
+    各 UTS 島 (u_start, u_end) について:
+    1. 「次の単語」= start >= u_end を満たす最初の未使用語。
+       w.start - u_end <= max_gap かつ [w.start, w.end] の無音被覆率が
+       min_silent_frac 以上、かつ付け替え後も順序が保てる
+       （words 中でその直前の語の end <= u_start）なら、その語を
+       [u_start, u_end] へ retime し、島を UTS 候補から外す。
+    2. 1で付け替えられなければ「前の単語」= end <= u_start を満たす最後の
+       未使用語について対称の条件（u_start - w.end <= max_gap、無音被覆、
+       words 中でその直後の語の start >= u_end）を試す。
+    3. いずれも成立しなければ島は UTS 候補として残す。
+
+    1単語は最大1回しか付け替えない（他の島に使い回さない）。start/end が
+    None の語は候補にしない。長さ0の語は、その1点が無音に含まれるときだけ
+    「無音に沈んでいる」とみなす。
+
+    戻り値: (付け替え反映後の words のコピー, 付け替えで消えなかった UTS 島)。
+    入力の words/uts_spans/rms_silences は変更しない。
+    """
+    merged_silences = _merge_time_spans(rms_silences)
+    out = [dict(w) for w in words]
+    n = len(out)
+    used = [False] * n
+    remaining: list[tuple[float, float]] = []
+
+    for u_start, u_end in uts_spans:
+        u_start = float(u_start)
+        u_end = float(u_end)
+        reattached = False
+
+        # 1. 次の単語を試す。
+        next_idx = None
+        for i in range(n):
+            if used[i]:
+                continue
+            w_start = out[i].get("start")
+            if w_start is None:
+                continue
+            if float(w_start) >= u_end:
+                next_idx = i
+                break
+        if next_idx is not None:
+            w_start = out[next_idx].get("start")
+            w_end = out[next_idx].get("end")
+            if w_start is not None and w_end is not None:
+                w_start = float(w_start)
+                w_end = float(w_end)
+                prev_end = None
+                if next_idx > 0:
+                    prev_end = out[next_idx - 1].get("end")
+                ordering_ok = prev_end is None or float(prev_end) <= u_start
+                if (
+                    w_start - u_end <= max_gap
+                    and ordering_ok
+                    and _silence_covered_fraction(
+                        w_start, w_end, merged_silences
+                    )
+                    >= min_silent_frac
+                ):
+                    out[next_idx]["start"] = u_start
+                    out[next_idx]["end"] = u_end
+                    used[next_idx] = True
+                    reattached = True
+
+        # 2. 前の単語を試す。
+        if not reattached:
+            prev_idx = None
+            for i in range(n - 1, -1, -1):
+                if used[i]:
+                    continue
+                w_end = out[i].get("end")
+                if w_end is None:
+                    continue
+                if float(w_end) <= u_start:
+                    prev_idx = i
+                    break
+            if prev_idx is not None:
+                w_start = out[prev_idx].get("start")
+                w_end = out[prev_idx].get("end")
+                if w_start is not None and w_end is not None:
+                    w_start = float(w_start)
+                    w_end = float(w_end)
+                    next_start = None
+                    if prev_idx + 1 < n:
+                        next_start = out[prev_idx + 1].get("start")
+                    ordering_ok = (
+                        next_start is None or float(next_start) >= u_end
+                    )
+                    if (
+                        u_start - w_end <= max_gap
+                        and ordering_ok
+                        and _silence_covered_fraction(
+                            w_start, w_end, merged_silences
+                        )
+                        >= min_silent_frac
+                    ):
+                        out[prev_idx]["start"] = u_start
+                        out[prev_idx]["end"] = u_end
+                        used[prev_idx] = True
+                        reattached = True
+
+        if not reattached:
+            remaining.append((u_start, u_end))
+
+    return out, remaining
+
+
+def _reattach_uts_words(
+    segments: list[dict],
+    cuts: list[tuple[float, float]],
+    silences: list[tuple[float, float]],
+    uts_spans: list[tuple[float, float]],
+    rms_silences: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """UTS 候補へ誤タイムの単語を付け替え、吸収できた候補を取り除く（結線用）。
+
+    segments（kind!="unrecognized" のもの）の確定済み単語をまとめて
+    reattach_misplaced_words へ渡し、付け替え結果を各 segment へ
+    "_reattached_words" として書き込む（segments を直接書き換える）。以後の
+    _finalize_segment_words 呼び出し（gap保持・ブロック割当・最終JSON書き出し）
+    はこのキャッシュを読むため、補正が全呼び出し元へ自動的に伝播する。
+
+    戻り値: 付け替えで消えなかった UTS 候補（_preserve_unrecognized_gaps へ渡す）。
+    """
+    flat_words: list[dict] = []
+    owners: list[dict] = []
+    for seg in segments:
+        if seg.get("kind") == "unrecognized":
+            continue
+        for word in _finalize_segment_words(seg, cuts, silences):
+            flat_words.append(word)
+            owners.append(seg)
+
+    corrected, remaining = reattach_misplaced_words(
+        flat_words, uts_spans, rms_silences
+    )
+
+    by_seg: dict[int, list[dict]] = {}
+    for seg, word in zip(owners, corrected):
+        by_seg.setdefault(id(seg), []).append(word)
+    for seg in segments:
+        words = by_seg.get(id(seg))
+        if words is not None:
+            seg["_reattached_words"] = words
+
+    return remaining
+
+
 def _detect_silence(wav_path: str, d: float = SILENCE_MIN_S) -> str:
     """ffmpeg silencedetect を実行し stderr を返す。失敗時は空文字列。
 
@@ -1712,6 +1914,13 @@ def transcribe(
         # する」モードであり、転写に載らない発声の検出とは別問題のため）。
         uts_spans, rms_silences = _detect_uts_spans(
             tmp_wav, kept_segments, cuts, periods
+        )
+        # Whisper が UTS 島の実発声を隣の無音側へ誤タイムした場合、その単語を
+        # 島へ付け替えて UTS 候補から外す（単語自体を独立制御できるようにする）。
+        # kept_segments を直接書き換え、以後の _finalize_segment_words 呼び出し
+        # すべてへ補正が伝播する。
+        uts_spans = _reattach_uts_words(
+            kept_segments, cuts, periods, uts_spans, rms_silences
         )
     finally:
         for p in {tmp_wav, trimmed_wav}:
