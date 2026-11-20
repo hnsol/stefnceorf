@@ -60,6 +60,9 @@ UTS_RMS_MIN_SILENCE_S = 0.10
 # 隣接語が十分近く・無音に沈んでいるときだけ島へ付け替え、UTS 候補を消す。
 UTS_REATTACH_MAX_GAP_S = 0.3     # 島端と単語の間に許容する最大ギャップ
 UTS_REATTACH_MIN_SILENT_FRAC = 0.8  # 単語区間のうち無音に沈んでいるべき最小割合
+# 単語区間のうち無音でない部分の上限（秒）。Whisper が単語末尾だけを無音側へ
+# 長く引き延ばした場合（実発声は単語区間の先頭に残っている）を付け替えない。
+UTS_REATTACH_MAX_VOICED_S = 0.05
 
 # 繰り返し幻覚セグメントの後処理除去（--verbatim の短チャンク turbo が
 # チャンク境界や静音区間でまれに出す繰り返し・定型幻覚への対策。入力側では
@@ -1331,6 +1334,24 @@ def _silence_covered_fraction(
     return covered / (end - start)
 
 
+def _word_sunk_in_silence(
+    start: float,
+    end: float,
+    merged_silences: list[tuple[float, float]],
+    min_silent_frac: float,
+    max_voiced: float = UTS_REATTACH_MAX_VOICED_S,
+) -> bool:
+    """単語区間がほぼ丸ごと無音に沈んでいるか（付け替え候補の条件・純関数）。
+
+    無音被覆率が min_silent_frac 以上、かつ無音でない部分が max_voiced 秒以下。
+    後者は「実発声は区間の先頭にあり、末尾だけが無音側へ長く伸びた」単語
+    （例: 2.4 秒の「ですね。」のうち発声 0.3 秒）を除くため。
+    """
+    frac = _silence_covered_fraction(start, end, merged_silences)
+    voiced = max(0.0, end - start) * (1.0 - frac)
+    return frac >= min_silent_frac and voiced <= max_voiced + 1e-9
+
+
 def reattach_misplaced_words(
     words: list[dict],
     uts_spans: list[tuple[float, float]],
@@ -1396,10 +1417,9 @@ def reattach_misplaced_words(
                 if (
                     w_start - u_end <= max_gap
                     and ordering_ok
-                    and _silence_covered_fraction(
-                        w_start, w_end, merged_silences
+                    and _word_sunk_in_silence(
+                        w_start, w_end, merged_silences, min_silent_frac
                     )
-                    >= min_silent_frac
                 ):
                     out[next_idx]["start"] = u_start
                     out[next_idx]["end"] = u_end
@@ -1433,10 +1453,9 @@ def reattach_misplaced_words(
                     if (
                         u_start - w_end <= max_gap
                         and ordering_ok
-                        and _silence_covered_fraction(
-                            w_start, w_end, merged_silences
+                        and _word_sunk_in_silence(
+                            w_start, w_end, merged_silences, min_silent_frac
                         )
-                        >= min_silent_frac
                     ):
                         out[prev_idx]["start"] = u_start
                         out[prev_idx]["end"] = u_end

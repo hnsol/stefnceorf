@@ -3497,6 +3497,19 @@ def test_reattach_skips_word_that_is_not_silent():
     assert corrected == words
 
 
+def test_reattach_skips_long_word_with_voiced_head():
+    # ep28 実測: 「ですね。」1310.7559-1313.2032s のうち発声は先頭 0.3 秒ほどで、
+    # 残りは無音（被覆率 87%）。末尾が伸びただけなので直後の島へ付け替えない。
+    words = [_w(1310.0, 1310.7559), _w(1310.7559, 1313.2032)]
+    corrected, remaining = transcribe.reattach_misplaced_words(
+        words,
+        [(1313.2032, 1313.34)],
+        [(1310.82, 1312.94)],
+    )
+    assert remaining == [(1313.2032, 1313.34)]
+    assert corrected == words
+
+
 def test_reattach_skips_when_gap_too_large():
     # 単語は完全に無音へ沈んでいる（無音被覆率は満たす）が、島端との距離が
     # max_gap を超えるため付け替えない。前の単語候補も存在しない。
