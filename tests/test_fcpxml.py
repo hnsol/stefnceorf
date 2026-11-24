@@ -17,8 +17,10 @@ from stefnceorf.fcpxml import (
     EDGE_SAFE_DBFS,
     EDGE_SEARCH_S,
     export_fcpxml,
+    _resolve_forward_overlaps,
     _snap_edge_inward,
     _snap_region,
+    _timeline_offsets,
 )
 
 _SAFE_AMP = 10 ** (EDGE_SAFE_DBFS / 20.0)
@@ -594,3 +596,24 @@ def test_generated_xml_validates_against_logic_dtd_when_available(tmp_path):
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_forward_overlap_trims_previous_end_and_keeps_source_timeline():
+    # ep31: 隣接区間がソース上で 20ms 重なると、以降の全クリップが 20ms ずつ
+    # 前へ詰まり、2人収録の別トラック間で時間軸がずれた。
+    sr = 48000
+    bounds = [(0, 1000), (900, 2000), (2500, 3000)]
+    resolved = _resolve_forward_overlaps(bounds)
+    assert resolved == [(0, 900), (900, 2000), (2500, 3000)]
+    offsets, end = _timeline_offsets(resolved, sr)
+    assert offsets == [start for start, _ in resolved]
+    assert end == 3000
+
+
+def test_resolve_forward_overlaps_leaves_reorder_and_containment_alone():
+    reordered = [(1000, 2000), (0, 500)]
+    assert _resolve_forward_overlaps(reordered) == reordered
+    contained = [(0, 1000), (200, 800)]
+    assert _resolve_forward_overlaps(contained) == contained
+    same_start = [(0, 1000), (0, 1500)]
+    assert _resolve_forward_overlaps(same_start) == same_start

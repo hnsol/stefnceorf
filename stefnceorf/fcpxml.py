@@ -127,6 +127,26 @@ def _audio_layout(channels: int) -> str:
     return "surround"
 
 
+def _resolve_forward_overlaps(
+    bounds: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """順方向に重なる隣接区間の前側終端を、次区間の始端まで切り詰める。
+
+    計画区間はクロスフェード用マージンのぶん数十ms 重なることがある。spine は
+    クリップを重ねられないため、そのままだと次区間以降がすべて重なり分だけ前へ
+    詰まり、ソース時間軸からずれる（別トラックと並べると位置が合わない）。
+    切り詰めた2区間はソース上で連続するため、つなぎ目は無編集と同じ音になる。
+    並べ替え（始端が逆行・同一）と包含（次区間が前区間内で終わる）は対象外。
+    """
+    resolved = list(bounds)
+    for index in range(1, len(resolved)):
+        previous_start, previous_end = resolved[index - 1]
+        current_start, current_end = resolved[index]
+        if previous_start < current_start < previous_end < current_end:
+            resolved[index - 1] = (previous_start, current_start)
+    return resolved
+
+
 def _timeline_offsets(
     bounds: list[tuple[int, int]],
     samplerate: int,
@@ -227,6 +247,7 @@ def export_fcpxml(
                 plan.audio, rate, source_start, source_end
             )
             bounds.append((source_start, source_end))
+    bounds = _resolve_forward_overlaps(bounds)
     offsets, timeline_end = _timeline_offsets(bounds, rate)
 
     for clip_number, ((source_start, source_end), offset) in enumerate(
